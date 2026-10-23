@@ -195,12 +195,14 @@
 
     // Set dashboard view
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['set_dashboard_view'])) {
-        $_SESSION['dashboard_view'] = $_POST['view'] ?? 'initialize';
+        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'initialize'), ['initialize', 'accounts', 'all_config'], true) ? $_POST['view'] : 'initialize';
         $redirect = true;
     }
 
-    // Save Global Dynamic Fields
+    // Save Account Dynamic Fields
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_global_dynamic_fields'])) {
+        $userId = intval($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
+        if ($userId <= 0) { http_response_code(400); exit('Select an account before editing dynamic fields.'); }
         $debugMessages[] = "=== SAVE GLOBAL DYNAMIC FIELDS DEBUG ===";
         $debugMessages[] = "POST keys: " . implode(', ', array_keys($_POST));
         
@@ -221,12 +223,13 @@
             }
         }
         
-        $config = getGlobalConfig($pdo);
+        $config = getUserConfig($pdo, $userId);
+                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
         $settings = $config ? json_decode($config['settings'], true) : [];
         if (!is_array($settings)) $settings = [];
         $settings = repairSettings($settings);
         
-        $result = saveGlobalConfig($pdo, $settings, $dynamicFields);
+        $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
         $debugMessages[] = "Save result: " . ($result ? "TRUE" : "FALSE");
         
         if ($result) {
@@ -241,6 +244,8 @@
 
     // Update Global Dynamic Field
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_global_field'])) {
+        $userId = intval($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
+        if ($userId <= 0) { echo json_encode(['success' => false, 'message' => 'Select an account first.']); exit; }
         $oldKey = $_POST['old_key'] ?? '';
         $newKey = $_POST['new_key'] ?? '';
         $fieldData = isset($_POST['field_data']) ? json_decode($_POST['field_data'], true) : [];
@@ -252,7 +257,8 @@
         
         if ($oldKey && $newKey && !empty($fieldData)) {
             try {
-                $config = getGlobalConfig($pdo);
+                $config = getUserConfig($pdo, $userId);
+                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
                 $settings = $config ? json_decode($config['settings'], true) : [];
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
@@ -268,7 +274,7 @@
                 // Add with new key
                 $dynamicFields[$newKey] = $fieldData;
                 
-                $result = saveGlobalConfig($pdo, $settings, $dynamicFields);
+                $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                 error_log("Save result: " . ($result ? "TRUE" : "FALSE"));
                 
                 if ($result) {
@@ -291,6 +297,8 @@
 
     // Save single global dynamic field
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_global_single_field'])) {
+        $userId = intval($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
+        if ($userId <= 0) { echo json_encode(['success' => false, 'message' => 'Select an account first.']); exit; }
         $fieldData = isset($_POST['field_data']) ? json_decode($_POST['field_data'], true) : [];
         
         error_log("=== SAVE GLOBAL SINGLE FIELD ===");
@@ -298,7 +306,8 @@
         
         if (!empty($fieldData)) {
             try {
-                $config = getGlobalConfig($pdo);
+                $config = getUserConfig($pdo, $userId);
+                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
                 $settings = $config ? json_decode($config['settings'], true) : [];
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
@@ -323,12 +332,12 @@
                             'field_type' => 'individual',
                             'element_type' => $fieldData['element_type'] ?? 'input',
                             'default_value' => $fieldData['default_value'] ?? '',
-                            'default_values' => $fieldData['default_values'] ?? []
+                            'default_values' => $fieldData['default_values'] ?? [],
                         ];
                     }
                 }
                 
-                $result = saveGlobalConfig($pdo, $settings, $dynamicFields);
+                $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                 error_log("Save result: " . ($result ? "TRUE" : "FALSE"));
                 
                 if ($result) {
@@ -354,10 +363,13 @@
 
     // Delete Global Dynamic Field
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_global_dynamic_field'])) {
+        $userId = intval($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
+        if ($userId <= 0) { http_response_code(400); exit('Select an account first.'); }
         $fieldKey = $_POST['field_key'] ?? '';
         
         if ($fieldKey) {
-            $config = getGlobalConfig($pdo);
+            $config = getUserConfig($pdo, $userId);
+                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
             if ($config) {
                 $settings = json_decode($config['settings'], true) ?: [];
                 if (!is_array($settings)) $settings = [];
@@ -368,7 +380,7 @@
                 
                 if (isset($dynamicFields[$fieldKey])) {
                     unset($dynamicFields[$fieldKey]);
-                    saveGlobalConfig($pdo, $settings, $dynamicFields);
+                    saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                     $_SESSION['flash_success'] = 'Field "' . $fieldKey . '" deleted successfully!';
                 } else {
                     $_SESSION['flash_error'] = 'Field not found.';
@@ -440,8 +452,7 @@
         
         if ($userId > 0 && is_array($entryData) && !empty($entryData)) {
             $config = getUserConfig($pdo, $userId);
-            $globalConfig = getGlobalConfig($pdo);
-            $globalDynamicFields = $globalConfig ? json_decode($globalConfig['dynamic_fields'], true) : [];
+            $globalDynamicFields = $config ? (json_decode($config['dynamic_fields'], true) ?: []) : [];
             
             // Get dynamic tabs with submit_tab settings
             $dynamicTabs = $config ? json_decode($config['dynamic_tabs'], true) : [];
@@ -462,18 +473,18 @@
             $flatEntry = [];
             foreach ($entryData as $key => $value) {
                 if (is_array($value) && isset($value['_object'])) {
-                    // Check if this object field should be submitted
                     if (in_array($key, $submittedFieldKeys)) {
                         $objectData = [];
+                        $subFieldDefinitions = $globalDynamicFields[$key]['fieldkeyvalue'] ?? [];
                         foreach ($value as $subKey => $subValue) {
-                            if ($subKey !== '_object') {
-                                $objectData[$subKey] = $subValue;
+                            if ($subKey === '_object') {
+                                continue;
                             }
+                            $objectData[$subKey] = $subValue;
                         }
                         $flatEntry[$key] = $objectData;
                     }
                 } else {
-                    // Check if this individual field should be submitted
                     if (in_array($key, $submittedFieldKeys)) {
                         $flatEntry[$key] = $value;
                     }
@@ -499,7 +510,7 @@
                 $newEntry['status'] = 'pending';
                 $newEntry['operation_status'] = 'entry_created: New Project added by admin';
                 $settings[] = $newEntry;
-                saveUserConfig($pdo, $userId, $settings, $globalDynamicFields, $dynamicTabs);
+                saveUserConfig($pdo, $userId, $settings, [], $dynamicTabs);
                 $_SESSION['flash_success'] = 'Entry added successfully!';
             }
         } else {
@@ -548,8 +559,8 @@
                 $settings = repairSettings($settings);
                 
                 if ($index < count($settings)) {
-                    $settings[$index][$fieldKey] = $fieldValue;
                     $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
+                    $settings[$index][$fieldKey] = $fieldValue;
                     $dynamicTabs = json_decode($config['dynamic_tabs'], true) ?: [];
                     saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                     $_SESSION['flash_success'] = 'Field updated successfully!';
@@ -594,6 +605,13 @@
                     $tab['submit_tab'] = true;
                 }
                 
+                // Keep nested-tab metadata optional so legacy tab records remain valid.
+                if (!isset($tab['sub_tabs_mode'])) {
+                    $tab['sub_tabs_mode'] = !empty($tab['sub_tabs']) ? 'add' : 'none';
+                }
+                if (!isset($tab['sub_tabs']) || !is_array($tab['sub_tabs'])) {
+                    $tab['sub_tabs'] = [];
+                }
                 // Ensure additional_features exists with defaults
                 if (!isset($tab['additional_features']) || !is_array($tab['additional_features'])) {
                     $tab['additional_features'] = [
@@ -708,7 +726,127 @@
         echo '.success{color:#51cf66;}';
         echo '.warning{color:#ffd93d;}';
         echo 'pre{background:#1a1a2e;padding:10px;border-radius:5px;overflow:auto;}';
-        echo '</style></head><body>';
+        echo '
+        /* ===== CLEAN, CONSISTENT DYNAMIC TABS EDITOR ===== */
+        #dynamicTabsEditor { width: 100%; min-width: 0; }
+        .dynamic-tabs-editor-header {
+            display: flex; align-items: center; justify-content: space-between;
+            gap: 16px; flex-wrap: wrap; margin-bottom: 18px;
+            padding: 18px; background: #f8fafc; border: 1px solid #e2e8f0;
+            border-radius: 14px;
+        }
+        .dynamic-tabs-editor-header h3 { color: #0f172a; font-size: 20px; margin: 0 0 5px; }
+        .dynamic-tabs-editor-header p { color: #64748b; font-size: 13px; line-height: 1.5; margin: 0; max-width: 720px; }
+        .dynamic-tabs-editor-list { display: flex; flex-direction: column; gap: 14px; }
+        .tab-editor-item {
+            width: 100%; min-width: 0; background: #fff; border: 1px solid #dbe3ea;
+            border-radius: 13px; padding: 16px; margin: 0; box-shadow: 0 2px 7px rgba(15,23,42,.04);
+        }
+        .root-tab-editor-item { border-left: 4px solid #0f766e; }
+        .sub-tab-editor-item { border-left: 3px solid #94a3b8; background: #fff; }
+        .tab-editor-heading { display: flex; justify-content: space-between; align-items: center; gap: 12px; flex-wrap: wrap; }
+        .tab-editor-heading-copy { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+        .tab-editor-kind { font-size: 10px; letter-spacing: .09em; font-weight: 800; color: #0f766e; }
+        .sub-tab-editor-item .tab-editor-kind { color: #64748b; }
+        .tab-editor-title { color: #0f172a; font-size: 15px; overflow-wrap: anywhere; }
+        .tab-editor-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+        .nested-tab-editor-body { margin-top: 16px; display: block; }
+        .tab-editor-item .form-group { margin-bottom: 14px; }
+        .tab-editor-item .form-group label { font-size: 13px; font-weight: 650; color: #334155; }
+        .tab-editor-item .form-group input[type="text"],
+        .tab-editor-item .form-group select,
+        .tab-editor-item .form-group textarea {
+            width: 100%; max-width: 100%; min-width: 0; padding: 10px 12px;
+            border: 1px solid #cbd5e1; border-radius: 8px; background: #fff;
+            color: #0f172a; box-shadow: none; font-size: 14px !important;
+        }
+        .tab-editor-item .form-group input:focus,
+        .tab-editor-item .form-group select:focus,
+        .tab-editor-item .form-group textarea:focus {
+            outline: none; border-color: #0f766e; box-shadow: 0 0 0 3px rgba(15,118,110,.12);
+        }
+        .tab-fields-toggle-list {
+            display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 260px), 1fr));
+            gap: 6px; padding: 10px; border: 1px solid #e2e8f0; border-radius: 9px; background: #f8fafc;
+        }
+        .tab-field-option {
+            display: flex; align-items: center; justify-content: space-between; gap: 12px;
+            min-width: 0; padding: 9px 10px; border: 1px solid #e2e8f0;
+            border-radius: 8px; background: #fff; cursor: pointer;
+        }
+        .tab-field-option input { flex: 0 0 auto; width: 16px; height: 16px; accent-color: #0f766e; }
+        .tab-field-label { min-width: 0; overflow-wrap: anywhere; color: #334155; font-size: 12px; }
+        .tab-field-label small { color: #64748b; }
+        .tab-editor-empty-fields { color: #64748b; font-size: 12px; padding: 8px; margin: 0; }
+        .tab-feature-options { display: flex; align-items: center; gap: 8px 18px; flex-wrap: wrap; padding: 12px; border: 1px solid #e2e8f0; border-radius: 9px; background: #f8fafc; }
+        .tab-feature-options label { display: inline-flex; align-items: center; gap: 7px; color: #475569; font-size: 12px; cursor: pointer; }
+        .tab-feature-options input { accent-color: #0f766e; }
+        .tab-editor-help { margin-top: 6px; font-size: 12px; line-height: 1.5; color: #64748b; }
+        .nested-sub-tabs-container { margin-top: 16px; padding: 14px; border: 1px solid #99f6e4; background: #f0fdfa; border-radius: 12px; }
+        .nested-sub-tabs-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+        .nested-sub-tabs-heading strong { display: block; color: #115e59; font-size: 14px; }
+        .nested-sub-tabs-heading p { margin: 4px 0 0; color: #64748b; font-size: 12px; }
+        .nested-sub-tabs-list { display: flex; flex-direction: column; gap: 10px; }
+        .nested-sub-tabs-list:empty { display: none; }
+        .nested-sub-tabs-empty { padding: 12px; margin: 0; border: 1px dashed #99f6e4; border-radius: 8px; color: #64748b; font-size: 12px; text-align: center; }
+        .dynamic-tabs-save-bar { display: flex; justify-content: flex-end; margin-top: 18px; padding: 14px 0 2px; }
+        .tab-editor-empty-state { display: flex; flex-direction: column; gap: 5px; align-items: center; padding: 28px 16px; border: 1px dashed #cbd5e1; border-radius: 12px; color: #64748b; text-align: center; margin-bottom: 14px; }
+        .tab-editor-empty-state strong { color: #334155; font-size: 14px; }
+        #newProjectSubTabs { gap: 8px; padding: 4px 2px 10px; border-bottom: 1px solid #e2e8f0; }
+        #newProjectSubTabs .dynamic-sub-tab-btn,
+        .nested-project-tabs .nested-child-btn {
+            border: 1px solid #e2e8f0; border-radius: 9px; padding: 9px 14px;
+            background: #f8fafc; color: #475569; margin: 0; min-height: 38px;
+            transition: background .15s ease, border-color .15s ease, color .15s ease;
+        }
+        #newProjectSubTabs .dynamic-sub-tab-btn.active,
+        .nested-project-tabs .nested-child-btn.active {
+            background: #e6fffb; border-color: #0f766e; color: #115e59; font-weight: 700;
+        }
+        .nested-project-tabs { padding: 14px; border: 1px solid #e2e8f0; border-radius: 12px; background: #fff; }
+        .nested-project-tabs .dynamic-sub-tabs { gap: 8px; border-bottom: 1px solid #e2e8f0; padding-bottom: 10px; }
+        .nested-child-content { min-width: 0; padding-top: 8px; }
+        @media (max-width: 640px) {
+            .dynamic-tabs-editor-header { padding: 14px; align-items: stretch; }
+            .dynamic-tabs-editor-header > .btn { width: 100%; }
+            .tab-editor-item { padding: 12px; }
+            .nested-sub-tabs-container { padding: 10px; }
+            .tab-editor-actions { width: 100%; }
+            .tab-editor-actions .btn { flex: 1 1 auto; }
+            .tab-fields-toggle-list { grid-template-columns: minmax(0, 1fr); }
+            .dynamic-tabs-save-bar .btn { width: 100%; }
+        }
+
+    
+/* ===== Dynamic tab editor interaction updates ===== */
+#dynamicTabsEditor .tab-editor-heading {
+    cursor: pointer;
+}
+#dynamicTabsEditor .tab-editor-heading:focus-visible {
+    outline: 2px solid #087f75;
+    outline-offset: -2px;
+}
+#dynamicTabsEditor .tab-editor-item:not(.is-expanded) .tab-delete-button {
+    display: none !important;
+}
+#dynamicTabsEditor .tab-editor-item.is-expanded .tab-delete-button {
+    display: inline-flex !important;
+}
+#dynamicTabsEditor .display-tab-setting select.display-tab-input {
+    width: 100%;
+    max-width: 220px;
+    min-height: 40px;
+    padding: 9px 12px;
+    border: 1px solid #cfd8e3;
+    border-radius: 8px;
+    background: #fff;
+    color: #172033;
+    cursor: pointer;
+}
+#dynamicTabsEditor .tab-editor-heading .tab-editor-actions {
+    cursor: default;
+}
+</style></head><body>';
         echo '<h1> Debug Information</h1>';
         echo '<div class="debug-box">';
         foreach ($debugMessages as $msg) {
@@ -741,15 +879,15 @@
     $users = getAllUsers($pdo);
     $selectedUserId = isset($_SESSION['selected_user_id']) ? intval($_SESSION['selected_user_id']) : 0;
     $dashboardView = isset($_SESSION['dashboard_view']) ? $_SESSION['dashboard_view'] : 'initialize';
+    if (!in_array($dashboardView, ['initialize', 'accounts', 'all_config'], true)) { $dashboardView = 'initialize'; }
 
     $selectedUser = null;
     $userConfig = null;
     $userSettings = [];
     $userDynamicFields = [];
     $userDynamicTabs = [];
-    $globalConfig = getGlobalConfig($pdo);
-    $globalDynamicFields = $globalConfig ? json_decode($globalConfig['dynamic_fields'], true) : [];
-    if (!is_array($globalDynamicFields)) $globalDynamicFields = [];
+    // Dynamic fields are account-scoped; there is no shared/global field definition.
+    $globalDynamicFields = [];
 
     $groupedEntries = ['pending' => [], 'completed' => [], 'aborted' => []];
     $statusLabels = ['pending' => 'Pending', 'completed' => 'Completed', 'aborted' => 'Aborted'];
@@ -798,12 +936,14 @@
                     $groupedEntries[$status][] = $entry;
                 }
             } else {
-                saveUserConfig($pdo, $selectedUserId, [], $globalDynamicFields, []);
-                $userDynamicFields = $globalDynamicFields;
+                saveUserConfig($pdo, $selectedUserId, [], [], []);
+                $userDynamicFields = [];
                 $userDynamicTabs = [];
             }
         }
     }
+    // Existing JavaScript uses this variable name; its data is now strictly per selected account.
+    $globalDynamicFields = $userDynamicFields;
 ?>
 <!DOCTYPE html>
 <html lang="en">
@@ -812,6 +952,8 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>SceneIQ Server - Admin</title>
 <style>
+        .copy-button-copied { background:#dcfce7 !important; border-color:#16a34a !important; color:#166534 !important; }
+
         /* ===== RESET & BODY ===== */
         * { 
             margin: 0; 
@@ -891,7 +1033,8 @@
             flex: 1;
             overflow-y: auto;
             overflow-x: hidden;
-            padding: 15px;
+            padding: 0 15px 30px;
+            padding-top: 0 !important;
             padding-bottom: 30px;
             background: #ffffff;
             width: 100%;
@@ -2174,7 +2317,8 @@
             }
             
             .scroll-body {
-                padding: 10px;
+                padding: 0 10px 30px !important;
+                padding-top: 0 !important;
             }
             
             .dashboard-tabs {
@@ -2652,17 +2796,907 @@
     .toggle-switch input:checked + .toggle-slider:before {
         transform: translateX(18px);
     }
+/* ===== REFINED DYNAMIC TABS UI (scoped, responsive, predictable) ===== */
+#dynamicTabsEditor{--dt-ink:#172033;--dt-muted:#687386;--dt-line:#dce3ec;--dt-soft:#f6f8fb;--dt-teal:#087f75;--dt-teal-dark:#075e57;--dt-red:#b42318;width:100%;min-width:0;color:var(--dt-ink)}
+#dynamicTabsEditor *{box-sizing:border-box}
+#dynamicTabsEditor .dynamic-tabs-editor-header{display:flex;align-items:center;justify-content:space-between;gap:18px;padding:22px 24px;margin:0 0 22px;border:1px solid #d8e7e5;border-radius:16px;background:linear-gradient(120deg,#f0fdfa 0%,#f8fbff 72%);box-shadow:0 5px 18px rgba(15,45,55,.045)}
+#dynamicTabsEditor .dynamic-tabs-editor-header h3{font-size:22px;line-height:1.25;font-weight:750;letter-spacing:-.025em;color:#102a32;margin:0 0 7px}
+#dynamicTabsEditor .dynamic-tabs-editor-header p{max-width:720px;color:#5c6d7c;font-size:13px;line-height:1.65;margin:0}
+#dynamicTabsEditor .dynamic-tabs-editor-header .btn{flex:0 0 auto;min-height:42px;padding:10px 16px;border-radius:10px;font-weight:700;box-shadow:0 3px 8px rgba(8,127,117,.12)}
+#dynamicTabsEditor .dynamic-tabs-editor-list{display:flex;flex-direction:column;gap:18px;counter-reset:main-tab;min-width:0}
+#dynamicTabsEditor .tab-editor-item{position:relative;min-width:0;width:100%;margin:0;padding:0;overflow:hidden;border:1px solid var(--dt-line);border-radius:15px;background:#fff;box-shadow:0 4px 14px rgba(20,35,55,.045)}
+#dynamicTabsEditor .root-tab-editor-item{counter-increment:main-tab;border-top:3px solid #087f75;border-left:1px solid var(--dt-line)}
+#dynamicTabsEditor .root-tab-editor-item>.tab-editor-heading{padding:16px 18px;background:linear-gradient(180deg,#f7fcfb,#fff);border-bottom:1px solid #e5ecef}
+#dynamicTabsEditor .root-tab-editor-item>.tab-editor-heading .tab-editor-kind:before{content:'MAIN TAB ' counter(main-tab);display:inline-flex;align-items:center;justify-content:center;margin-right:8px;padding:4px 8px;border-radius:6px;background:#d9f4ef;color:#075e57;font-size:10px;letter-spacing:.07em}
+#dynamicTabsEditor .root-tab-editor-item>.tab-editor-heading .tab-editor-kind{font-size:0;color:transparent}
+#dynamicTabsEditor .tab-editor-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;min-width:0}
+#dynamicTabsEditor .tab-editor-heading-copy{display:flex;flex:1 1 220px;min-width:0;flex-direction:column;gap:7px}
+#dynamicTabsEditor .tab-editor-title{display:block;min-width:0;overflow-wrap:anywhere;font-size:16px;line-height:1.4;font-weight:750;color:#182638}
+#dynamicTabsEditor .tab-editor-actions{display:flex;align-items:center;justify-content:flex-end;gap:8px;flex-wrap:wrap}
+#dynamicTabsEditor .tab-editor-actions .btn{min-height:34px;padding:7px 11px;border-radius:8px;font-size:12px;font-weight:650}
+#dynamicTabsEditor .tab-editor-actions .btn-danger{background:#fff5f4;color:#a32920;border:1px solid #f2c7c3}
+#dynamicTabsEditor .tab-editor-actions .btn-danger:hover{background:#fee9e7}
+#dynamicTabsEditor .tab-editor-actions .btn-secondary{background:#fff;color:#425166;border:1px solid #d8e0e9}
+#dynamicTabsEditor .nested-tab-editor-body{display:block;padding:20px;min-width:0}
+#dynamicTabsEditor .tab-editor-item .form-group{display:flex;flex-direction:column;gap:7px;margin:0 0 18px;min-width:0}
+#dynamicTabsEditor .tab-editor-item .form-group>label{font-size:12px;font-weight:750;letter-spacing:.015em;color:#344256}
+#dynamicTabsEditor .tab-editor-item .form-group input[type=text],#dynamicTabsEditor .tab-editor-item .form-group select,#dynamicTabsEditor .tab-editor-item .form-group textarea{display:block;width:100%;max-width:100%;min-width:0;min-height:42px;padding:10px 12px;border:1px solid #cfd8e3;border-radius:9px;background:#fff;color:#172033;font-size:14px!important;line-height:1.45;box-shadow:none;transition:border-color .15s,box-shadow .15s}
+#dynamicTabsEditor .tab-editor-item .form-group textarea{min-height:82px;resize:vertical}
+#dynamicTabsEditor .tab-editor-item .form-group input:focus,#dynamicTabsEditor .tab-editor-item .form-group select:focus,#dynamicTabsEditor .tab-editor-item .form-group textarea:focus{outline:none;border-color:#087f75;box-shadow:0 0 0 3px rgba(8,127,117,.12)}
+#dynamicTabsEditor .tab-editor-help{margin:2px 0 0;padding:10px 12px;border-radius:8px;background:#f2f7fb;color:#5e6e81;font-size:12px;line-height:1.6}
+#dynamicTabsEditor .tab-fields-toggle-list{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px;padding:12px;border:1px solid #e0e7ef;border-radius:11px;background:#f8fafc}
+#dynamicTabsEditor .tab-field-option{display:flex;align-items:center;justify-content:space-between;gap:12px;min-width:0;min-height:44px;padding:10px 12px;border:1px solid #e0e6ed;border-radius:9px;background:#fff;cursor:pointer;transition:border-color .15s,background .15s}
+#dynamicTabsEditor .tab-field-option:hover{border-color:#8dcfc5;background:#f7fffd}
+#dynamicTabsEditor .tab-field-option input{flex:0 0 auto;width:17px;height:17px;margin:0;accent-color:#087f75}
+#dynamicTabsEditor .tab-field-label{min-width:0;overflow-wrap:anywhere;font-size:12px;line-height:1.5;color:#344256}
+#dynamicTabsEditor .tab-field-label small{display:block;margin-top:2px;color:#8490a0;font-size:10px}
+#dynamicTabsEditor .tab-feature-options{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:9px;padding:12px;border:1px solid #e0e7ef;border-radius:11px;background:#fbfcfe}
+#dynamicTabsEditor .tab-feature-options label{display:flex;align-items:center;gap:8px;min-width:0;margin:0;padding:10px;border:1px solid #e6ebf1;border-radius:8px;background:#fff;color:#3f4d60;font-size:12px;line-height:1.45;cursor:pointer}
+#dynamicTabsEditor .tab-feature-options input{flex:0 0 auto;accent-color:#087f75;width:16px;height:16px;margin:0}
+#dynamicTabsEditor .nested-sub-tabs-container{margin:20px 0 0;padding:17px;border:1px solid #b8e4dc;border-radius:13px;background:#f2fbf9}
+#dynamicTabsEditor .nested-sub-tabs-heading{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;margin:0 0 14px;padding-bottom:13px;border-bottom:1px solid #d7eeea}
+#dynamicTabsEditor .nested-sub-tabs-heading strong{display:block;color:#145b55;font-size:15px;font-weight:800}
+#dynamicTabsEditor .nested-sub-tabs-heading p{margin:5px 0 0;color:#647b7a;font-size:12px;line-height:1.5}
+#dynamicTabsEditor .nested-sub-tabs-heading .btn{min-height:36px;padding:8px 12px;border-radius:9px;font-weight:700}
+#dynamicTabsEditor .nested-sub-tabs-list{display:flex;flex-direction:column;gap:12px;min-width:0}
+#dynamicTabsEditor .sub-tab-editor-item{border:1px solid #d8e2eb;border-left:4px solid #7b8da4;border-radius:11px;background:#fff;box-shadow:none}
+#dynamicTabsEditor .sub-tab-editor-item>.tab-editor-heading{padding:13px 15px;background:#f7f9fc;border-bottom:1px solid #e7edf3}
+#dynamicTabsEditor .sub-tab-editor-item .tab-editor-kind{display:inline-flex;align-self:flex-start;padding:4px 7px;border-radius:5px;background:#e8eef5;color:#53677e;font-size:10px;font-weight:800;letter-spacing:.08em}
+#dynamicTabsEditor .sub-tab-editor-item .tab-editor-title{font-size:14px}
+#dynamicTabsEditor .sub-tab-editor-item .nested-tab-editor-body{padding:16px}
+#dynamicTabsEditor .nested-sub-tabs-empty{margin:0;padding:16px;border:1px dashed #b8d9d4;border-radius:9px;background:rgba(255,255,255,.7);color:#637c79;text-align:center;font-size:12px;line-height:1.5}
+#dynamicTabsEditor .tab-editor-empty-fields{margin:0;padding:13px;border:1px dashed #d1dbe5;border-radius:9px;background:#fff;color:#718096;font-size:12px;line-height:1.5}
+#dynamicTabsEditor .tab-editor-empty-state{margin:0 0 16px;padding:34px 20px;border:1px dashed #cbd7e2;border-radius:14px;background:#fafcff;color:#6b7788;display:flex;flex-direction:column;align-items:center;gap:8px;text-align:center}
+#dynamicTabsEditor .tab-editor-empty-state strong{font-size:15px;color:#27364a}
+#dynamicTabsEditor .dynamic-tabs-save-bar{position:sticky;bottom:0;z-index:20;display:flex;justify-content:flex-end;gap:12px;margin:22px -2px 0;padding:14px 2px 3px;background:linear-gradient(180deg,rgba(255,255,255,0),#fff 28%)}
+#dynamicTabsEditor .dynamic-tabs-save-bar .btn{min-height:44px;padding:11px 20px;border-radius:10px;font-size:14px;font-weight:800;box-shadow:0 4px 12px rgba(8,127,117,.16)}
+#dynamicTabsEditor .btn:focus-visible{outline:3px solid rgba(8,127,117,.25);outline-offset:2px}
+/* Nested project tabs: clearly separated parent and child navigation/content */
+#newProjectSubTabs{display:flex;flex-wrap:wrap;gap:8px;padding:10px;margin:0 0 18px;border:1px solid #dce5ed;border-radius:12px;background:#f7f9fc;white-space:normal;overflow:visible}
+#newProjectSubTabs .dynamic-sub-tab-btn{min-height:40px;margin:0;padding:9px 14px;border:1px solid #d9e2eb;border-radius:9px;background:#fff;color:#46566b;font-size:13px;font-weight:650;white-space:normal}
+#newProjectSubTabs .dynamic-sub-tab-btn.active{border-color:#087f75;background:#e5f7f3;color:#075e57;box-shadow:inset 0 0 0 1px rgba(8,127,117,.08)}
+#user_tab_add_entry .dynamic-sub-tab-content{padding:18px;border:1px solid #dce5ed;border-radius:13px;background:#fff}
+#user_tab_add_entry .nested-project-tabs{padding:14px;border:1px solid #d5e9e5;border-radius:12px;background:#f8fcfb}
+#user_tab_add_entry .nested-project-tabs .dynamic-sub-tabs{display:flex;flex-wrap:wrap;gap:7px;padding:0 0 12px;border-bottom:1px solid #dfe8ec;overflow:visible;white-space:normal}
+#user_tab_add_entry .nested-project-tabs .nested-child-btn{margin:0;padding:8px 12px;border:1px solid #d8e2eb;border-radius:8px;background:#fff;color:#526176;font-size:12px;font-weight:650;white-space:normal}
+#user_tab_add_entry .nested-project-tabs .nested-child-btn.active{border-color:#8acfc4;background:#e7f8f4;color:#075e57}
+#user_tab_add_entry .nested-child-content{padding:16px 4px 4px}
+@media(max-width:760px){#dynamicTabsEditor .dynamic-tabs-editor-header{align-items:stretch;flex-direction:column;padding:17px}#dynamicTabsEditor .dynamic-tabs-editor-header .btn{width:100%}#dynamicTabsEditor .nested-tab-editor-body{padding:14px}#dynamicTabsEditor .root-tab-editor-item>.tab-editor-heading{padding:13px}#dynamicTabsEditor .tab-editor-actions{width:100%;justify-content:flex-start}#dynamicTabsEditor .tab-editor-actions .btn{flex:1 1 auto}#dynamicTabsEditor .tab-fields-toggle-list{grid-template-columns:minmax(0,1fr)}#dynamicTabsEditor .tab-feature-options{grid-template-columns:minmax(0,1fr)}#dynamicTabsEditor .nested-sub-tabs-container{padding:12px}#dynamicTabsEditor .nested-sub-tabs-heading{align-items:stretch;flex-direction:column}#dynamicTabsEditor .nested-sub-tabs-heading .btn{width:100%}#dynamicTabsEditor .dynamic-tabs-save-bar .btn{width:100%}#user_tab_add_entry .dynamic-sub-tab-content{padding:12px}}
+@media(prefers-reduced-motion:reduce){#dynamicTabsEditor *,#newProjectSubTabs *{transition:none!important;scroll-behavior:auto!important}}
+
+/* ===== SINGLE-WINNER STICKY NAVIGATION =====
+   Navigation hand-off:
+   1) The hardcoded account tabs (New Project, Pending, Completed, Aborted, etc.)
+      stay at the top while they are the only navigation row in use.
+   2) When the dynamic main-tab row reaches the top, it takes over and the
+      hardcoded row is released to scroll away.
+   3) When a nested row reaches the top, it takes over and the dynamic main row
+      is released. Scrolling upward restores the previous row naturally.
+   ========================================================== */
+.content-area {
+    overflow: visible !important;
+    min-height: 0;
+}
+
+/* Sticky navigation stacking order: default 800, dynamic main 900, nested child 1000. */
+.user-config-tabs {
+    position: sticky;
+    top: 0;
+    z-index: 800;
+    isolation: isolate;
+    background: rgba(255, 255, 255, .98);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 4px 14px rgba(15, 35, 55, .09);
+}
+
+/* Keep the default row sticky, but always beneath both dynamic navigation rows. */
+.user-config-tabs.default-nav-released {
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 800 !important;
+}
+
+/* The main dynamic row is sticky until a nested child row arrives. */
+#user_tab_add_entry #newProjectSubTabs {
+    position: sticky;
+    top: 0;
+    z-index: 900;
+    isolation: isolate;
+    background: rgba(247, 249, 252, .99);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 5px 16px rgba(15, 35, 55, .10);
+    border-color: #cbd9e5;
+    scroll-margin-top: 0;
+}
+
+/* The main row remains sticky underneath the nested child row. */
+#user_tab_add_entry.child-nav-priority #newProjectSubTabs {
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 900 !important;
+}
+
+/* Child row takes over the entire dynamic-content width while stuck. */
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
+    isolation: isolate;
+    width: calc(100% + 64px);
+    max-width: none;
+    margin-left: -32px;
+    margin-right: -32px;
+    padding: 10px 32px 12px !important;
+    background: rgba(248, 252, 251, .99);
+    -webkit-backdrop-filter: blur(12px);
+    backdrop-filter: blur(12px);
+    box-shadow: 0 5px 16px rgba(15, 35, 55, .12);
+    border-bottom: 1px solid #cbdedb;
+    box-sizing: border-box;
+}
+
+#user_tab_add_entry.child-nav-priority #newProjectSubTabs,
+#user_tab_add_entry.child-nav-priority .nested-project-tabs > .dynamic-sub-tabs {
+    transition: box-shadow .18s ease, background-color .18s ease;
+}
+
+.custom-dialog-overlay { z-index: 999999 !important; }
+
+@media (max-width: 760px) {
+    #user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+        width: calc(100% + 52px);
+        margin-left: -26px;
+        margin-right: -26px;
+        padding: 9px 26px 11px !important;
+        gap: 6px;
+    }
+    #user_tab_add_entry #newProjectSubTabs {
+        gap: 6px;
+        padding: 8px;
+        border-radius: 0 0 11px 11px;
+    }
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .user-config-tabs,
+    #user_tab_add_entry #newProjectSubTabs,
+    #user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+        transition: none !important;
+    }
+}
+
+
+        /* Dynamic-tab editor controls */
+        .dynamic-tabs-save-bar { position: sticky; bottom: 0; z-index: 50; background: rgba(255,255,255,.97); border-top: 1px solid #e2e8f0; padding: 12px; margin-top: 16px; }
+        .display-tab-toggle { display:inline-flex; align-items:center; gap:10px; cursor:pointer; padding:8px 10px; border:1px solid #cbd5e1; border-radius:9px; background:#f8fafc; }
+        .display-tab-toggle input { width:18px; height:18px; accent-color:#0f766e; }
+        .display-tab-state { font-size:12px; color:#334155; }
+        #user_tab_dynamic_fields > div > div[style*="display:flex"] { position:sticky; bottom:0; z-index:40; background:rgba(255,255,255,.97); padding:12px 0; border-top:1px solid #e2e8f0; }
+        .dynamic-tabs-editor-list { padding-bottom:70px; }
+
+        .dynamic-tabs-save-bar { position: sticky; bottom: 0; z-index: 50; background: rgba(255,255,255,.97); border-top: 1px solid #e2e8f0; padding: 12px; margin-top: 16px; }
+        .display-tab-toggle { display:inline-flex; align-items:center; gap:10px; cursor:pointer; padding:8px 10px; border:1px solid #cbd5e1; border-radius:9px; background:#f8fafc; }
+        .display-tab-toggle input { width:18px; height:18px; accent-color:#0f766e; }
+        .display-tab-state { font-size:12px; color:#334155; }
+        #user_tab_dynamic_fields > div > div[style*="display:flex"] { position:sticky; bottom:0; z-index:40; background:rgba(255,255,255,.97); padding:12px 0; border-top:1px solid #e2e8f0; }
+        .dynamic-tabs-editor-list { padding-bottom:70px; }
+
+/* ===== FINAL DESIGN RULES: full outlines only, no directional accent borders ===== */
+#dynamicTabsEditor .root-tab-editor-item,
+#dynamicTabsEditor .sub-tab-editor-item,
+#dynamicTabsEditor .root-tab-editor-item > .tab-editor-heading,
+#dynamicTabsEditor .sub-tab-editor-item > .tab-editor-heading,
+#dynamicTabsEditor .nested-sub-tabs-heading,
+#dynamicTabsEditor .nested-project-tabs .dynamic-sub-tabs,
+#dynamicTabsEditor .dynamic-tabs-save-bar,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs .dynamic-sub-tabs,
+#user_tab_submit_tabs .submit-tabs-save-bar,
+#user_tab_dynamic_fields .account-dynamic-fields-add-bar {
+    border-top: 0 !important;
+    border-left: 0 !important;
+    border-right: 0 !important;
+    border-bottom: 0 !important;
+}
+#dynamicTabsEditor .root-tab-editor-item,
+#dynamicTabsEditor .sub-tab-editor-item,
+#dynamicTabsEditor .root-tab-editor-item > .tab-editor-heading,
+#dynamicTabsEditor .sub-tab-editor-item > .tab-editor-heading,
+#dynamicTabsEditor .nested-sub-tabs-heading,
+#dynamicTabsEditor .dynamic-tabs-save-bar,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs .dynamic-sub-tabs,
+#user_tab_submit_tabs .submit-tabs-save-bar,
+#user_tab_dynamic_fields .account-dynamic-fields-add-bar {
+    border: 1px solid #dce5ed !important;
+}
+#dynamicTabsEditor .root-tab-editor-item > .tab-editor-heading,
+#dynamicTabsEditor .sub-tab-editor-item > .tab-editor-heading,
+#dynamicTabsEditor .nested-sub-tabs-heading {
+    border-radius: 12px;
+}
+#dynamicTabsEditor .root-tab-editor-item { border: 1px solid var(--dt-line) !important; }
+#dynamicTabsEditor .sub-tab-editor-item { border: 1px solid #d8e2eb !important; }
+#dynamicTabsEditor .dynamic-tabs-save-bar {
+    position: sticky !important; bottom: 0; z-index: 100;
+    margin-top: 18px; padding: 12px;
+    background: rgba(255,255,255,.98);
+    box-shadow: 0 -8px 18px rgba(15,23,42,.08);
+    border-radius: 12px;
+}
+.content-area { overflow: visible !important; }
+#user_tab_submit_tabs { overflow: visible !important; }
+#user_tab_submit_tabs #submitTabsEditor { padding-bottom: 92px; }
+#user_tab_submit_tabs .submit-tabs-save-bar {
+    position: sticky; bottom: 0; z-index: 100;
+    display: flex; justify-content: flex-end;
+    margin: 14px 0 0; padding: 12px;
+    background: rgba(255,255,255,.98);
+    box-shadow: 0 -8px 18px rgba(15,23,42,.08);
+    border-radius: 12px;
+}
+#user_tab_submit_tabs .submit-tabs-save-bar .btn { min-height: 44px; }
+#user_tab_dynamic_fields { overflow: visible !important; }
+#user_tab_dynamic_fields #userGlobalDynamicFieldsList { padding-bottom: 92px; }
+#user_tab_dynamic_fields .account-dynamic-fields-add-bar {
+    position: sticky; bottom: 0; z-index: 100;
+    display: flex; justify-content: flex-end; gap: 10px; flex-wrap: wrap;
+    margin-top: 12px; padding: 12px;
+    background: rgba(255,255,255,.98);
+    box-shadow: 0 -8px 18px rgba(15,23,42,.08);
+    border-radius: 12px;
+}
+.account-dynamic-field-card {
+    display: block; width: 100%; margin: 0 0 12px; padding: 0;
+    border: 1px solid #dce3ec; border-radius: 12px;
+    background: #fff; box-shadow: 0 3px 10px rgba(15,23,42,.04);
+    cursor: pointer; overflow: hidden; transition: background .15s, box-shadow .15s;
+}
+.account-dynamic-field-card:hover { background: #fbfdfd; box-shadow: 0 5px 14px rgba(15,23,42,.07); }
+.account-dynamic-field-card:focus-visible { outline: 2px solid #087f75; outline-offset: 2px; }
+.account-dynamic-field-heading {
+    display: flex; align-items: center; justify-content: space-between; gap: 12px;
+    padding: 15px; min-width: 0;
+}
+.account-dynamic-field-title-wrap { display: flex; flex-direction: column; gap: 5px; min-width: 0; }
+.account-dynamic-field-title { color: #1a1a2e; overflow-wrap: anywhere; }
+.account-dynamic-field-key { color: #6b7280; font-size: 12px; overflow-wrap: anywhere; }
+.account-dynamic-field-heading-side { display: flex; align-items: center; gap: 10px; flex: 0 0 auto; }
+.account-dynamic-field-type { font-size: 11px; color: #475569; background: #eef2f7; padding: 5px 9px; border-radius: 999px; }
+.account-dynamic-field-chevron { display: inline-flex; align-items: center; justify-content: center; width: 28px; height: 28px; border: 1px solid #dce3ec; border-radius: 8px; color: #334155; font-weight: 700; }
+.account-dynamic-field-details { padding: 14px 15px 15px; border: 1px solid #e5eaf0; border-radius: 10px; margin: 0 12px 12px; background: #f8fafc; cursor: default; }
+.account-dynamic-field-details[hidden] { display: none !important; }
+.account-dynamic-field-info { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px 14px; color: #64748b; font-size: 13px; overflow-wrap: anywhere; }
+.account-dynamic-subfield { grid-column: 1 / -1; margin-left: 8px; font-size: 12px; color: #64748b; }
+.account-dynamic-field-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; padding: 12px 0 0; border: 1px solid #e5eaf0; border-radius: 9px; }
+@media (max-width: 640px) {
+    #user_tab_submit_tabs .submit-tabs-save-bar .btn,
+    #user_tab_dynamic_fields .account-dynamic-fields-add-bar .btn { width: 100%; }
+    #user_tab_submit_tabs .submit-tabs-save-bar,
+    #user_tab_dynamic_fields .account-dynamic-fields-add-bar { justify-content: stretch; }
+    .account-dynamic-field-info { grid-template-columns: minmax(0,1fr); }
+    .account-dynamic-field-heading { align-items: flex-start; }
+    .account-dynamic-field-heading-side { gap: 6px; }
+}
+
+
+/* ===== STICKY ACTIONS: ONLY THE BUTTONS FLOAT; THE WRAPPER IS CLICK-THROUGH ===== */
+#dynamicTabsEditor .dynamic-tabs-save-bar,
+.dynamic-tabs-save-bar,
+#user_tab_submit_tabs .submit-tabs-save-bar,
+#user_tab_dynamic_fields .account-dynamic-fields-add-bar {
+    position: sticky !important;
+    bottom: 0 !important;
+    z-index: 100 !important;
+    display: flex !important;
+    justify-content: flex-end !important;
+    align-items: center !important;
+    gap: 10px !important;
+    flex-wrap: wrap !important;
+    width: 100% !important;
+    min-height: 0 !important;
+    margin: 12px 0 0 !important;
+    padding: 0 !important;
+    background: transparent !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    pointer-events: none !important;
+}
+
+/* The invisible sticky area must never block controls beneath it. */
+#dynamicTabsEditor .dynamic-tabs-save-bar > *,
+.dynamic-tabs-save-bar > *,
+#user_tab_submit_tabs .submit-tabs-save-bar > *,
+#user_tab_dynamic_fields .account-dynamic-fields-add-bar > * {
+    pointer-events: auto !important;
+    flex: 0 0 auto;
+}
+
+/* Keep only the actual controls visible and interactive—not a white card. */
+#dynamicTabsEditor .dynamic-tabs-save-bar .btn,
+.dynamic-tabs-save-bar .btn,
+#user_tab_submit_tabs .submit-tabs-save-bar .btn,
+#user_tab_dynamic_fields .account-dynamic-fields-add-bar .btn {
+    pointer-events: auto !important;
+    position: relative;
+    z-index: 101;
+    box-shadow: 0 3px 10px rgba(15, 23, 42, .16);
+}
+
+/* Preserve scroll clearance without creating a visible backing panel. */
+#user_tab_submit_tabs #submitTabsEditor,
+#user_tab_dynamic_fields #userGlobalDynamicFieldsList,
+#dynamicTabsEditor .dynamic-tabs-editor-list {
+    padding-bottom: 76px !important;
+}
+
+@media (max-width: 640px) {
+    #user_tab_submit_tabs .submit-tabs-save-bar,
+    #user_tab_dynamic_fields .account-dynamic-fields-add-bar,
+    #dynamicTabsEditor .dynamic-tabs-save-bar {
+        justify-content: flex-end !important;
+        padding: 0 !important;
+        background: transparent !important;
+        border: 0 !important;
+        box-shadow: none !important;
+    }
+    #user_tab_submit_tabs .submit-tabs-save-bar .btn,
+    #user_tab_dynamic_fields .account-dynamic-fields-add-bar .btn,
+    #dynamicTabsEditor .dynamic-tabs-save-bar .btn {
+        width: auto !important;
+        max-width: 100%;
+    }
+}
+
+
+/* ===== Dynamic tab editor interaction updates ===== */
+#dynamicTabsEditor .tab-editor-heading {
+    cursor: pointer;
+}
+#dynamicTabsEditor .tab-editor-heading:focus-visible {
+    outline: 2px solid #087f75;
+    outline-offset: -2px;
+}
+#dynamicTabsEditor .tab-editor-item:not(.is-expanded) .tab-delete-button {
+    display: none !important;
+}
+#dynamicTabsEditor .tab-editor-item.is-expanded .tab-delete-button {
+    display: inline-flex !important;
+}
+#dynamicTabsEditor .display-tab-setting select.display-tab-input {
+    width: 100%;
+    max-width: 220px;
+    min-height: 40px;
+    padding: 9px 12px;
+    border: 1px solid #cfd8e3;
+    border-radius: 8px;
+    background: #fff;
+    color: #172033;
+    cursor: pointer;
+}
+#dynamicTabsEditor .tab-editor-heading .tab-editor-actions {
+    cursor: default;
+}
+
+
+/* ===== STICKY NAV VISUAL SPACING FIX (preserve existing scroll hand-off) =====
+   Keep the default account tabs, dynamic main tabs, and nested tabs flush
+   vertically. This changes only default layout spacing; sticky positioning,
+   z-index priority, sentinels, and scroll listeners remain untouched.
+*/
+.user-config-tabs {
+    margin-bottom: 0 !important;
+}
+.user-config-content {
+    padding-top: 0 !important;
+}
+#user_tab_add_entry #newProjectSubTabs {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+/* Remove the parent container's top inset above the nested sticky row. */
+#user_tab_add_entry .nested-project-tabs {
+    padding-top: 0 !important;
+}
+/* Do not add a gap above the nested sticky row or between its own tabs. */
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+/* Keep tab rows edge-to-edge without changing their horizontal button spacing. */
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    align-self: stretch;
+}
+/* Keep the nested sub-tab row flush with the very top of its parent element.
+   The sticky row previously had 10px (9px on mobile) of top padding, which
+   made its buttons look separated from the main dynamic tab above it.
+   This is a visual-only change: sticky positioning and scroll hand-off stay intact. */
+#user_tab_add_entry .nested-project-tabs {
+    padding-top: 0 !important;
+}
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+
+/* ===== END STICKY NAV VISUAL SPACING FIX ===== */
+
+/* ===== FINAL FIX: SUB-TAB STICKY ROW TOUCHES MAIN DYNAMIC TAB =====
+   The active dynamic-tab content had top padding before its nested tabs.
+   Remove only that inset when the content contains nested-project-tabs, so
+   the child sticky row begins flush against the bottom of #newProjectSubTabs.
+   Sticky top offsets, z-index priority, sentinels, and scroll hand-off stay intact.
+*/
+#user_tab_add_entry .dynamic-sub-tab-content:has(.nested-project-tabs) {
+    padding-top: 0 !important;
+    margin-top: 0 !important;
+}
+
+#user_tab_add_entry .dynamic-sub-tab-content .nested-project-tabs {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+}
+
+#user_tab_add_entry .dynamic-sub-tab-content .nested-project-tabs > .dynamic-sub-tabs {
+    margin-top: 0 !important;
+    padding-top: 0 !important;
+    top: 0 !important;
+}
+
+@supports not selector(.dynamic-sub-tab-content:has(.nested-project-tabs)) {
+    /* Fallback for older browsers: remove the top inset from the content row. */
+    #user_tab_add_entry .dynamic-sub-tab-content {
+        padding-top: 0 !important;
+    }
+}
+/* ===== END FINAL SUB-TAB FLUSH FIX ===== */
+
+/* ===== SUB-TAB STICKY HEIGHT, CENTERING, AND LEFT-AXIS ALIGNMENT =====
+   Match the nested sticky row to the main dynamic-tab row's measured height,
+   plus 2px. The buttons stay vertically centered, and their left edge aligns
+   with the first main dynamic-tab button. Sticky hand-off logic is unchanged.
+*/
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    display: flex !important;
+    align-items: center !important;
+    box-sizing: border-box !important;
+    min-height: 0 !important;
+    height: var(--nested-sticky-nav-height, auto) !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    padding-left: 42px !important;
+    padding-right: 32px !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    background: #f8fcfb !important;
+    opacity: 1 !important;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs > .nested-child-btn {
+    align-self: center !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    flex-shrink: 0;
+}
+
+@media (max-width: 760px) {
+    #user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+        padding-left: 34px !important;
+        padding-right: 26px !important;
+    }
+}
+/* ===== END SUB-TAB STICKY HEIGHT, CENTERING, AND LEFT-AXIS ALIGNMENT ===== */
+
+
+
+
+/* ===== REQUESTED STICKY TAB CLEAN WHITE DESIGN (CSS ONLY) =====
+   Keep all existing sticky positioning and scroll hand-off behaviour.
+   Remove outlines, border colors, rounded corners, shadows, and tinted
+   backgrounds from the default, main dynamic, and nested sub-tab areas.
+*/
+.user-config-tabs,
+.user-config-tabs.default-nav-released {
+    border-bottom: 0 !important;
+    background: #fff !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+}
+
+/* Main dynamic sticky tab row and its buttons */
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry #newProjectSubTabs .dynamic-sub-tab-btn,
+#user_tab_add_entry #newProjectSubTabs .dynamic-sub-tab-btn:hover,
+#user_tab_add_entry #newProjectSubTabs .dynamic-sub-tab-btn.active {
+    border: 0 !important;
+    border-color: transparent !important;
+    border-radius: 0 !important;
+    outline-color: transparent !important;
+    box-shadow: none !important;
+    background: #fff !important;
+}
+
+/* Nested sticky sub-tab row and all of its buttons */
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs .nested-child-btn,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs .nested-child-btn:hover,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs .nested-child-btn.active {
+    border: 0 !important;
+    border-color: transparent !important;
+    border-radius: 0 !important;
+    outline-color: transparent !important;
+    box-shadow: none !important;
+    background: #fff !important;
+}
+
+/* Make all tab content and nested containers plain white, without outlines */
+#user_tab_add_entry .dynamic-sub-tab-content,
+#user_tab_add_entry .nested-project-tabs,
+#user_tab_add_entry .nested-child-content {
+    border: 0 !important;
+    border-color: transparent !important;
+    border-radius: 0 !important;
+    outline: 0 !important;
+    box-shadow: none !important;
+    background: #fff !important;
+}
+
+/* Remove any remaining bottom divider from the default and dynamic tab rows */
+.user-config-tabs,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    border-top: 0 !important;
+    border-right: 0 !important;
+    border-bottom: 0 !important;
+    border-left: 0 !important;
+    background-color: #fff !important;
+    -webkit-backdrop-filter: none !important;
+    backdrop-filter: none !important;
+}
+
+
+/* ===== FINAL TAB ALIGNMENT + ACTIVE UNDERLINE =====
+   Keep the existing sticky positioning and scroll hand-off behaviour.
+   Remove row-level horizontal inset so the first dynamic/sub-tab button
+   starts on the same left axis as the default New Project button.
+*/
+#user_tab_add_entry #newProjectSubTabs {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    gap: 0 !important;
+    border: 0 !important;
+    background: #fff !important;
+}
+
+#user_tab_add_entry #newProjectSubTabs > .dynamic-sub-tab-btn {
+    flex: 0 0 auto;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+    border: 0 !important;
+    border-bottom: 2px solid transparent !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    background: #fff !important;
+    box-sizing: border-box;
+}
+
+#user_tab_add_entry #newProjectSubTabs > .dynamic-sub-tab-btn.active {
+    border-bottom: 2px solid #00695c !important;
+    color: #00695c !important;
+    font-weight: 700 !important;
+    background: #fff !important;
+}
+
+/* Nested sub-tab row: remove row and first-button left/right insets. */
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    gap: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    border: 0 !important;
+    border-radius: 0 !important;
+    background: #fff !important;
+    box-shadow: none !important;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs > .nested-child-btn {
+    flex: 0 0 auto;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    padding-left: 16px !important;
+    padding-right: 16px !important;
+    border: 0 !important;
+    border-bottom: 2px solid transparent !important;
+    border-radius: 0 !important;
+    box-shadow: none !important;
+    background: #fff !important;
+    box-sizing: border-box;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs > .nested-child-btn.active {
+    border-bottom: 2px solid #00695c !important;
+    color: #00695c !important;
+    font-weight: 700 !important;
+    background: #fff !important;
+}
+
+/* Prevent inherited first-child offsets from shifting either tab row. */
+#user_tab_add_entry #newProjectSubTabs > :first-child,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs > :first-child {
+    margin-left: 0 !important;
+}
+
+
+/* ===== FINAL FIX: NESTED SUB-TAB ROW MUST MATCH MAIN DYNAMIC ROW WIDTH =====
+   The nested row and its first button must share the exact same left axis and
+   full available width as #newProjectSubTabs. Remove horizontal padding,
+   margins, negative offsets, and parent insets that could make the row appear
+   narrower or start 10% inward. Sticky positioning and scroll hand-off remain
+   unchanged.
+*/
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry .dynamic-sub-tab-content,
+#user_tab_add_entry .dynamic-sub-tab-content:has(.nested-project-tabs),
+#user_tab_add_entry .dynamic-sub-tab-content .nested-project-tabs,
+#user_tab_add_entry .nested-project-tabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    box-sizing: border-box !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+
+#user_tab_add_entry .dynamic-sub-tab-content:has(.nested-project-tabs),
+#user_tab_add_entry .dynamic-sub-tab-content .nested-project-tabs,
+#user_tab_add_entry .nested-project-tabs {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+    align-self: stretch !important;
+    justify-content: flex-start !important;
+    box-sizing: border-box !important;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs > .nested-child-btn,
+#user_tab_add_entry #newProjectSubTabs > .dynamic-sub-tab-btn {
+    margin-left: 0 !important;
+    flex-shrink: 0 !important;
+}
+
+@media (max-width: 760px) {
+    #user_tab_add_entry .dynamic-sub-tab-content:has(.nested-project-tabs),
+    #user_tab_add_entry .dynamic-sub-tab-content .nested-project-tabs,
+    #user_tab_add_entry .nested-project-tabs,
+    #user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+        width: 100% !important;
+        max-width: 100% !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+        padding-left: 0 !important;
+        padding-right: 0 !important;
+    }
+}
+/* ===== END FINAL FULL-WIDTH SUB-TAB ALIGNMENT FIX ===== */
+
+
+/* ===== EXACT GLOBAL-HEADER-TO-STICKY-NAV CONTACT FIX =====
+   .scroll-body begins immediately below .main-header. A sticky top of 0
+   therefore pins each navigation row directly to the header's bottom edge.
+   No header-height offset, bottom offset, or extra sticky gap is used.
+*/
+.user-config-tabs,
+.user-config-tabs.default-nav-released,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry.child-nav-priority #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    top: 0 !important;
+    scroll-margin-top: 0 !important;
+}
+
+/* ELIMINATE THE HEADER-TO-STICKY GAP AT ITS SOURCE.
+   The scroll viewport starts directly under .main-header. Remove all top
+   padding from that viewport on desktop and mobile so sticky rows can meet
+   the header edge with no 15px/10px inset. */
+.scroll-body {
+    padding-top: 0 !important;
+    scroll-padding-top: 0 !important;
+}
+
+/* Keep the header-gap fix, restore the sticky rows' full available width,
+   and remove bottom padding from the sticky row containers themselves. */
+.user-config-tabs,
+.user-config-tabs.default-nav-released,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry.child-nav-priority #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    top: 0 !important;
+    margin-top: 0 !important;
+    scroll-margin-top: 0 !important;
+    translate: 0 0 !important;
+    padding-bottom: 0 !important;
+    width: 100% !important;
+    max-width: 100% !important;
+    min-width: 0 !important;
+}
+
+/* Preserve the original horizontal layout of the page; only the top inset
+   is removed from the scroll viewport. */
+.scroll-body {
+    padding-top: 0 !important;
+    scroll-padding-top: 0 !important;
+}
+
+/* The sentinel checks switch priority only when the sentinel reaches the
+   exact scroll viewport top, with no early 1px allowance. */
+
+/* ===== FINAL CORRECTION: NO STICKY-ROW PADDING + MATCH CONTENT-AREA WIDTH =====
+   Keep the top-contact fix exactly as it is.
+   The content-area has 20px of internal horizontal padding, so each navigation
+   row expands by that exact amount on both sides to match the content-area's
+   outer width. Row containers themselves have zero left/right/bottom padding.
+   Button padding is deliberately preserved so button labels remain readable.
+*/
+.content-area > .user-config-tabs,
+.content-area .user-config-tabs,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry.child-nav-priority #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    box-sizing: border-box !important;
+    width: calc(100% + 40px) !important;
+    max-width: none !important;
+    min-width: 0 !important;
+    margin-left: -20px !important;
+    margin-right: -20px !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-left: 0 !important;
+    padding-right: 0 !important;
+    padding-bottom: 0 !important;
+    padding-block-end: 0 !important;
+    scroll-margin-top: 0 !important;
+    top: 0 !important;
+    translate: 0 0 !important;
+}
+
+/* Explicitly remove any bottom padding from the nested row, including mobile
+   overrides and earlier height/alignment rules. */
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    padding-block: 0 !important;
+}
+
+/* The main row has no bottom padding either; only the buttons retain their
+   own horizontal padding. */
+#user_tab_add_entry #newProjectSubTabs {
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    padding-block: 0 !important;
+}
+
+/* Preserve the exact header contact: no top inset in the scroll viewport. */
+.scroll-body {
+    padding-top: 0 !important;
+    scroll-padding-top: 0 !important;
+}
+/* ===== END EXACT GLOBAL-HEADER-TO-STICKY-NAV CONTACT FIX ===== */
+
+
+/* ===== EXACT STICKY NAV HEIGHT HIERARCHY =====
+   default account tabs are 1px shorter than the main dynamic row;
+   the nested row is 1px taller than the main dynamic row.
+   JS measures the main row and applies the exact pixel heights.
+*/
+.user-config-tabs,
+.user-config-tabs.default-nav-released,
+#user_tab_add_entry #newProjectSubTabs,
+#user_tab_add_entry.child-nav-priority #newProjectSubTabs,
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    box-sizing: border-box !important;
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+    padding-top: 0 !important;
+    padding-bottom: 0 !important;
+    align-items: center !important;
+}
+
+.user-config-tabs,
+.user-config-tabs.default-nav-released {
+    min-height: 0 !important;
+}
+
+.user-config-tabs > .user-config-tab-btn {
+    min-height: 0 !important;
+    align-self: center !important;
+}
+
+#user_tab_add_entry #newProjectSubTabs {
+    min-height: 0 !important;
+}
+
+#user_tab_add_entry #newProjectSubTabs > .dynamic-sub-tab-btn {
+    min-height: 0 !important;
+    align-self: center !important;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs {
+    min-height: 0 !important;
+}
+
+#user_tab_add_entry .nested-project-tabs > .dynamic-sub-tabs > .nested-child-btn {
+    min-height: 0 !important;
+    align-self: center !important;
+}
+/* ===== END EXACT STICKY NAV HEIGHT HIERARCHY ===== */
+
+
+/* ===== Requested navigation and account-list updates ===== */
+.two-col.dashboard-layout { display:block !important; grid-template-columns:minmax(0,1fr) !important; gap:0 !important; margin-top:0 !important; }
+.two-col.dashboard-layout > .content-area { width:100% !important; max-width:100% !important; min-width:0 !important; }
+/* Keep tab rows horizontally scrollable when their buttons exceed the available width, but hide every scrollbar. */
+.dashboard-tabs, .user-config-tabs, .dynamic-sub-tabs, #newProjectSubTabs,
+#dynamicTabsEditor .dynamic-sub-tabs, .nested-project-tabs > .dynamic-sub-tabs,
+.nested-project-tabs .dynamic-sub-tabs {
+    display:flex !important; flex-wrap:nowrap !important; overflow-x:auto !important; overflow-y:hidden !important;
+    max-width:100% !important; min-width:0 !important; white-space:nowrap !important;
+    scrollbar-width:none !important; -ms-overflow-style:none !important; -webkit-overflow-scrolling:touch;
+}
+.dashboard-tabs::-webkit-scrollbar, .user-config-tabs::-webkit-scrollbar, .dynamic-sub-tabs::-webkit-scrollbar,
+#newProjectSubTabs::-webkit-scrollbar, #dynamicTabsEditor .dynamic-sub-tabs::-webkit-scrollbar,
+.nested-project-tabs > .dynamic-sub-tabs::-webkit-scrollbar, .nested-project-tabs .dynamic-sub-tabs::-webkit-scrollbar,
+*::-webkit-scrollbar { display:none !important; width:0 !important; height:0 !important; }
+* { scrollbar-width:none !important; }
+.dashboard-tab-btn, .user-config-tab-btn, .dynamic-sub-tab-btn, .nested-child-btn { flex:0 0 auto !important; }
+.accounts-list { display:flex; flex-direction:column; gap:8px; width:100%; }
+.account-list-row { margin:0; width:100%; }
+.account-list-select { display:flex; align-items:center; justify-content:space-between; gap:14px; width:100%; min-width:0; padding:14px 16px; text-align:left; background:#fff; border:1px solid #e5e7eb; border-radius:10px; cursor:pointer; }
+.account-list-select:hover { background:#f8fafc; border-color:#00897b; }
+.account-list-name { font-weight:650; color:#1f2937; overflow-wrap:anywhere; }
+.account-list-email { color:#6b7280; font-size:13px; overflow-wrap:anywhere; text-align:right; }
+.accounts-empty { padding:28px 12px; color:#6b7280; text-align:center; }
+.menu-drawer-overlay { position:fixed; inset:0; z-index:5000; background:rgba(15,23,42,.42); opacity:0; visibility:hidden; pointer-events:none; transition:opacity .22s ease, visibility .22s ease; }
+.menu-drawer-overlay.active { opacity:1; visibility:visible; pointer-events:auto; }
+.menu-drawer { position:absolute; top:0; left:0; bottom:0; width:min(340px,86vw); background:#fff; box-shadow:8px 0 30px rgba(0,0,0,.18); transform:translateX(-105%); transition:transform .25s ease; padding:20px 16px; display:flex; flex-direction:column; gap:10px; }
+.menu-drawer-overlay.active .menu-drawer { transform:translateX(0); }
+.menu-drawer-heading { display:flex; align-items:center; justify-content:space-between; font-size:20px; color:#0f172a; padding-bottom:12px; border-bottom:1px solid #e5e7eb; }
+.menu-drawer-close { border:0; background:transparent; font-size:30px; line-height:1; cursor:pointer; color:#64748b; padding:0 5px; }
+.menu-account-identity { padding:14px 12px; background:#f8fafc; border-radius:10px; overflow-wrap:anywhere; }
+.menu-account-username { font-weight:700; color:#0f172a; margin-bottom:5px; }
+.menu-account-email { color:#64748b; font-size:13px; }
+.menu-drawer-item { width:100%; text-align:left; padding:13px 12px; border:0; border-radius:8px; background:#fff; color:#1f2937; font-size:15px; cursor:pointer; }
+.menu-drawer-item:hover { background:#f1f5f9; color:#00695c; }
+@media (max-width:640px) { .account-list-select { align-items:flex-start; flex-direction:column; gap:5px; } .account-list-email { text-align:left; } }
 </style>
 </head>
 <body>
     <div class="custom-body">
-        <div class="main-header"  style="display: flex;">
+        <div class="main-header" style="display:flex;">
+            <div><h1>SceneIQ <span>Server</span></h1></div>
             <div>
-                <h1>SceneIQ <span>Server</span></h1>
-            </div>
-            
-            <div>
-                <button   style="background: none; border: 1px solid linear-gradient(135deg, #00695c 0%, #00897b 50%, #26a69a 100%); padding: 8px 15px; color: white; font-size: 0.8rem; border-radius: 10px;" onclick="window.location.href='index.php'">← Tasks</button>
+                <?php if ($selectedUserId > 0 && $selectedUser): ?>
+                    <button type="button" class="debug-btn" id="menuButton" onclick="openMenuDrawer()" aria-haspopup="dialog" aria-controls="menuDrawer">Menu</button>
+                <?php else: ?>
+                    <button type="button" class="debug-btn" id="taskButton" onclick="window.location.href='index.php'">Task</button>
+                <?php endif; ?>
             </div>
         </div>
         
@@ -2676,32 +3710,9 @@
                     <div class="notification error"> <?php echo htmlspecialchars($flashError); ?></div>
                 <?php endif; ?>
                 
-                <div class="two-col">
-                    <div class="sidebar">
-                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
-                            <h2 style="margin:0;"> Users</h2>
-                            <?php if ($selectedUserId > 0): ?>
-                                <form method="POST" style="margin:0;">
-                                    <button type="submit" name="clear_user" class="btn btn-secondary btn-sm" style="padding:4px 12px; font-size:12px;">Dashboard</button>
-                                </form>
-                            <?php endif; ?>
-                        </div>
-                        
-                        <button class="search-users-btn" onclick="openUserSearchDialog()">
-                            Search Account
-                        </button>
-                        
-                    </div>
-                    
+                <div class="two-col dashboard-layout">
                     <div class="content-area">
                         <?php if ($selectedUserId > 0 && $selectedUser): ?>
-                            <div class="user-settings-header">
-                                <div class="user-info">
-                                    <h2><?php echo htmlspecialchars($selectedUser['username']); ?></h2>
-                                    <div class="email"><?php echo htmlspecialchars($selectedUser['email']); ?></div>
-                                </div>
-                            </div>
-                            
                             <div class="user-config-tabs">
                                 <button class="user-config-tab-btn  active" onclick="switchUserConfigTab('add_entry', this)"> New Project</button>
                                 <button class="user-config-tab-btn" onclick="switchUserConfigTab('pending', this)"> Pending</button>
@@ -2709,7 +3720,7 @@
                                 <button class="user-config-tab-btn" onclick="switchUserConfigTab('aborted', this)"> Aborted</button>
                                 <button class="user-config-tab-btn" onclick="switchUserConfigTab('dynamic_tabs', this)"> Dynamic Tabs</button>
                                 <button class="user-config-tab-btn" onclick="switchUserConfigTab('submit_tabs', this)"> Submit Tabs</button>
-                                <button class="user-config-tab-btn" onclick="switchUserConfigTab('dynamic_fields', this)"> Dynamic Fields</button>
+                                <button class="user-config-tab-btn" onclick="switchUserConfigTab('dynamic_fields', this)"> Dynamic Content</button>
                             </div>
                             
                             <div id="user_tab_pending" class="user-config-content active">
@@ -2726,12 +3737,12 @@
 
                             <!-- Dynamic Fields Tab -->
                             <div id="user_tab_dynamic_fields" class="user-config-content">
-                                <h3 style="margin-bottom:15px; color:#1a1a2e;">Global Dynamic Fields</h3>
-                                <p style="color:#6b7280; margin-bottom:15px;">These fields are used for all users.</p>
+                                <h3 style="margin-bottom:15px; color:#1a1a2e;">Dynamic Content</h3>
+                                <p style="color:#6b7280; margin-bottom:15px;">These fields belong only to the selected account.</p>
                                 
                                 <div id="userGlobalDynamicFieldsList"></div>
                                 
-                                <div style="margin-top:15px; display:flex; gap:10px; flex-wrap:wrap;">
+                                <div class="account-dynamic-fields-add-bar">
                                     <button type="button" class="btn btn-primary" onclick="addGlobalDynamicField()">+ Add Field</button>
                                 </div>
                             </div>
@@ -2749,23 +3760,19 @@
                             
 
                             <div id="user_tab_add_entry" class="user-config-content active">
-                                <h3 style="margin-bottom:15px; color:#1a1a2e;">Add New Project</h3>
-                                <?php
-                                    $globalConfig = getGlobalConfig($pdo);
-                                    $globalDynamicFields = $globalConfig ? json_decode($globalConfig['dynamic_fields'], true) : [];
-                                    if (!is_array($globalDynamicFields)) $globalDynamicFields = [];
-                                ?>
+                                <?php $globalDynamicFields = $userDynamicFields; ?>
                                 <?php if (empty($globalDynamicFields)): ?>
-                                    <p style="color:#6b7280;">No dynamic fields configured globally. Please add fields in the Dynamic Fields tab first.</p>
+                                    <p style="color:#6b7280;">No dynamic fields configured for this account. Add fields in the Account Dynamic Fields tab first.</p>
                                 <?php else: ?>
                                     <!-- Dynamic Sub Tabs for New Project -->
                                     <div class="dynamic-sub-tabs" id="newProjectSubTabs">
                                         <?php 
                                         $firstTabIndex = !empty($userDynamicTabs) ? array_key_first($userDynamicTabs) : -1;
                                         foreach ($userDynamicTabs as $tabIndex => $tab): 
+                                            if (array_key_exists('display_tab', $tab) && empty($tab['display_tab'])) continue;
                                             $isActive = ($tabIndex === $firstTabIndex) ? 'active' : '';
                                         ?>
-                                            <button class="dynamic-sub-tab-btn <?php echo $isActive; ?>" data-tab="tab_<?php echo $tabIndex; ?>" onclick="switchNewProjectSubTab('tab_<?php echo $tabIndex; ?>', this)"> <?php echo htmlspecialchars($tab['tab_name'] ?? 'Tab ' . ($tabIndex + 1)); ?></button>
+                                            <button type="button" class="dynamic-sub-tab-btn <?php echo $isActive; ?>" data-tab="tab_<?php echo $tabIndex; ?>" data-submit-enabled="<?php echo (!array_key_exists('submit_tab', $tab) || !empty($tab['submit_tab'])) ? '1' : '0'; ?>" onclick="switchNewProjectSubTab('tab_<?php echo $tabIndex; ?>', this)"> <?php echo htmlspecialchars($tab['tab_name'] ?? 'Tab ' . ($tabIndex + 1)); ?></button>
                                         <?php endforeach; ?>
                                     </div>
                                     
@@ -2778,38 +3785,56 @@
                                     <?php 
                                     $firstTabIndex = !empty($userDynamicTabs) ? array_key_first($userDynamicTabs) : -1;
                                     foreach ($userDynamicTabs as $tabIndex => $tab): 
+                                        if (array_key_exists('display_tab', $tab) && empty($tab['display_tab'])) continue;
                                         $isActive = ($tabIndex === $firstTabIndex) ? 'active' : '';
                                     ?>
                                         <div id="newProjectSubTab_tab_<?php echo $tabIndex; ?>" class="dynamic-sub-tab-content <?php echo $isActive; ?>">
-                                            <?php 
+                                            <?php
+                                                $children = (isset($tab['sub_tabs_mode']) && $tab['sub_tabs_mode'] === 'add' && !empty($tab['sub_tabs']) && is_array($tab['sub_tabs'])) ? array_values(array_filter($tab['sub_tabs'], function($child) { return !array_key_exists('display_tab', $child) || !empty($child['display_tab']); })) : [];
+                                                if (!empty($children)):
+                                            ?>
+                                                <?php if (!empty($tab['header']) || !empty($tab['description'])): ?>
+                                                    <div style="margin-bottom:12px;padding:10px;background:#f0fdf4;border-radius:8px;border-left:4px solid #00695c;">
+                                                        <?php if (!empty($tab['header'])): ?><h4 style="color:#00695c;"><?php echo htmlspecialchars($tab['header']); ?></h4><?php endif; ?>
+                                                        <?php if (!empty($tab['description'])): ?><p style="color:#6b7280;font-size:14px;"><?php echo htmlspecialchars($tab['description']); ?></p><?php endif; ?>
+                                                    </div>
+                                                <?php endif; ?>
+                                                <div class="nested-project-tabs" data-parent-tab="<?php echo $tabIndex; ?>">
+                                                    <div class="dynamic-sub-tabs" style="margin-bottom:12px;">
+                                                        <?php foreach ($children as $childIndex => $child): ?>
+                                                            <button type="button" class="dynamic-sub-tab-btn nested-child-btn <?php echo $childIndex === 0 ? 'active' : ''; ?>" onclick="switchNewProjectNestedSubTab(this)"><?php echo htmlspecialchars($child['tab_name'] ?? ('Sub Tab ' . ($childIndex + 1))); ?></button>
+                                                        <?php endforeach; ?>
+                                                    </div>
+                                                    <?php foreach ($children as $childIndex => $child):
+                                                        $childFields = [];
+                                                        foreach (($child['dynamic_fields_display'] ?? []) as $childFieldKey) {
+                                                            if (isset($globalDynamicFields[$childFieldKey])) $childFields[$childFieldKey] = $globalDynamicFields[$childFieldKey];
+                                                        }
+                                                    ?>
+                                                        <div class="nested-child-content <?php echo $childIndex === 0 ? 'active' : ''; ?>" style="display:<?php echo $childIndex === 0 ? 'block' : 'none'; ?>;">
+                                                            <?php if (!empty($child['header']) || !empty($child['description'])): ?>
+                                                                <div style="margin-bottom:12px;padding:10px;background:#f0fdf4;border-radius:8px;border-left:4px solid #00695c;">
+                                                                    <?php if (!empty($child['header'])): ?><h4 style="color:#00695c;"><?php echo htmlspecialchars($child['header']); ?></h4><?php endif; ?>
+                                                                    <?php if (!empty($child['description'])): ?><p style="color:#6b7280;font-size:14px;"><?php echo htmlspecialchars($child['description']); ?></p><?php endif; ?>
+                                                                </div>
+                                                            <?php endif; ?>
+                                                            <?php if (!empty($childFields)) renderNewProjectForm($childFields, $selectedUserId); else echo '<p style="color:#6b7280;">No fields selected for this sub-tab.</p>'; ?>
+                                                        </div>
+                                                    <?php endforeach; ?>
+                                                </div>
+                                            <?php else:
                                                 $displayFields = $tab['dynamic_fields_display'] ?? [];
                                                 $filteredFields = [];
-                                                foreach ($displayFields as $fieldKey) {
-                                                    if (isset($globalDynamicFields[$fieldKey])) {
-                                                        $filteredFields[$fieldKey] = $globalDynamicFields[$fieldKey];
-                                                    }
-                                                }
-                                                if (!empty($filteredFields)) {
-                                                    echo '<div style="margin-bottom:15px; padding:10px; background:#f0fdf4; border-radius:8px; border-left:4px solid #00695c;">';
-                                                    if (!empty($tab['header'])) {
-                                                        echo '<h4 style="color:#00695c;">' . htmlspecialchars($tab['header']) . '</h4>';
-                                                    }
-                                                    if (!empty($tab['description'])) {
-                                                        echo '<p style="color:#6b7280; font-size:14px;">' . htmlspecialchars($tab['description']) . '</p>';
-                                                    }
-                                                    echo '</div>';
-                                                    renderNewProjectForm($filteredFields, $selectedUserId);
-                                                } else {
-                                                    echo '<div style="margin-bottom:15px; padding:10px; background:#f0fdf4; border-radius:8px; border-left:4px solid #00695c;">';
-                                                    if (!empty($tab['header'])) {
-                                                        echo '<h4 style="color:#00695c;">' . htmlspecialchars($tab['header']) . '</h4>';
-                                                    }
-                                                    if (!empty($tab['description'])) {
-                                                        echo '<p style="color:#6b7280; font-size:14px;">' . htmlspecialchars($tab['description']) . '</p>';
-                                                    }
-                                                    echo '</div>';
-                                                }
+                                                foreach ($displayFields as $fieldKey) if (isset($globalDynamicFields[$fieldKey])) $filteredFields[$fieldKey] = $globalDynamicFields[$fieldKey];
                                             ?>
+                                                <?php if (!empty($tab['header']) || !empty($tab['description'])): ?>
+                                                    <div style="margin-bottom:15px;padding:10px;background:#f0fdf4;border-radius:8px;border-left:4px solid #00695c;">
+                                                        <?php if (!empty($tab['header'])): ?><h4 style="color:#00695c;"><?php echo htmlspecialchars($tab['header']); ?></h4><?php endif; ?>
+                                                        <?php if (!empty($tab['description'])): ?><p style="color:#6b7280;font-size:14px;"><?php echo htmlspecialchars($tab['description']); ?></p><?php endif; ?>
+                                                    </div>
+                                                <?php endif; ?>
+                                                <?php if (!empty($filteredFields)) renderNewProjectForm($filteredFields, $selectedUserId); ?>
+                                            <?php endif; ?>
                                         </div>
                                     <?php endforeach; ?>
                                 <?php endif; ?>
@@ -2828,10 +3853,10 @@
                             </div>
                             
                         <?php else: ?>
-                            <div class="dashboard-tabs">
-                                <button class="dashboard-tab-btn <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>" onclick="switchDashboardTab('initialize', this)"> Initialize Account</button>
-                                <button class="dashboard-tab-btn <?php echo ($dashboardView === 'dynamic_fields') ? 'active' : ''; ?>" onclick="switchDashboardTab('dynamic_fields', this)"> Dynamic Fields</button>
-                                <button class="dashboard-tab-btn <?php echo ($dashboardView === 'all_config') ? 'active' : ''; ?>" onclick="switchDashboardTab('all_config', this)"> All Account Config</button>
+                            <div class="dashboard-tabs" role="tablist" aria-label="Account dashboard">
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>" onclick="switchDashboardTab('initialize', this)">Initialize Account</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>" onclick="switchDashboardTab('accounts', this)">All Accounts</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'all_config') ? 'active' : ''; ?>" onclick="switchDashboardTab('all_config', this)">All Account Config</button>
                             </div>
                             
                             <div id="dash_tab_initialize" class="dashboard-content <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>">
@@ -2849,14 +3874,22 @@
                                 </div>
                             </div>
                             
-                            <div id="dash_tab_dynamic_fields" class="dashboard-content <?php echo ($dashboardView === 'dynamic_fields') ? 'active' : ''; ?>">
-                                <h3 style="margin-bottom:15px; color:#1a1a2e;">Global Dynamic Fields</h3>
-                                <p style="color:#6b7280; margin-bottom:15px;">These fields are used for all users.</p>
-                                
-                                <div id="globalDynamicFieldsList"></div>
-                                
-                                <div style="margin-top:15px; display:flex; gap:10px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-primary" onclick="addGlobalDynamicField()">+ Add Field</button>
+                            <div id="dash_tab_accounts" class="dashboard-content <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>">
+                                <div class="accounts-list" id="allAccountsList">
+                                    <?php if (empty($users)): ?>
+                                        <p class="accounts-empty">No accounts found. Create an account first.</p>
+                                    <?php else: ?>
+                                        <?php foreach ($users as $user): ?>
+                                            <form method="POST" class="account-list-row">
+                                                <input type="hidden" name="select_user" value="1">
+                                                <input type="hidden" name="user_id" value="<?php echo (int)$user['id']; ?>">
+                                                <button type="submit" class="account-list-select">
+                                                    <span class="account-list-name"><?php echo htmlspecialchars($user['username']); ?></span>
+                                                    <span class="account-list-email"><?php echo htmlspecialchars($user['email']); ?></span>
+                                                </button>
+                                            </form>
+                                        <?php endforeach; ?>
+                                    <?php endif; ?>
                                 </div>
                             </div>
                             
@@ -2875,6 +3908,22 @@
         </div>
     </div>
     
+    <!-- ===== LEFT MENU DRAWER ===== -->
+    <div class="menu-drawer-overlay" id="menuDrawerOverlay" onclick="closeMenuDrawer(event)" aria-hidden="true">
+        <aside class="menu-drawer" id="menuDrawer" role="dialog" aria-modal="true" aria-label="Main menu">
+            <div class="menu-drawer-heading">
+                <strong>Menu</strong>
+                <button type="button" class="menu-drawer-close" onclick="closeMenuDrawer()" aria-label="Close menu">×</button>
+            </div>
+            <div class="menu-account-identity">
+                <div class="menu-account-username">Username: <?php echo htmlspecialchars($selectedUser['username'] ?? '—'); ?></div>
+                <div class="menu-account-email">Email: <?php echo htmlspecialchars($selectedUser['email'] ?? '—'); ?></div>
+            </div>
+            <button type="button" class="menu-drawer-item" onclick="goToDashboard()">Dashboard</button>
+            <button type="button" class="menu-drawer-item" onclick="window.location.href='index.php'">Task</button>
+        </aside>
+    </div>
+
     <!-- ===== CUSTOM DIALOG ===== -->
     <div class="custom-dialog-overlay" id="customDialog">
         <div class="custom-dialog-box">
@@ -2950,7 +3999,19 @@
                                             </div>
                                         </div>
                                     <?php elseif ($elementType === 'textarea'): ?>
-                                        <textarea id="entry_<?php echo $key; ?>_<?php echo $subKey; ?>" rows="3" placeholder="Enter <?php echo htmlspecialchars($title); ?>..." class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>" data-sub-key="<?php echo $subKey; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
+                                        <?php if (($subField['separate_paragraphs'] ?? 'no') === 'yes' && trim($defaultValue) !== ''): ?>
+                                            <div class="separated-default-paragraphs" style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px;">
+                                                <?php foreach (preg_split('/\R+/', trim($defaultValue)) as $paragraph): $paragraph = trim($paragraph); if ($paragraph === '') continue; ?>
+                                                    <div style="padding:10px;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;">
+                                                        <div style="white-space:pre-wrap;margin-bottom:7px;"><?php echo htmlspecialchars($paragraph); ?></div>
+                                                        <button type="button" class="btn btn-secondary btn-sm" data-copy-text="<?php echo htmlspecialchars($paragraph, ENT_QUOTES); ?>" onclick="copyToClipboard(this.getAttribute('data-copy-text'), this)">📋 Copy</button>
+                                                    </div>
+                                                <?php endforeach; ?>
+                                            </div>
+                                            <textarea id="entry_<?php echo $key; ?>_<?php echo $subKey; ?>" rows="3" style="display:none;" class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>" data-sub-key="<?php echo $subKey; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
+                                        <?php else: ?>
+                                            <textarea id="entry_<?php echo $key; ?>_<?php echo $subKey; ?>" rows="3" placeholder="Enter <?php echo htmlspecialchars($title); ?>..." class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>" data-sub-key="<?php echo $subKey; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
+                                        <?php endif; ?>
                                     <?php elseif ($elementType === 'select'): ?>
                                         <select id="entry_<?php echo $key; ?>_<?php echo $subKey; ?>" class="new-project-field" data-field-key="<?php echo $key; ?>" data-sub-key="<?php echo $subKey; ?>">
                                             <option value="">Select...</option>
@@ -2972,8 +4033,7 @@
                             <?php endforeach; ?>
                         </div>
                         <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="copyObjectFromDOM('object_<?php echo $key; ?>_container')">📋 Copy Element Values</button>
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="copyObjectDefaultValues('object_<?php echo $key; ?>_container')">📋 Copy Default Values</button>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="copyObjectFromDOM('object_<?php echo $key; ?>_container')">📋 Copy data</button>
                         </div>
                         <input type="hidden" id="object_<?php echo $key; ?>_data" value="">
                     </div>
@@ -2986,7 +4046,17 @@
                             $defaultValues = $field['default_values'] ?? [];
                             $buttonUrl = $field['button_url'] ?? '';
                         ?>
-                        <?php if ($elementType === 'date-time-input'): ?>
+                        <?php if ($elementType === 'copy_button_for_each_of'): ?>
+                            <div id="field_<?php echo htmlspecialchars($key); ?>_container" style="display:flex;flex-direction:column;gap:12px;margin:10px 0;">
+                                <?php $copySentences = $field['copy_button_for_each_of'] ?? []; if (is_array($copySentences)): foreach ($copySentences as $sentence): $sentence = trim((string)$sentence); if ($sentence === '') continue; ?>
+                                    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:12px;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;margin-bottom:4px;">
+                                        <div style="white-space:pre-wrap;overflow-wrap:anywhere;flex:1;min-width:0;"><?php echo htmlspecialchars($sentence); ?></div>
+                                        <button type="button" class="btn btn-secondary btn-sm individual-sentence-copy-button" data-copy-text="<?php echo htmlspecialchars($sentence, ENT_QUOTES); ?>" onclick="copyToClipboard(this.getAttribute('data-copy-text'), this)">📋 Copy</button>
+                                    </div>
+                                <?php endforeach; endif; ?>
+                                <input type="hidden" id="entry_<?php echo htmlspecialchars($key); ?>" value="" class="new-project-field" data-field-key="<?php echo htmlspecialchars($key); ?>">
+                            </div>
+                        <?php elseif ($elementType === 'date-time-input'): ?>
                             <div class="datetime-group" id="field_<?php echo $key; ?>_container">
                                 <input type="date" id="entry_<?php echo $key; ?>_date" class="date-input new-project-field" data-field-key="<?php echo $key; ?>" value="<?php echo htmlspecialchars($defaultValue); ?>">
                                 <div class="time-group">
@@ -3000,17 +4070,29 @@
                                     <span style="color:#6b7280; font-size:12px; margin-left:5px;">(12h format)</span>
                                 </div>
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Element Value</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')">📋 Copy Default Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display: none">📋 Copy Default Value</button>
                                 </div>
                             </div>
                         <?php elseif ($elementType === 'textarea'): ?>
                             <div id="field_<?php echo $key; ?>_container">
-                                <textarea id="entry_<?php echo $key; ?>" rows="3" placeholder="Enter <?php echo htmlspecialchars($field['field-title'] ?? $key); ?>..." class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
-                                <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Element Value</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')">📋 Copy Default Value</button>
-                                </div>
+                                <?php if (($field['separate_paragraphs'] ?? 'no') === 'yes' && trim($defaultValue) !== ''): ?>
+                                    <div class="separated-default-paragraphs" style="display:flex;flex-direction:column;gap:8px;margin-bottom:8px;">
+                                        <?php foreach (preg_split('/\R+/', trim($defaultValue)) as $paragraph): $paragraph = trim($paragraph); if ($paragraph === '') continue; ?>
+                                            <div style="padding:10px;border:1px solid #d1d5db;border-radius:8px;background:#f9fafb;">
+                                                <div style="white-space:pre-wrap;margin-bottom:7px;"><?php echo htmlspecialchars($paragraph); ?></div>
+                                                <button type="button" class="btn btn-secondary btn-sm" data-copy-text="<?php echo htmlspecialchars($paragraph, ENT_QUOTES); ?>" onclick="copyToClipboard(this.getAttribute('data-copy-text'), this)">📋 Copy</button>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                    <textarea id="entry_<?php echo $key; ?>" rows="3" style="display:none;" class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
+                                <?php else: ?>
+                                    <textarea id="entry_<?php echo $key; ?>" rows="3" placeholder="Enter <?php echo htmlspecialchars($field['field-title'] ?? $key); ?>..." class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
+                                    <div style="margin-top:5px;display:flex;gap:8px;flex-wrap:wrap;">
+                                        <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
+                                        <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display:none">📋 Copy Default Value</button>
+                                    </div>
+                                <?php endif; ?>
                             </div>
                         <?php elseif ($elementType === 'select'): ?>
                             <div id="field_<?php echo $key; ?>_container">
@@ -3021,8 +4103,8 @@
                                     <?php endforeach; ?>
                                 </select>
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Element Value</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')">📋 Copy Default Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display: none">📋 Copy Default Value</button>
                                 </div>
                             </div>
                         <?php elseif ($elementType === 'button'): ?>
@@ -3032,15 +4114,15 @@
                                 </button>
                                 <input type="hidden" id="entry_<?php echo $key; ?>" value="<?php echo htmlspecialchars($buttonUrl); ?>" class="new-project-field" data-field-key="<?php echo $key; ?>">
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Element Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
                                 </div>
                             </div>
                         <?php else: ?>
                             <div id="field_<?php echo $key; ?>_container">
                                 <input type="text" id="entry_<?php echo $key; ?>" placeholder="Enter <?php echo htmlspecialchars($field['field-title'] ?? $key); ?>..." value="<?php echo htmlspecialchars($defaultValue); ?>" class="new-project-field" data-field-key="<?php echo $key; ?>">
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Element Value</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')">📋 Copy Default Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display: none">📋 Copy Default Value</button>
                                 </div>
                             </div>
                         <?php endif; ?>
@@ -3049,7 +4131,7 @@
             <?php endforeach; ?>
             
             <div class="form-actions">
-                <button type="button" class="btn btn-success" onclick="submitUserEntry()"> Save Entry</button>
+                <button type="button" id="saveEntryButton" class="btn btn-success" onclick="submitUserEntry()" style="display:none;"> Save Entry</button>
             </div>
         </form>
         <?php
@@ -3398,6 +4480,31 @@
         ]);
     }
 
+    // ===== LEFT MENU DRAWER =====
+    function openMenuDrawer() {
+        var overlay = document.getElementById('menuDrawerOverlay');
+        if (!overlay) return;
+        overlay.classList.add('active');
+        overlay.setAttribute('aria-hidden', 'false');
+        document.body.classList.add('menu-open');
+    }
+    function closeMenuDrawer(event) {
+        if (event && event.target !== event.currentTarget) return;
+        var overlay = document.getElementById('menuDrawerOverlay');
+        if (!overlay) return;
+        overlay.classList.remove('active');
+        overlay.setAttribute('aria-hidden', 'true');
+        document.body.classList.remove('menu-open');
+    }
+    function goToDashboard() {
+        closeMenuDrawer();
+        var form = document.createElement('form');
+        form.method = 'POST';
+        var clear = document.createElement('input'); clear.type = 'hidden'; clear.name = 'clear_user'; clear.value = '1';
+        form.appendChild(clear); document.body.appendChild(form); form.submit();
+    }
+    document.addEventListener('keydown', function(event) { if (event.key === 'Escape') closeMenuDrawer(); });
+
     // ============================================================
     // ===== DASHBOARD TAB SWITCHING =====
     // ============================================================
@@ -3414,9 +4521,7 @@
             method: 'POST',
             body: formData
         });
-        if (tabName === 'dynamic_fields') {
-            renderGlobalDynamicFields();
-        } else if (tabName === 'all_config') {
+        if (tabName === 'all_config') {
             renderAllUsersEntries('pending', 'allUsersPendingList');
         }
     }
@@ -3551,7 +4656,7 @@
                     return field ? field['field-title'] || fk : fk;
                 });
                 
-                html += '<div class="tab-editor-item" style="border:1px solid ' + (isSubmitted ? '#10b981' : '#e5e7eb') + '; border-radius:10px; padding:15px; margin-bottom:12px; background:' + (isSubmitted ? '#f0fdf4' : '#fafafa') + ';">';
+                html += '<div class="submit-tab-card tab-editor-item" style="border:1px solid ' + (isSubmitted ? '#10b981' : '#e5e7eb') + '; border-radius:10px; padding:15px; margin-bottom:12px; background:' + (isSubmitted ? '#f0fdf4' : '#fafafa') + ';">';
                 html += '<div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;">';
                 html += '<div>';
                 html += '<strong style="font-size:16px; color:#1a1a2e;">' + (tab.tab_name || 'Tab #' + (index + 1)) + '</strong>';
@@ -3568,8 +4673,8 @@
                 html += '</div>';
             });
             
-            html += '<div class="form-actions">';
-            html += '<button type="button" class="btn btn-success" onclick="saveSubmitTabs()"> Save Submit Tabs Configuration</button>';
+            html += '<div class="form-actions submit-tabs-save-bar">';
+            html += '<button type="button" class="btn btn-success" onclick="saveSubmitTabs()">Save Submit Tabs Configuration</button>';
             html += '</div>';
             html += '</form>';
         }
@@ -3618,76 +4723,107 @@
     // ===== UPDATE renderUserGlobalDynamicFields FUNCTION =====
     // Replace the entire function with this version
 
+    function toggleAccountDynamicFieldCard(card, event) {
+        if (event && event.target && event.target.closest('button, a, input, select, textarea, label, .account-dynamic-field-details')) return;
+        var body = card.querySelector('.account-dynamic-field-details');
+        var icon = card.querySelector('.account-dynamic-field-chevron');
+        if (!body) return;
+        var opening = body.hidden;
+        body.hidden = !opening;
+        card.classList.toggle('is-expanded', opening);
+        if (icon) icon.textContent = opening ? '−' : '+';
+        card.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    }
+
     function renderUserGlobalDynamicFields() {
         var container = document.getElementById('userGlobalDynamicFieldsList');
         if (!container) return;
         container.innerHTML = '';
-        var fields = globalDynamicFields;
+        var fields = globalDynamicFields || {};
         var fieldKeys = Object.keys(fields);
         if (fieldKeys.length === 0) {
-            container.innerHTML = '<p style="color:#6b7280; text-align:center; padding:20px;">No dynamic fields configured.</p>';
+            container.innerHTML = '<p style="color:#6b7280;text-align:center;padding:20px;">No dynamic fields configured.</p>';
             return;
         }
-        for (var i = 0; i < fieldKeys.length; i++) {
-            var key = fieldKeys[i];
-            var field = fields[key];
-            var div = document.createElement('div');
-            div.className = 'form-group';
-            div.style.border = '1px solid #e5e7eb';
-            div.style.borderRadius = '10px';
-            div.style.padding = '15px';
-            div.style.marginBottom = '12px';
-            div.style.background = '#fafafa';
+
+        fieldKeys.forEach(function(key) {
+            var field = fields[key] || {};
+            var card = document.createElement('div');
+            card.className = 'account-dynamic-field-card';
+            card.setAttribute('role', 'button');
+            card.setAttribute('tabindex', '0');
+            card.setAttribute('aria-expanded', 'false');
+            card.addEventListener('click', function(event) { toggleAccountDynamicFieldCard(card, event); });
+            card.addEventListener('keydown', function(event) {
+                if (event.target !== card) return;
+                if (event.key === 'Enter' || event.key === ' ') {
+                    event.preventDefault();
+                    toggleAccountDynamicFieldCard(card, event);
+                }
+            });
+
+            var fieldType = field.field_type === 'objects' ? 'Objects field' : 'Individual field';
             var fieldInfo = '';
-            var editFieldsHtml = '';
             if (field.field_type === 'objects') {
                 var subFields = field.fieldkeyvalue || {};
                 var subKeys = Object.keys(subFields);
-                fieldInfo = 
-                    '<div><strong>Type:</strong> Objects Field</div>' +
+                fieldInfo = '<div><strong>Type:</strong> Objects field</div>' +
                     '<div><strong>Sub-fields:</strong> ' + subKeys.length + '</div>' +
-                    subKeys.map(function(sk) { 
-                        var sub = subFields[sk];
+                    subKeys.map(function(sk) {
+                        var sub = subFields[sk] || {};
                         var subElement = sub.element_type || 'input';
                         var extraInfo = subElement === 'button' ? ' (Button → ' + (sub.button_url || 'No URL') + ')' : '';
-                        return '<div style="font-size:12px; color:#6b7280; margin-left:10px;">• ' + sk + ' (' + subElement + extraInfo + ')</div>'; 
+                        return '<div class="account-dynamic-subfield">• ' + escapeHtml(String(sk)) + ' (' + escapeHtml(String(subElement + extraInfo)) + ')</div>';
                     }).join('');
-                editFieldsHtml = 
-                    '<div style="margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb;">' +
-                    '<button type="button" class="btn btn-primary btn-sm" onclick="editGlobalDynamicField(\'' + key + '\')"> Edit Field</button>' +
-                    '<button type="button" class="btn btn-danger btn-sm" onclick="deleteGlobalDynamicField(\'' + key + '\')" style="margin-left:8px;"> Delete</button>' +
-                    '</div>';
             } else {
                 var defaultValue = field.default_value || '';
                 var defaultValues = field.default_values || [];
-                var buttonUrl = field.button_url || '';
                 var elementType = field.element_type || 'input';
+                var buttonUrl = field.button_url || '';
                 var extraInfo = elementType === 'button' ? ' (URL: ' + buttonUrl + ')' : '';
-                fieldInfo = 
-                    '<div><strong>Type:</strong> Individual Field</div>' +
-                    '<div><strong>Element:</strong> ' + elementType + extraInfo + '</div>' +
-                    (defaultValue ? '<div><strong>Default Value:</strong> ' + defaultValue + '</div>' : '') +
-                    (defaultValues.length > 0 ? '<div><strong>Select Options:</strong> ' + defaultValues.join(', ') + '</div>' : '');
-                editFieldsHtml = 
-                    '<div style="margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb;">' +
-                    '<button type="button" class="btn btn-primary btn-sm" onclick="editGlobalDynamicField(\'' + key + '\')"> Edit Field</button>' +
-                    '<button type="button" class="btn btn-danger btn-sm" onclick="deleteGlobalDynamicField(\'' + key + '\')" style="margin-left:8px;"> Delete</button>' +
-                    '</div>';
+                fieldInfo = '<div><strong>Type:</strong> Individual field</div>' +
+                    '<div><strong>Element:</strong> ' + escapeHtml(String(elementType + extraInfo)) + '</div>' +
+                    (defaultValue ? '<div><strong>Default value:</strong> ' + escapeHtml(String(defaultValue)) + '</div>' : '') +
+                    (defaultValues.length ? '<div><strong>Select options:</strong> ' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</div>' : '');
             }
-            div.innerHTML = 
-                '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">' +
-                '<strong style="color:#1a1a2e;">' + (field['field-title'] || key) + '</strong>' +
-                '<div>' +
-                '<span style="font-size:12px; color:#6b7280; background:#e5e7eb; padding:2px 10px; border-radius:12px;">' + (field.field_type || 'individual') + '</span>' +
+
+            var safeKey = String(key).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+            card.innerHTML =
+                '<div class="account-dynamic-field-heading">' +
+                    '<div class="account-dynamic-field-title-wrap">' +
+                        '<strong class="account-dynamic-field-title">' + escapeHtml(String(field['field-title'] || key)) + '</strong>' +
+                        '<span class="account-dynamic-field-key">Key: ' + escapeHtml(String(key)) + '</span>' +
+                    '</div>' +
+                    '<div class="account-dynamic-field-heading-side">' +
+                        '<span class="account-dynamic-field-type">' + escapeHtml(fieldType) + '</span>' +
+                        '<span class="account-dynamic-field-chevron" aria-hidden="true">+</span>' +
+                    '</div>' +
                 '</div>' +
-                '</div>' +
-                '<div style="display:grid; grid-template-columns:1fr 1fr; gap:10px; font-size:13px; color:#6b7280;">' +
-                '<div><strong>Field Key:</strong> ' + key + '</div>' +
-                fieldInfo +
-                '</div>' +
-                editFieldsHtml;
-            container.appendChild(div);
-        }
+                '<div class="account-dynamic-field-details" hidden>' +
+                    '<div class="account-dynamic-field-info">' + fieldInfo + '</div>' +
+                    '<div class="account-dynamic-field-actions">' +
+                        '<button type="button" class="btn btn-primary btn-sm account-field-edit">Edit Field</button>' +
+                        '<button type="button" class="btn btn-danger btn-sm account-field-delete">Delete</button>' +
+                    '</div>' +
+                '</div>';
+            var editButton = card.querySelector('.account-field-edit');
+            var deleteButton = card.querySelector('.account-field-delete');
+            editButton.addEventListener('click', function(event) {
+                event.stopPropagation();
+                editGlobalDynamicField(key);
+            });
+            deleteButton.addEventListener('click', function(event) {
+                event.stopPropagation();
+                deleteGlobalDynamicField(key);
+            });
+            container.appendChild(card);
+        });
+    }
+
+    function escapeHtml(value) {
+        return String(value).replace(/[&<>"']/g, function(ch) {
+            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+        });
     }
 
     // ============================================================
@@ -3820,14 +4956,12 @@
                     subKeys.forEach(function(subKey) {
                         var subValue = subFields[subKey];
                         var displayValue = typeof subValue === 'object' ? JSON.stringify(subValue, null, 2) : subValue;
-                        var escapedValue = typeof displayValue === 'string' ? 
-                            displayValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : 
-                            displayValue;
+                        var escapedValue = typeof displayValue === 'string' ? displayValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : displayValue;
                         var rawValue = typeof subValue === 'object' ? JSON.stringify(subValue) : subValue;
-                        html += 
-                            '<div class="sub-field-item" data-raw-value="' + encodeURIComponent(rawValue) + '">' +
+                        html +=
+                            '<div class="sub-field-item" data-raw-value="' + encodeURIComponent(rawValue == null ? '' : String(rawValue)) + '">' +
                             '<span class="sub-label">' + subKey + '</span>' +
-                            '<span class="sub-value">' + escapedValue + '</span>' +
+                            '<div class="sub-value">' + escapedValue + '</div>' +
                             '</div>';
                     });
                     html += '</div>';
@@ -3835,7 +4969,6 @@
                         var val = subFields[sk];
                         return typeof val === 'object' ? JSON.stringify(val) : val;
                     }).filter(function(v) { return v && v !== '' && v !== '{}'; }).join('\n');
-                    html += '<div style="margin-top:8px;"><button class="btn btn-secondary btn-sm" onclick="copyObjectValuesFromDiv(\'' + objectId + '\')">📋 Copy All</button></div>';
                     html += '</div>';
                 }
             }
@@ -3873,14 +5006,14 @@
                     subKeys.forEach(function(subKey) {
                         var subValue = objectData[subKey];
                         var displayValue = typeof subValue === 'object' ? JSON.stringify(subValue, null, 2) : subValue;
-                        var escapedValue = typeof displayValue === 'string' ? 
-                            displayValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : 
+                        var escapedValue = typeof displayValue === 'string' ?
+                            displayValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') :
                             displayValue;
                         var rawValue = typeof subValue === 'object' ? JSON.stringify(subValue) : subValue;
-                        html += 
-                            '<div class="sub-field-item" data-raw-value="' + encodeURIComponent(rawValue) + '">' +
+                        html +=
+                            '<div class="sub-field-item" data-raw-value="' + encodeURIComponent(rawValue == null ? '' : String(rawValue)) + '">' +
                             '<span class="sub-label">' + subKey + '</span>' +
-                            '<span class="sub-value">' + escapedValue + '</span>' +
+                            '<div class="sub-value">' + escapedValue + '</div>' +
                             '</div>';
                     });
                 } else {
@@ -3895,20 +5028,17 @@
                     var val = objectData[sk];
                     return typeof val === 'object' ? JSON.stringify(val) : val;
                 }).filter(function(v) { return v && v !== '' && v !== '{}'; }).join('\n');
-                html += '<div style="margin-top:8px;"><button class="btn btn-secondary btn-sm" onclick="copyObjectValuesFromDiv(\'' + objectId + '\')">📋 Copy All</button></div>';
                 html += '</div>';
             } else if (!key.includes('_') || !hasFlattenedGroups) {
                 var displayValue = typeof value === 'object' ? JSON.stringify(value, null, 2) : value;
-                var escapedValue = typeof displayValue === 'string' ? 
-                    displayValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : 
-                    displayValue;
+                var escapedValue = typeof displayValue === 'string' ? displayValue.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;') : displayValue;
                 var rawValue = typeof value === 'object' ? JSON.stringify(value) : value;
                 var fieldId = 'field_' + index + '_' + key;
-                html += 
-                    '<div class="entry-field-group individual-field" id="' + fieldId + '" data-raw-value="' + encodeURIComponent(rawValue) + '">' +
+                html +=
+                    '<div class="entry-field-group individual-field" id="' + fieldId + '" data-raw-value="' + encodeURIComponent(rawValue == null ? '' : String(rawValue)) + '">' +
                     '<span class="field-label">' + key + '</span>' +
                     '<div style="display:flex; justify-content:space-between; align-items:flex-start; gap:10px;">' +
-                    '<div class="field-value">' + escapedValue + '</div>' +
+                    '<div class="field-value" style="flex:1;min-width:0;">' + escapedValue + '</div>' +
                     '<button class="btn btn-secondary btn-sm" onclick="copyIndividualFromDiv(\'' + fieldId + '\')">📋 Copy</button>' +
                     '</div>' +
                     '</div>';
@@ -4037,140 +5167,196 @@
     function renderDynamicTabsEditor() {
         var container = document.getElementById('dynamicTabsEditor');
         if (!container) return;
-        container.innerHTML = '';
-        
+
         var tabs = userDynamicTabs || [];
-        var filteredTabs = tabs.filter(function(tab) {
-            return (tab.tab_name && tab.tab_name.trim() !== '') || 
-                (tab.dynamic_fields_display && tab.dynamic_fields_display.length > 0);
-        });
-        
-        if (filteredTabs.length !== tabs.length) {
-            userDynamicTabs = filteredTabs;
-            tabs = filteredTabs;
-        }
-        
         var globalFields = globalDynamicFields || {};
         var fieldKeys = Object.keys(globalFields);
-        
-        var html = 
-            '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:15px; flex-wrap:wrap; gap:10px;">' +
-            '<h3 style="color:#1a1a2e;"> Dynamic Tabs</h3>' +
-            '<button type="button" class="btn btn-primary" onclick="addDynamicTab()">+ Add Tab</button>' +
-            '</div>' +
-            '<p style="color:#6b7280; margin-bottom:15px;">Create tabs that group specific dynamic fields for "New Project" view.</p>';
-        
-        if (tabs.length === 0) {
-            html += '<p style="color:#6b7280; text-align:center; padding:20px;">No dynamic tabs configured. Click "Add Tab" to create one.</p>';
-        } else {
-            html += '<form method="POST" id="dynamicTabsForm">';
-            html += '<input type="hidden" name="save_dynamic_tabs" value="true">';
-            html += '<input type="hidden" name="user_id" value="' + selectedUserId + '">';
-            html += '<input type="hidden" name="tabs_data" id="tabsDataInput">';
-            
-            tabs.forEach(function(tab, index) {
-                var tabFields = tab.dynamic_fields_display || [];
-                var isExpanded = tab._expanded || false;
-                
-                // Get additional features with defaults
-                var additionalFeatures = tab.additional_features || {
-                    copy_button: false,
-                    transcript_detection: false,
-                    transcript_with_structured_data_detection: false
-                };
-                
-                var availableFieldsHtml = '';
-                if (fieldKeys.length === 0) {
-                    availableFieldsHtml = '<p style="color:#6b7280; font-size:13px;">No dynamic fields available globally.</p>';
-                } else {
-                    availableFieldsHtml = fieldKeys.map(function(key) {
-                        var isChecked = tabFields.includes(key);
-                        var fieldData = globalFields[key];
-                        var fieldTitle = fieldData ? (fieldData['field-title'] || key) : key;
-                        return '<div class="field-toggle-item" style="display:flex; justify-content:space-between; align-items:center; padding:6px 10px; margin:2px 0; border-radius:6px; background:#f3f4f6;">' +
-                            '<span class="field-name" style="font-size:13px; color:#1a1a2e;">' + fieldTitle + ' <span style="color:#6b7280; font-size:11px;">(' + key + ')</span></span>' +
-                            '<label class="toggle-switch" style="position:relative; display:inline-block; width:40px; height:22px; flex-shrink:0;">' +
-                            '<input type="checkbox" class="field-toggle" data-field-key="' + key + '" ' + (isChecked ? 'checked' : '') + ' style="opacity:0; width:0; height:0;">' +
-                            '<span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:' + (isChecked ? '#00695c' : '#ccc') + '; transition:.4s; border-radius:22px;"></span>' +
-                            '</label>' +
-                            '</div>';
-                    }).join('');
-                }
-                
-                // Additional features HTML with toggle switches
-                var additionalFeaturesHtml = 
-                    '<div style="margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb;">' +
-                    '<div style="font-weight:600; color:#1a1a2e; margin-bottom:8px;">Additional Features</div>' +
-                    '<div style="display:grid; grid-template-columns:1fr 1fr; gap:8px;">' +
-                    // Copy Element Value Toggle
-                    '<div style="display:flex; justify-content:space-between; align-items:center; padding:6px 10px; background:#f8fafc; border-radius:6px; border:1px solid #e5e7eb;">' +
-                    '<span style="font-size:13px; color:#1a1a2e;">📋 Copy Element Value</span>' +
-                    '<label class="toggle-switch" style="position:relative; display:inline-block; width:40px; height:22px; flex-shrink:0;">' +
-                    '<input type="checkbox" class="additional-feature-toggle" data-feature="copy_button" ' + (additionalFeatures.copy_button ? 'checked' : '') + ' style="opacity:0; width:0; height:0;">' +
-                    '<span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:' + (additionalFeatures.copy_button ? '#00695c' : '#ccc') + '; transition:.4s; border-radius:22px;"></span>' +
-                    '</label>' +
-                    '</div>' +
-                    // Transcript Detection Toggle
-                    '<div style="display:flex; justify-content:space-between; align-items:center; padding:6px 10px; background:#f8fafc; border-radius:6px; border:1px solid #e5e7eb;">' +
-                    '<span style="font-size:13px; color:#1a1a2e;">📝 Transcript Detection</span>' +
-                    '<label class="toggle-switch" style="position:relative; display:inline-block; width:40px; height:22px; flex-shrink:0;">' +
-                    '<input type="checkbox" class="additional-feature-toggle" data-feature="transcript_detection" ' + (additionalFeatures.transcript_detection ? 'checked' : '') + ' style="opacity:0; width:0; height:0;">' +
-                    '<span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:' + (additionalFeatures.transcript_detection ? '#00695c' : '#ccc') + '; transition:.4s; border-radius:22px;"></span>' +
-                    '</label>' +
-                    '</div>' +
-                    // Structured Data Detection Toggle
-                    '<div style="display:flex; justify-content:space-between; align-items:center; padding:6px 10px; background:#f8fafc; border-radius:6px; border:1px solid #e5e7eb; grid-column: span 2;">' +
-                    '<span style="font-size:13px; color:#1a1a2e;">📊 Structured Data Detection</span>' +
-                    '<label class="toggle-switch" style="position:relative; display:inline-block; width:40px; height:22px; flex-shrink:0;">' +
-                    '<input type="checkbox" class="additional-feature-toggle" data-feature="transcript_with_structured_data_detection" ' + (additionalFeatures.transcript_with_structured_data_detection ? 'checked' : '') + ' style="opacity:0; width:0; height:0;">' +
-                    '<span class="toggle-slider" style="position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0; background-color:' + (additionalFeatures.transcript_with_structured_data_detection ? '#00695c' : '#ccc') + '; transition:.4s; border-radius:22px;"></span>' +
-                    '</label>' +
-                    '</div>' +
-                    '</div>' +
-                    '</div>';
-                
-                html += 
-                    '<div class="tab-editor-item" data-tab-index="' + index + '" style="border:1px solid #e5e7eb; border-radius:10px; padding:15px; margin-bottom:12px; background:#fafafa;">' +
-                    '<div class="tab-header" style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px; flex-wrap:wrap; gap:10px;">' +
-                    '<span class="tab-title" style="font-weight:600; color:#1a1a2e; font-size:16px;"> ' + (tab.tab_name || 'Tab #' + (index + 1)) + '</span>' +
-                    '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-                    '<button type="button" class="btn btn-primary btn-sm" onclick="toggleTabEdit(' + index + ')" id="toggleTabBtn_' + index + '">' +
-                    (isExpanded ? ' Hide Editor' : ' Edit Tab') +
-                    '</button>' +
-                    '<button type="button" class="btn btn-danger btn-sm" onclick="deleteDynamicTab(' + index + ')"> Delete</button>' +
-                    '</div>' +
-                    '</div>' +
-                    '<div id="tabEditContent_' + index + '" style="' + (isExpanded ? 'display:block;' : 'display:none;') + ' margin-top:10px;">' +
-                    '<div class="form-group">' +
-                    '<label>Tab Name</label>' +
-                    '<input type="text" class="tab-name-input" value="' + (tab.tab_name || '') + '" placeholder="Enter tab name..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                    '<label>Header</label>' +
-                    '<input type="text" class="tab-header-input" value="' + (tab.header || '') + '" placeholder="Enter header text..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                    '<label>Description</label>' +
-                    '<textarea class="tab-description-input" rows="2" placeholder="Enter description..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' + (tab.description || '') + '</textarea>' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                    '<label>Fields to Display</label>' +
-                    '<div style="border:1px solid #e5e7eb; border-radius:8px; padding:10px; background:white;">' +
-                    availableFieldsHtml +
-                    '</div>' +
-                    '</div>' +
-                    additionalFeaturesHtml +
-                    '</div>' +
-                    '</div>';
-            });
-            
-            html += 
-                '<div class="form-actions">' +
-                '<button type="button" class="btn btn-success" onclick="saveDynamicTabs()"> Save All Tabs</button>' +
-                '</div>';
-            html += '</form>';
+
+        function esc(value) {
+            return String(value == null ? '' : value)
+                .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
         }
+
+        function fieldToggles(selected) {
+            selected = Array.isArray(selected) ? selected : [];
+            if (!fieldKeys.length) {
+                return '<p class="tab-editor-empty-fields">No dynamic fields are available. Add fields in Account Dynamic Fields first.</p>';
+            }
+            return fieldKeys.map(function(key) {
+                var checked = selected.indexOf(key) !== -1;
+                var title = (globalFields[key] && globalFields[key]['field-title']) || key;
+                return '<label class="tab-field-option">' +
+                    '<span class="tab-field-label">' + esc(title) + ' <small>(' + esc(key) + ')</small></span>' +
+                    '<input type="checkbox" class="field-toggle" data-field-key="' + esc(key) + '" ' + (checked ? 'checked' : '') + '>' +
+                    '</label>';
+            }).join('');
+        }
+
+        function features(featureSet) {
+            var f = featureSet || {};
+            return '<div class="tab-feature-options">' +
+                '<label><input type="checkbox" class="feature-copy" ' + (f.copy_button ? 'checked' : '') + '> <span>Copy Data</span></label>' +
+                '<label><input type="checkbox" class="feature-transcript" ' + (f.transcript_detection ? 'checked' : '') + '> <span>Transcript Detection</span></label>' +
+                '<label><input type="checkbox" class="feature-structured" ' + (f.transcript_with_structured_data_detection ? 'checked' : '') + '> <span>Structured Data Detection</span></label>' +
+                '</div>';
+        }
+
+        function renderTab(tab, index, isSub) {
+            tab = tab || {};
+            var children = Array.isArray(tab.sub_tabs) ? tab.sub_tabs : [];
+            var subMode = children.length ? 'add' : (tab.sub_tabs_mode || 'none');
+            var isParentWithChildren = !isSub && subMode === 'add';
+            var title = tab.tab_name || (isSub ? 'Sub Tab ' + (index + 1) : 'Tab ' + (index + 1));
+            var html = '<section class="tab-editor-item ' + (isSub ? 'sub-tab-editor-item' : 'root-tab-editor-item') + '" data-tab-index="' + index + '" data-is-sub="' + (isSub ? '1' : '0') + '">';
+            html += '<div class="tab-editor-heading" onclick="toggleNestedTabEditor(this)" role="button" tabindex="0" aria-expanded="false">';
+            html += '<div class="tab-editor-heading-copy"><span class="tab-editor-kind">' + (isSub ? 'SUB TAB' : 'MAIN TAB') + '</span><strong class="tab-editor-title">' + esc(title) + '</strong></div>';
+            html += '<div class="tab-editor-actions"><button type="button" class="btn btn-secondary btn-sm reorder-move" style="display:none" onclick="event.stopPropagation();moveEditorItem(this,-1)">↑</button><button type="button" class="btn btn-secondary btn-sm reorder-move" style="display:none" onclick="event.stopPropagation();moveEditorItem(this,1)">↓</button><button type="button" class="btn btn-danger btn-sm tab-delete-button" onclick="event.stopPropagation();removeNestedTabEditor(this)">Delete</button></div></div>';
+            html += '<div class="nested-tab-editor-body" style="display:none;">';
+            html += '<div class="form-group"><label>' + (isSub ? 'Sub Tab Name' : 'Tab Name') + '</label><input type="text" class="tab-name-input" value="' + esc(tab.tab_name || '') + '" placeholder="' + (isSub ? 'Enter sub-tab name' : 'Enter main tab name') + '"></div>';
+            var displayTab = tab.display_tab !== undefined ? !!tab.display_tab : true;
+            html += '<div class="form-group display-tab-setting"><label>Display Tab in New Project</label><select class="display-tab-input"><option value="yes" ' + (displayTab ? 'selected' : '') + '>Yes</option><option value="no" ' + (!displayTab ? 'selected' : '') + '>No</option></select></div>';
+
+            if (!isSub) {
+                html += '<div class="form-group"><label>Add Sub Tabs</label><select class="sub-tabs-mode" onchange="toggleNestedSubTabs(this)">' +
+                    '<option value="none" ' + (subMode === 'none' ? 'selected' : '') + '>No Sub Tabs</option>' +
+                    '<option value="add" ' + (subMode === 'add' ? 'selected' : '') + '>Add New</option></select>' +
+                    '<p class="tab-editor-help">When sub-tabs are enabled, the main tab is only a container. Its content is configured inside each sub-tab.</p></div>';
+            }
+
+            html += '<div class="root-content-settings" style="display:' + (isParentWithChildren ? 'none' : 'block') + ';">';
+            html += '<div class="form-group"><label>Header</label><input type="text" class="tab-header-input" value="' + esc(tab.header || '') + '" placeholder="Enter header text..."></div>';
+            html += '<div class="form-group"><label>Description</label><textarea class="tab-description-input" rows="2" placeholder="Enter description...">' + esc(tab.description || '') + '</textarea></div>';
+            html += '<div class="form-group"><label>Fields to Display</label><div class="tab-fields-toggle-list">' + fieldToggles(tab.dynamic_fields_display) + '</div></div>';
+            html += features(tab.additional_features);
+            html += '</div>';
+
+            if (!isSub) {
+                html += '<div class="nested-sub-tabs-container" style="display:' + (subMode === 'add' ? 'block' : 'none') + ';">';
+                html += '<div class="nested-sub-tabs-heading"><div><strong>Sub-tabs</strong><p>Add and configure the content for each sub-tab below.</p></div><div style="display:flex;gap:6px;flex-wrap:wrap"><button type="button" class="btn btn-secondary btn-sm" onclick="toggleSubTabReorder(this)">Reorder Sub Tabs</button><button type="button" class="btn btn-primary btn-sm" onclick="addNestedSubTab(this)">+ Add Sub Tab</button></div></div>';
+                html += '<div class="nested-sub-tabs-list">';
+                children.forEach(function(child, childIndex) { html += renderTab(child, childIndex, true); });
+                html += '</div><p class="nested-sub-tabs-empty" style="display:' + (children.length ? 'none' : 'block') + ';">No sub-tabs yet. Select “Add Sub Tab” to create the first one.</p></div>';
+            }
+            html += '</div></section>';
+            return html;
+        }
+
+        var html = '<div class="dynamic-tabs-editor-header"><div><h3>Dynamic Tabs</h3><p>Keep each tab simple. Main tabs with sub-tabs act as containers; their fields and features are configured on the sub-tabs.</p></div><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" class="btn btn-secondary" onclick="toggleTabReorder(this)">Reorder Tabs</button><button type="button" class="btn btn-primary" onclick="addDynamicTab()">+ Add Tab</button></div></div>';
+        if (!tabs.length) html += '<div class="tab-editor-empty-state"><strong>No dynamic tabs configured</strong><span>Click “Add Tab” to create your first tab.</span></div>';
+        html += '<form method="POST" id="dynamicTabsForm"><input type="hidden" name="save_dynamic_tabs" value="true"><input type="hidden" name="user_id" value="' + esc(selectedUserId) + '"><input type="hidden" name="tabs_data" id="tabsDataInput"><div class="dynamic-tabs-editor-list">';
+        // New tabs are inserted at the beginning so the newest editor is always first.
+        tabs.forEach(function(tab, index) { html += renderTab(tab, index, false); });
+        html += '</div><div class="dynamic-tabs-save-bar"><button type="button" class="btn btn-success" onclick="saveDynamicTabs()">Save All Tabs</button></div></form>';
         container.innerHTML = html;
+    }
+
+    // Display Tab in New Project is a simple Yes/No select for main and sub-tabs.
+    // Do not attach toggle behavior to form controls; card expansion is handled by its heading.
+
+    function toggleTabReorder(button) {
+        var list = document.querySelector('#dynamicTabsForm .dynamic-tabs-editor-list');
+        if (!list) return;
+        var active = button.dataset.reordering !== '1';
+        button.dataset.reordering = active ? '1' : '0';
+        button.textContent = active ? 'Done Reordering' : 'Reorder Tabs';
+        list.querySelectorAll(':scope > .root-tab-editor-item .reorder-move').forEach(function(b) { b.style.display = active ? 'inline-block' : 'none'; });
+    }
+    function toggleSubTabReorder(button) {
+        var container = button.closest('.nested-sub-tabs-container');
+        if (!container) return;
+        var active = button.dataset.reordering !== '1';
+        button.dataset.reordering = active ? '1' : '0';
+        button.textContent = active ? 'Done Reordering' : 'Reorder Sub Tabs';
+        container.querySelectorAll(':scope > .nested-sub-tabs-list > .sub-tab-editor-item .reorder-move').forEach(function(b) { b.style.display = active ? 'inline-block' : 'none'; });
+    }
+    function moveEditorItem(button, direction) {
+        var item = button.closest('.tab-editor-item');
+        if (!item) return;
+        var parent = item.parentElement;
+        var siblings = Array.from(parent.children).filter(function(el) { return el.classList.contains('tab-editor-item'); });
+        var index = siblings.indexOf(item);
+        var target = siblings[index + direction];
+        if (!target) return;
+        if (direction < 0) parent.insertBefore(item, target);
+        else parent.insertBefore(target, item);
+    }
+
+    function toggleNestedTabEditor(source) {
+        var item = source && source.closest ? source.closest('.tab-editor-item') : null;
+        if (!item) return;
+        var body = item.querySelector(':scope > .nested-tab-editor-body');
+        var heading = item.querySelector(':scope > .tab-editor-heading');
+        if (!body) return;
+        var opening = body.style.display === 'none' || body.style.display === '';
+        body.style.display = opening ? 'block' : 'none';
+        item.classList.toggle('is-expanded', opening);
+        item.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        if (heading) heading.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    }
+
+    function removeNestedTabEditor(button) {
+        var item = button.closest('.tab-editor-item');
+        if (!item) return;
+        if (item.classList.contains('root-tab-editor-item')) {
+            var idx = parseInt(item.getAttribute('data-tab-index'), 10);
+            deleteDynamicTab(idx);
+        } else {
+            var parentList = item.parentElement;
+            item.remove();
+            if (parentList && parentList.classList.contains('nested-sub-tabs-list')) {
+                var emptyState = parentList.parentElement ? parentList.parentElement.querySelector('.nested-sub-tabs-empty') : null;
+                if (emptyState && parentList.querySelectorAll(':scope > .sub-tab-editor-item').length === 0) {
+                    emptyState.style.display = 'block';
+                }
+            }
+        }
+    }
+
+    function toggleNestedSubTabs(select) {
+        var item = select.closest('.tab-editor-item');
+        if (!item) return;
+        var enabled = select.value === 'add';
+        var container = item.querySelector(':scope > .nested-tab-editor-body > .nested-sub-tabs-container');
+        var ownSettings = item.querySelector(':scope > .nested-tab-editor-body > .root-content-settings');
+        if (container) container.style.display = enabled ? 'block' : 'none';
+        if (ownSettings) ownSettings.style.display = enabled ? 'none' : 'block';
+        if (enabled) {
+            item.querySelectorAll(':scope > .nested-tab-editor-body > .root-content-settings .field-toggle').forEach(function(el) { el.checked = false; });
+            item.querySelectorAll(':scope > .nested-tab-editor-body > .root-content-settings .feature-copy, :scope > .nested-tab-editor-body > .root-content-settings .feature-transcript, :scope > .nested-tab-editor-body > .root-content-settings .feature-structured').forEach(function(el) { el.checked = false; });
+            item.querySelectorAll(':scope > .nested-tab-editor-body > .root-content-settings .tab-header-input, :scope > .nested-tab-editor-body > .root-content-settings .tab-description-input').forEach(function(el) { el.value = ''; });
+        }
+    }
+
+    function addNestedSubTab(button) {
+        var list = button.closest('.nested-sub-tabs-container').querySelector('.nested-sub-tabs-list');
+        if (!list) return;
+        var index = list.querySelectorAll(':scope > .sub-tab-editor-item').length;
+        var item = document.createElement('div');
+        item.innerHTML = renderTemporarySubTab(index);
+        list.appendChild(item.firstElementChild);
+        var emptyState = button.closest('.nested-sub-tabs-container').querySelector('.nested-sub-tabs-empty');
+        if (emptyState) emptyState.style.display = 'none';
+    }
+
+    function renderTemporarySubTab(index) {
+        var fields = globalDynamicFields || {};
+        var keys = Object.keys(fields);
+        var toggles = keys.map(function(key) {
+            var title = (fields[key] && fields[key]['field-title']) || key;
+            return '<label class="tab-field-option"><span class="tab-field-label">' + String(title).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + ' <small>(' + String(key).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;') + ')</small></span><input type="checkbox" class="field-toggle" data-field-key="' + String(key).replace(/"/g,'&quot;') + '"></label>';
+        }).join('');
+        if (!toggles) toggles = '<p class="tab-editor-empty-fields">No dynamic fields are available. Add fields in Account Dynamic Fields first.</p>';
+        return '<section class="tab-editor-item sub-tab-editor-item" data-tab-index="' + index + '" data-is-sub="1">' +
+            '<div class="tab-editor-heading" onclick="toggleNestedTabEditor(this)" role="button" tabindex="0" aria-expanded="false"><div class="tab-editor-heading-copy"><span class="tab-editor-kind">SUB TAB</span><strong class="tab-editor-title">New Sub Tab</strong></div>' +
+            '<div class="tab-editor-actions"><button type="button" class="btn btn-secondary btn-sm reorder-move" style="display:none" onclick="event.stopPropagation();moveEditorItem(this,-1)">↑</button><button type="button" class="btn btn-secondary btn-sm reorder-move" style="display:none" onclick="event.stopPropagation();moveEditorItem(this,1)">↓</button><button type="button" class="btn btn-danger btn-sm tab-delete-button" onclick="event.stopPropagation();removeNestedTabEditor(this)">Delete</button></div></div>' +
+            '<div class="nested-tab-editor-body" style="display:none;"><div class="form-group"><label>Sub Tab Name</label><input type="text" class="tab-name-input" value="Sub Tab ' + (index + 1) + '" placeholder="Enter sub-tab name"></div>' +
+            '<div class="form-group display-tab-setting"><label>Display Tab in New Project</label><select class="display-tab-input"><option value="yes" selected>Yes</option><option value="no">No</option></select></div>' +
+            '<div class="form-group"><label>Header</label><input type="text" class="tab-header-input" value="" placeholder="Enter header text..."></div>' +
+            '<div class="form-group"><label>Description</label><textarea class="tab-description-input" rows="2" placeholder="Enter description..."></textarea></div>' +
+            '<div class="form-group"><label>Fields to Display</label><div class="tab-fields-toggle-list">' + toggles + '</div></div>' +
+            '<div class="tab-feature-options"><label><input type="checkbox" class="feature-copy"> <span>Copy Data</span></label><label><input type="checkbox" class="feature-transcript"> <span>Transcript Detection</span></label><label><input type="checkbox" class="feature-structured"> <span>Structured Data Detection</span></label></div></div></section>';
     }
 
     function cleanEmptyTabs() {
@@ -4226,13 +5412,14 @@
 
     function addDynamicTab() {
         var tabs = userDynamicTabs || [];
-        tabs.push({
+        tabs.unshift({
             tab_name: 'New Tab ' + (tabs.length + 1),
             header: '',
             description: '',
             dynamic_fields_display: [],
             _expanded: false,
             submit_tab: true,
+            display_tab: true,
             additional_features: {
                 copy_button: false,
                 transcript_detection: false,
@@ -4255,74 +5442,139 @@
     }
 
     function saveDynamicTabs() {
-        var tabItems = document.querySelectorAll('.tab-editor-item');
-        var tabs = [];
-        tabItems.forEach(function(item) {
-            var nameInput = item.querySelector('.tab-name-input');
-            var headerInput = item.querySelector('.tab-header-input');
-            var descInput = item.querySelector('.tab-description-input');
-            var toggles = item.querySelectorAll('.field-toggle');
-            var index = parseInt(item.getAttribute('data-tab-index'));
+        function collectTab(item, isSub) {
+            var nameInput = item.querySelector(':scope > .nested-tab-editor-body > .form-group .tab-name-input') || item.querySelector('.tab-name-input');
+            var body = item.querySelector('.nested-tab-editor-body');
+            var headerInput = body ? body.querySelector('.tab-header-input') : item.querySelector('.tab-header-input');
+            var descInput = body ? body.querySelector('.tab-description-input') : item.querySelector('.tab-description-input');
             var dynamicFieldsDisplay = [];
-            toggles.forEach(function(toggle) {
-                if (toggle.checked) {
-                    dynamicFieldsDisplay.push(toggle.getAttribute('data-field-key'));
-                }
-            });
-            
-            // Get additional features from toggles
-            var featureToggles = item.querySelectorAll('.additional-feature-toggle');
+            ((body || item).querySelector('.tab-fields-toggle-list') || body || item).querySelectorAll('.field-toggle').forEach(function(toggle) { if (toggle.checked) dynamicFieldsDisplay.push(toggle.getAttribute('data-field-key')); });
+            var featureRoot = body || item;
             var additionalFeatures = {
-                copy_button: false,
-                transcript_detection: false,
-                transcript_with_structured_data_detection: false
+                copy_button: !!featureRoot.querySelector('.feature-copy:checked'),
+                transcript_detection: !!featureRoot.querySelector('.feature-transcript:checked'),
+                transcript_with_structured_data_detection: !!featureRoot.querySelector('.feature-structured:checked')
             };
-            featureToggles.forEach(function(toggle) {
-                var feature = toggle.getAttribute('data-feature');
-                if (feature && additionalFeatures.hasOwnProperty(feature)) {
-                    additionalFeatures[feature] = toggle.checked;
-                }
-            });
-            
-            var existingTab = userDynamicTabs[index] || {};
-            tabs.push({
+            var result = {
                 tab_name: nameInput ? nameInput.value.trim() : '',
                 header: headerInput ? headerInput.value.trim() : '',
                 description: descInput ? descInput.value.trim() : '',
                 dynamic_fields_display: dynamicFieldsDisplay,
-                _expanded: existingTab._expanded || false,
-                submit_tab: existingTab.submit_tab !== undefined ? existingTab.submit_tab : true,
-                additional_features: additionalFeatures // Save directly, no need to fetch existing
-            });
+                display_tab: !!(item.querySelector('.display-tab-input') && item.querySelector('.display-tab-input').value === 'yes'),
+                additional_features: additionalFeatures
+            };
+            if (!isSub) {
+                var mode = item.querySelector('.sub-tabs-mode');
+                result.sub_tabs_mode = mode ? mode.value : 'none';
+                result.sub_tabs = [];
+                if (result.sub_tabs_mode === 'add') {
+                    // A parent with sub-tabs is a container only; its fields and feature toggles belong to children.
+                    result.header = '';
+                    result.description = '';
+                    result.dynamic_fields_display = [];
+                    result.additional_features = {
+                        copy_button: false,
+                        transcript_detection: false,
+                        transcript_with_structured_data_detection: false
+                    };
+                    item.querySelectorAll(':scope > .nested-tab-editor-body > .nested-sub-tabs-container > .nested-sub-tabs-list > .sub-tab-editor-item').forEach(function(child) {
+                        var c = collectTab(child, true); if (c.tab_name) result.sub_tabs.push(c);
+                    });
+                }
+                var idx = parseInt(item.getAttribute('data-tab-index'), 10);
+                var old = userDynamicTabs[idx] || {};
+                result.submit_tab = old.submit_tab !== undefined ? old.submit_tab : true;
+                result._expanded = old._expanded || false;
+            }
+            return result;
+        }
+        var tabs = [];
+        document.querySelectorAll('#dynamicTabsForm > .dynamic-tabs-editor-list > .root-tab-editor-item').forEach(function(item) {
+            var tab = collectTab(item, false);
+            if (tab.tab_name) tabs.push(tab);
         });
-        document.getElementById('tabsDataInput').value = JSON.stringify(tabs);
-        document.getElementById('dynamicTabsForm').submit();
+        userDynamicTabs = tabs;
+        var input = document.getElementById('tabsDataInput');
+        var form = document.getElementById('dynamicTabsForm');
+        if (input && form) { input.value = JSON.stringify(tabs); form.submit(); }
     }
 
     // ============================================================
     // ===== SWITCH NEW PROJECT SUB TAB =====
     // ============================================================
 
+    // Show Save Entry only when the currently displayed main tab is enabled
+    // in Submit Tabs. Nested child tabs inherit their parent tab's setting.
+    function updateSaveEntryButtonVisibility() {
+        var saveButton = document.getElementById('saveEntryButton');
+        if (!saveButton) return;
+
+        var activeContent = document.querySelector('#user_tab_add_entry .dynamic-sub-tab-content.active');
+        var enabled = false;
+
+        if (activeContent && activeContent.id !== 'newProjectSubTab_all_fields') {
+            var tabId = activeContent.id.replace('newProjectSubTab_', '');
+            var tabButton = document.querySelector('#user_tab_add_entry #newProjectSubTabs .dynamic-sub-tab-btn[data-tab="' + tabId + '"]');
+            enabled = !!(tabButton && tabButton.getAttribute('data-submit-enabled') === '1');
+        }
+
+        saveButton.style.display = enabled ? 'inline-flex' : 'none';
+    }
+
+    function switchNewProjectNestedSubTab(btn) {
+        var wrapper = btn.closest('.nested-project-tabs');
+        if (!wrapper) return;
+        wrapper.querySelectorAll('.nested-child-btn').forEach(function(b) { b.classList.remove('active'); });
+        wrapper.querySelectorAll('.nested-child-content').forEach(function(c) { c.classList.remove('active'); c.style.display = 'none'; });
+        btn.classList.add('active');
+        var index = Array.prototype.indexOf.call(wrapper.querySelectorAll('.nested-child-btn'), btn);
+        var contents = wrapper.querySelectorAll('.nested-child-content');
+        if (contents[index]) { contents[index].classList.add('active'); contents[index].style.display = 'block'; }
+        updateSaveEntryButtonVisibility();
+    }
+
     function switchNewProjectSubTab(tabId, btn) {
         document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(function(el) { el.classList.remove('active'); });
-        document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-btn').forEach(function(el) { el.classList.remove('active'); });
+        document.querySelectorAll('#user_tab_add_entry #newProjectSubTabs .dynamic-sub-tab-btn').forEach(function(el) { el.classList.remove('active'); });
         var target = document.getElementById('newProjectSubTab_' + tabId);
         if (target) {
             target.classList.add('active');
+            // Selecting a main tab always starts on its first child sub-tab.
+            var nested = target.querySelector('.nested-project-tabs');
+            if (nested) {
+                var childButtons = nested.querySelectorAll('.nested-child-btn');
+                var childContents = nested.querySelectorAll('.nested-child-content');
+                childButtons.forEach(function(childButton, index) {
+                    childButton.classList.toggle('active', index === 0);
+                });
+                childContents.forEach(function(childContent, index) {
+                    childContent.classList.toggle('active', index === 0);
+                    childContent.style.display = index === 0 ? 'block' : 'none';
+                });
+            }
         }
-        if (btn) {
-            btn.classList.add('active');
-        }
+        if (btn) btn.classList.add('active');
+        updateSaveEntryButtonVisibility();
     }
 
     // ============================================================
     // ===== SUBMIT USER ENTRY =====
     // ============================================================
 
+    document.addEventListener('DOMContentLoaded', function() {
+        updateSaveEntryButtonVisibility();
+    });
+
     function submitUserEntry() {
         var activeContent = document.querySelector('#user_tab_add_entry .dynamic-sub-tab-content.active');
         if (!activeContent) {
             showDialog('Error', 'No active form found.');
+            return;
+        }
+        updateSaveEntryButtonVisibility();
+        var saveButton = document.getElementById('saveEntryButton');
+        if (!saveButton || saveButton.style.display === 'none') {
+            showDialog('Info', 'Saving entries is disabled for the currently displayed tab in Submit Tabs.');
             return;
         }
         var inputs = activeContent.querySelectorAll('input, textarea, select');
@@ -4334,7 +5586,7 @@
                 if (key.includes('_date') || key.includes('_hour_12') || key.includes('_minute_12') || key.includes('_ampm')) {
                     return;
                 }
-                entryData[key] = input.value;
+                    entryData[key] = input.value;
             }
         });
         objectContainers.forEach(function(container) {
@@ -4370,13 +5622,8 @@
         document.getElementById('addEntryForm').submit();
     }
 
-    // ============================================================
-    // ===== RENDER GLOBAL DYNAMIC FIELDS =====
-    // ============================================================
-
-    // ===== UPDATE renderGlobalDynamicFields FUNCTION =====
-    // Replace the entire function with this version
-
+    // Legacy renderer retained for compatibility with account-scoped field editor helpers.
+    // The global dashboard Dynamic Fields tab has been removed.
     function renderGlobalDynamicFields() {
         var container = document.getElementById('globalDynamicFieldsList');
         if (!container) return;
@@ -4503,6 +5750,7 @@
                 var subElement = sub.element_type || 'input';
                 var subDefaultValue = sub.default_value || '';
                 var subDefaultValues = sub.default_values || [];
+                var subButtonUrl = sub.button_url || '';
                 subFieldsHtml += 
                     '<div class="sub-field-group" id="sub_field_' + idx + '">' +
                     '<button type="button" class="remove-sub-field" onclick="removeSubField(' + idx + ')">×</button>' +
@@ -4541,6 +5789,13 @@
                     '</div>' +
                     '<div id="sub_default_values_list_' + idx + '" style="margin-top:8px;"></div>' +
                     '</div>' +
+                    '<div class="form-group" id="sub_url_container_' + idx + '" style="' + (subElement === 'button' ? 'display:block;' : 'display:none;') + '">' +
+                    '<label>Button URL (onclick value)</label>' +
+                    '<div id="sub_url_input_container_' + idx + '">' +
+                    '<input type="url" id="sub_url_value_' + idx + '" value="' + subButtonUrl + '" placeholder="Enter URL (e.g., https://example.com)..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
+                    '<small style="color:#6b7280;">This URL will be opened in a new window/tab when the button is clicked.</small>' +
+                    '</div>' +
+                    '</div>' +
                     '</div>';
             });
         }
@@ -4571,23 +5826,32 @@
             '<div id="individual_fields_container" style="' + (isObjects ? 'display:none;' : 'display:block;') + '">' +
             '<div class="form-group">' +
             '<label>Element Type</label>' +
-            '<select id="df_element_type" onchange="toggleDefaultValueInput()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
+            '<select id="df_element_type" onchange="toggleDefaultValueInput(); toggleCopySentencesConfig()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '<option value="input" ' + (elementType === 'input' ? 'selected' : '') + '>Input</option>' +
             '<option value="select" ' + (elementType === 'select' ? 'selected' : '') + '>Select</option>' +
             '<option value="textarea" ' + (elementType === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
             '<option value="date-time-input" ' + (elementType === 'date-time-input' ? 'selected' : '') + '>Date & Time</option>' +
             '<option value="button" ' + (elementType === 'button' ? 'selected' : '') + '>Button</option>' +
+            '<option value="copy_button_for_each_of" ' + (elementType === 'copy_button_for_each_of' ? 'selected' : '') + '>Copy Button For Each Sentence</option>' +
             '</select>' +
             '</div>' +
-            '<div class="form-group" id="df_default_value_container">' +
+            '<div class="form-group" id="df_default_value_container" style="' + ((elementType === 'button' || elementType === 'copy_button_for_each_of') ? 'display:none;' : 'display:block;') + '">' +
             '<label>Default Value</label>' +
-            '<div id="df_default_value_input_container" ' + (elementType === 'textarea' ? 'style="display:none;"' : '') + '>' +
-            '<input type="text" id="df_default_value" value="' + defaultValue + '" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
+            '<div id="df_default_value_input_container" ' + (elementType === 'textarea' ? 'style="display:none;"' : 'style="display:block;"') + '>' +
+            '<input type="text" id="df_default_value" value="' + (elementType !== 'button' && elementType !== 'textarea' ? defaultValue : '') + '" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '</div>' +
             '<div id="df_default_value_textarea_container" ' + (elementType === 'textarea' ? 'style="display:block;"' : 'style="display:none;"') + '>' +
-            '<textarea id="df_default_value_textarea" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' + defaultValue + '</textarea>' +
+            '<textarea id="df_default_value_textarea" oninput="toggleSeparateParagraphOption()" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' + (elementType === 'textarea' ? defaultValue : '') + '</textarea>' +
             '</div>' +
+            '<div class="form-group" id="df_separate_paragraphs_container" style="' + (elementType === 'textarea' && defaultValue ? 'display:block;' : 'display:none;') + '">' +
+            '<label>Separate paragraphs into individual display items?</label>' +
+            '<select id="df_separate_paragraphs" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"><option value="no">No</option><option value="yes" ' + (field.separate_paragraphs === 'yes' ? 'selected' : '') + '>Yes</option></select>' +
+            '<small style="color:#6b7280;">When Yes, each non-empty line/paragraph is displayed separately with its own copy button.</small></div>' +
             '</div>' +
+                        '<div class="form-group" id="df_copy_sentences_container" style="display:none;border:1px solid #cbd5e1;border-radius:10px;padding:12px;background:#f8fafc;">' +
+            '<label>Add sentences with options of</label><select id="df_copy_sentence_mode" onchange="toggleCopySentenceMode()" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;margin:8px 0 12px;"><option value="individually">Individually</option><option value="bulk">Bulk</option></select>' +
+            '<div id="df_copy_individual_panel"><button type="button" class="btn btn-secondary btn-sm" onclick="addCopySentenceInput()">+ Add individual element</button><div id="df_copy_individual_list" style="margin-top:10px;"></div></div>' +
+            '<div id="df_copy_bulk_panel" style="display:none;"><label>Add Bulk sentences</label><textarea id="df_copy_bulk_text" rows="6" placeholder="I am sentence a&#10;I am sentence b" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;"></textarea><small>Each non-empty line is saved as a separate sentence.</small></div></div>' +
             '<div class="form-group" id="df_select_values_container" style="' + (elementType === 'select' ? 'display:block;' : 'display:none;') + '">' +
             '<label>Select Options</label>' +
             '<div style="display:flex; gap:8px;">' +
@@ -4619,6 +5883,7 @@
         showDialog('Edit Dynamic Field', '', null, content);
         toggleFieldCategory();
         toggleDefaultValueInput();
+        loadCopySentenceInputs(field);
         if (isObjects) {
             var subFieldData2 = field.fieldkeyvalue || {};
             var subKeys2 = Object.keys(subFieldData2);
@@ -4640,25 +5905,92 @@
         document.getElementById('objects_fields_container').style.display = category === 'objects' ? 'block' : 'none';
     }
 
+
+    function toggleCopySentencesConfig() {
+        var t=document.getElementById('df_element_type'), b=document.getElementById('df_copy_sentences_container');
+        if(t&&b)b.style.display=t.value==='copy_button_for_each_of'?'block':'none';
+    }
+    function toggleCopySentenceMode() {
+        var m=document.getElementById('df_copy_sentence_mode'), i=document.getElementById('df_copy_individual_panel'), b=document.getElementById('df_copy_bulk_panel');
+        if(i)i.style.display=m&&m.value==='individually'?'block':'none';
+        if(b)b.style.display=m&&m.value==='bulk'?'block':'none';
+    }
+    function addCopySentenceInput(value) {
+        var list=document.getElementById('df_copy_individual_list'); if(!list)return;
+        var row=document.createElement('div'); row.className='new-copy-sentence-row'; row.style.cssText='display:flex;gap:8px;margin-bottom:8px;';
+        var a=document.createElement('textarea'); a.className='new-copy-sentence'; a.rows=2; a.value=value||''; a.placeholder='Add a new sentence...'; a.style.cssText='flex:1;min-width:0;padding:10px;border:1px solid #cbd5e1;border-radius:8px;';
+        var x=document.createElement('button'); x.type='button'; x.className='btn btn-secondary btn-sm'; x.textContent='Remove'; x.onclick=function(){row.remove();};
+        row.appendChild(a);row.appendChild(x);list.appendChild(row);
+    }
+    function addExistingCopySentence(value) {
+        var list=document.getElementById('df_copy_individual_list'); if(!list)return;
+        var row=document.createElement('div'); row.className='existing-copy-sentence-row'; row.style.cssText='display:flex;align-items:flex-start;gap:8px;margin-bottom:8px;padding:9px;border:1px solid #dbe3ea;border-radius:8px;background:#fff;';
+        var text=document.createElement('div'); text.className='existing-copy-sentence-text'; text.textContent=value; text.style.cssText='flex:1;min-width:0;white-space:pre-wrap;overflow-wrap:anywhere;padding:5px 0;';
+        var x=document.createElement('button'); x.type='button'; x.className='btn btn-secondary btn-sm'; x.textContent='Delete'; x.setAttribute('aria-label','Delete this existing sentence'); x.onclick=function(){row.remove();};
+        row.appendChild(text);row.appendChild(x);list.appendChild(row);
+    }
+    function getCopySentenceInputs() {
+        var t=document.getElementById('df_element_type');if(!t||t.value!=='copy_button_for_each_of')return [];
+        var m=(document.getElementById('df_copy_sentence_mode')||{}).value||'individually';
+        if(m==='bulk')return ((document.getElementById('df_copy_bulk_text')||{}).value||'').split(/\r?\n/).map(function(v){return v.trim();}).filter(Boolean);
+        return Array.prototype.slice.call(document.querySelectorAll('#df_copy_individual_list .new-copy-sentence')).map(function(a){return a.value.trim();}).filter(Boolean);
+    }
+    function getRemainingExistingCopySentences() {
+        return Array.prototype.slice.call(document.querySelectorAll('#df_copy_individual_list .existing-copy-sentence-row .existing-copy-sentence-text')).map(function(el){return el.textContent.trim();}).filter(Boolean);
+    }
+    function loadCopySentenceInputs(field) {
+        var o=field&&field.copy_button_for_each_of?field.copy_button_for_each_of:{}, vals=Object.keys(o).sort(function(a,b){return +a- +b;}).map(function(k){return String(o[k]||'').trim();}).filter(Boolean);
+        var l=document.getElementById('df_copy_individual_list');if(l)l.innerHTML='';
+        vals.forEach(addExistingCopySentence);
+        addCopySentenceInput('');
+        var m=document.getElementById('df_copy_sentence_mode');if(m)m.value=field&&field.copy_button_mode?field.copy_button_mode:'individually';
+        var b=document.getElementById('df_copy_bulk_text');if(b)b.value=vals.join('\n');
+        toggleCopySentenceMode();toggleCopySentencesConfig();
+    }
+    function mergeCopySentenceRecords(old, added) {
+        var r={};
+        (old||[]).concat(added||[]).forEach(function(v){v=String(v||'').trim();if(v)r[String(Object.keys(r).length+1)]=v;});
+        return r;
+    }
+
     function toggleDefaultValueInput() {
         var elementType = document.getElementById('df_element_type').value;
+        var separateBox = document.getElementById('df_separate_paragraphs_container');
+        if (separateBox) separateBox.style.display = (elementType === 'textarea' && document.getElementById('df_default_value_textarea') && document.getElementById('df_default_value_textarea').value.trim() !== '') ? 'block' : 'none';
         var defaultValueContainer = document.getElementById('df_default_value_container');
         var defaultValueInput = document.getElementById('df_default_value_input_container');
         var defaultValueTextarea = document.getElementById('df_default_value_textarea_container');
         var selectValuesContainer = document.getElementById('df_select_values_container');
+        var urlContainer = document.getElementById('df_url_container');
+        
+        // Hide all first
+        if (defaultValueContainer) defaultValueContainer.style.display = 'none';
+        if (selectValuesContainer) selectValuesContainer.style.display = 'none';
+        if (urlContainer) urlContainer.style.display = 'none';
+        if (defaultValueInput) defaultValueInput.style.display = 'none';
+        if (defaultValueTextarea) defaultValueTextarea.style.display = 'none';
+        
         if (elementType === 'select') {
-            defaultValueContainer.style.display = 'none';
-            selectValuesContainer.style.display = 'block';
+            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
+            if (selectValuesContainer) selectValuesContainer.style.display = 'block';
         } else if (elementType === 'textarea') {
-            defaultValueContainer.style.display = 'block';
-            defaultValueInput.style.display = 'none';
-            defaultValueTextarea.style.display = 'block';
-            selectValuesContainer.style.display = 'none';
+            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
+            if (defaultValueInput) defaultValueInput.style.display = 'none';
+            if (defaultValueTextarea) defaultValueTextarea.style.display = 'block';
+        } else if (elementType === 'copy_button_for_each_of') {
+            if (defaultValueContainer) defaultValueContainer.style.display = 'none';
+            if (selectValuesContainer) selectValuesContainer.style.display = 'none';
+            if (urlContainer) urlContainer.style.display = 'none';
+        } else if (elementType === 'button') {
+            // Show URL container for button type
+            if (urlContainer) urlContainer.style.display = 'block';
+            // Hide default value container for button
+            if (defaultValueContainer) defaultValueContainer.style.display = 'none';
         } else {
-            defaultValueContainer.style.display = 'block';
-            defaultValueInput.style.display = 'block';
-            defaultValueTextarea.style.display = 'none';
-            selectValuesContainer.style.display = 'none';
+            // Input, date-time-input, etc.
+            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
+            if (defaultValueInput) defaultValueInput.style.display = 'block';
+            if (defaultValueTextarea) defaultValueTextarea.style.display = 'none';
         }
     }
 
@@ -4686,6 +6018,7 @@
             '<option value="textarea">Textarea</option>' +
             '<option value="date-time-input">Date & Time</option>' +
             '<option value="button">Button</option>' +
+            '<option value="copy_button_for_each_of">Copy Button For Each Sentence</option>' +
             '</select>' +
             '</div>' +
             '<div class="form-group" id="sub_default_value_container_' + index + '">' +
@@ -4873,6 +6206,15 @@
             }
             
             var defaultValues = window._dfDefaultValues || [];
+            var copySentenceMode = (document.getElementById('df_copy_sentence_mode') || {}).value || 'individually';
+            var additions = getCopySentenceInputs();
+            var remainingExisting = copySentenceMode === 'individually' ? getRemainingExistingCopySentences() : [];
+            // Bulk always replaces the complete saved list. Individual mode preserves
+            // existing sentences unless manually deleted, then appends newly entered ones.
+            var copySentenceRecord = elementType === 'copy_button_for_each_of'
+                ? mergeCopySentenceRecords(copySentenceMode === 'bulk' ? [] : remainingExisting, additions)
+                : {};
+
             fieldData = {
                 'field-title': title,
                 'field-name': key,
@@ -4880,7 +6222,10 @@
                 'element_type': elementType,
                 'default_value': defaultValue,
                 'default_values': defaultValues,
-                'button_url': buttonUrl
+                'button_url': buttonUrl,
+                'separate_paragraphs': (elementType === 'textarea' && document.getElementById('df_separate_paragraphs')) ? document.getElementById('df_separate_paragraphs').value : 'no',
+                'copy_button_mode': copySentenceMode,
+                'copy_button_for_each_of': copySentenceRecord
             };
         } else {
             var subFieldData = {};
@@ -4938,6 +6283,7 @@
         var finalKey = key;
         var formData = new FormData();
         formData.append('update_global_field', 'true');
+        formData.append('user_id', selectedUserId);
         formData.append('old_key', oldKey);
         formData.append('new_key', finalKey);
         formData.append('field_data', JSON.stringify(fieldData));
@@ -4971,6 +6317,7 @@
             { label: 'Delete', class: 'btn-confirm', callback: function() {
                 var formData = new FormData();
                 formData.append('delete_global_dynamic_field', 'true');
+                formData.append('user_id', selectedUserId);
                 formData.append('field_key', key);
                 fetch(window.location.href, {
                     method: 'POST',
@@ -4998,8 +6345,17 @@
     // ===== UPDATE toggleDefaultValueInput FUNCTION =====
     // Add this complete function with the new "button" case
 
+    function toggleSeparateParagraphOption() {
+        var box = document.getElementById('df_separate_paragraphs_container');
+        var textarea = document.getElementById('df_default_value_textarea');
+        var type = document.getElementById('df_element_type');
+        if (box) box.style.display = (type && type.value === 'textarea' && textarea && textarea.value.trim() !== '') ? 'block' : 'none';
+    }
+
     function toggleDefaultValueInput() {
         var elementType = document.getElementById('df_element_type').value;
+        var separateBox = document.getElementById('df_separate_paragraphs_container');
+        if (separateBox) separateBox.style.display = (elementType === 'textarea' && document.getElementById('df_default_value_textarea') && document.getElementById('df_default_value_textarea').value.trim() !== '') ? 'block' : 'none';
         var defaultValueContainer = document.getElementById('df_default_value_container');
         var defaultValueInput = document.getElementById('df_default_value_input_container');
         var defaultValueTextarea = document.getElementById('df_default_value_textarea_container');
@@ -5021,6 +6377,12 @@
             if (defaultValueContainer) defaultValueContainer.style.display = 'block';
             if (defaultValueInput) defaultValueInput.style.display = 'none';
             if (defaultValueTextarea) defaultValueTextarea.style.display = 'block';
+        } else if (elementType === 'copy_button_for_each_of') {
+            // Sentences entered in the sentence editor are the defaults; no separate default-value control is relevant.
+            if (defaultValueContainer) defaultValueContainer.style.display = 'none';
+            if (selectValuesContainer) selectValuesContainer.style.display = 'none';
+            if (urlContainer) urlContainer.style.display = 'none';
+            if (separateBox) separateBox.style.display = 'none';
         } else if (elementType === 'button') {
             // For button type, show URL input instead of default value
             if (urlContainer) urlContainer.style.display = 'block';
@@ -5057,12 +6419,13 @@
             '<div id="individual_fields_container">' +
             '<div class="form-group">' +
             '<label>Element Type</label>' +
-            '<select id="df_element_type" onchange="toggleDefaultValueInput()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
+            '<select id="df_element_type" onchange="toggleDefaultValueInput(); toggleCopySentencesConfig()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '<option value="input">Input</option>' +
             '<option value="select">Select</option>' +
             '<option value="textarea">Textarea</option>' +
             '<option value="date-time-input">Date & Time</option>' +
             '<option value="button">Button</option>' +
+            '<option value="copy_button_for_each_of">Copy Button For Each Sentence</option>' +
             '</select>' +
             '</div>' +
             '<div class="form-group" id="df_default_value_container">' +
@@ -5074,6 +6437,10 @@
             '<textarea id="df_default_value_textarea" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;"></textarea>' +
             '</div>' +
             '</div>' +
+                        '<div class="form-group" id="df_copy_sentences_container" style="display:none;border:1px solid #cbd5e1;border-radius:10px;padding:12px;background:#f8fafc;">' +
+            '<label>Add sentences with options of</label><select id="df_copy_sentence_mode" onchange="toggleCopySentenceMode()" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;margin:8px 0 12px;"><option value="individually">Individually</option><option value="bulk">Bulk</option></select>' +
+            '<div id="df_copy_individual_panel"><button type="button" class="btn btn-secondary btn-sm" onclick="addCopySentenceInput()">+ Add individual element</button><div id="df_copy_individual_list" style="margin-top:10px;"></div></div>' +
+            '<div id="df_copy_bulk_panel" style="display:none;"><label>Add Bulk sentences</label><textarea id="df_copy_bulk_text" rows="6" placeholder="I am sentence a&#10;I am sentence b" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;"></textarea><small>Each non-empty line is saved as a separate sentence.</small></div></div>' +
             '<div class="form-group" id="df_select_values_container" style="display:none;">' +
             '<label>Select Options</label>' +
             '<div style="display:flex; gap:8px;">' +
@@ -5105,6 +6472,7 @@
         showDialog('Add Dynamic Field', '', null, content);
         toggleFieldCategory();
         toggleDefaultValueInput();
+        loadCopySentenceInputs(null);
         renderDefaultValuesList();
     }
 
@@ -5140,6 +6508,15 @@
             }
             
             var defaultValues = window._dfDefaultValues || [];
+            var copySentenceMode = (document.getElementById('df_copy_sentence_mode') || {}).value || 'individually';
+            var additions = getCopySentenceInputs();
+            var remainingExisting = copySentenceMode === 'individually' ? getRemainingExistingCopySentences() : [];
+            // Bulk always replaces the complete saved list. Individual mode preserves
+            // existing sentences unless manually deleted, then appends newly entered ones.
+            var copySentenceRecord = elementType === 'copy_button_for_each_of'
+                ? mergeCopySentenceRecords(copySentenceMode === 'bulk' ? [] : remainingExisting, additions)
+                : {};
+
             
             fieldData = {
                 'field-title': title,
@@ -5148,7 +6525,10 @@
                 'element_type': elementType,
                 'default_value': defaultValue,
                 'default_values': defaultValues,
-                'button_url': buttonUrl
+                'button_url': buttonUrl,
+                'separate_paragraphs': (elementType === 'textarea' && document.getElementById('df_separate_paragraphs')) ? document.getElementById('df_separate_paragraphs').value : 'no',
+                'copy_button_mode': copySentenceMode,
+                'copy_button_for_each_of': copySentenceRecord
             };
         } else {
             var subFieldData = {};
@@ -5205,6 +6585,7 @@
         
         var formData = new FormData();
         formData.append('save_global_single_field', 'true');
+        formData.append('user_id', selectedUserId);
         formData.append('field_data', JSON.stringify(fieldData));
         
         showDialog('Saving', 'Saving field...');
@@ -5381,7 +6762,16 @@
         
         // Find all copy buttons in the active content
         var copyButtons = activeContent.querySelectorAll('.btn-secondary');
+        activeContent.querySelectorAll('.individual-sentence-copy-button').forEach(function(btn) {
+            btn.style.display = 'inline-flex';
+        });
         copyButtons.forEach(function(btn) {
+            // Individual-sentence rows always keep their own Copy button.
+            // The tab-level copy_button feature controls only general field/object copy buttons.
+            if (btn.classList.contains('individual-sentence-copy-button')) {
+                btn.style.display = 'inline-flex';
+                return;
+            }
             // Check if this is a copy button (contains copy-related text)
             var btnText = btn.textContent || '';
             if (btnText.includes('Copy') || btnText.includes('📋')) {
@@ -5395,6 +6785,10 @@
         
         // Also handle the copy buttons inside field containers
         activeContent.querySelectorAll('[id^="field_"]_container .btn-secondary, [id^="object_"]_container .btn-secondary').forEach(function(btn) {
+            if (btn.classList.contains('individual-sentence-copy-button')) {
+                btn.style.display = 'inline-flex';
+                return;
+            }
             var btnText = btn.textContent || '';
             if (btnText.includes('Copy') || btnText.includes('📋')) {
                 if (copyButtonEnabled) {
@@ -5500,14 +6894,63 @@
             };
         }
         
-        return tab.additional_features || {
-            copy_button: false,
-            transcript_detection: false,
-            transcript_with_structured_data_detection: false
+        // Return the tab's features, with defaults if missing
+        var features = tab.additional_features || {};
+        return {
+            copy_button: features.copy_button === true,
+            transcript_detection: features.transcript_detection === true,
+            transcript_with_structured_data_detection: features.transcript_with_structured_data_detection === true
         };
     }
 
-    // Function to detect transcript in element values
+    // Detect if character data is in structured JSON format with improved detection
+    function detectStructuredCharacterData(text) {
+        if (!text || typeof text !== 'string') return false;
+        
+        try {
+            // Check for characters_visual_prompts AND script
+            var hasPrompts = text.match(/"characters_visual_prompts"\s*:\s*\{/);
+            var hasScriptArray = text.match(/"script"\s*:\s*\[/);
+            var hasScriptObject = text.match(/"script"\s*:\s*\{/);
+            
+            // Return true if we have prompts AND (script array OR script object)
+            var hasValidScript = hasScriptArray !== null || hasScriptObject !== null;
+            
+            if (hasPrompts !== null && hasValidScript) {
+                return true;
+            }
+            
+            // Fallback: try to find the JSON object and validate it
+            var jsonStart = text.indexOf('{');
+            if (jsonStart !== -1) {
+                var braceCount = 0;
+                var jsonEnd = -1;
+                for (var i = jsonStart; i < text.length; i++) {
+                    if (text[i] === '{') braceCount++;
+                    else if (text[i] === '}') {
+                        braceCount--;
+                        if (braceCount === 0) {
+                            jsonEnd = i + 1;
+                            break;
+                        }
+                    }
+                }
+                if (jsonEnd !== -1) {
+                    var jsonStr = text.substring(jsonStart, jsonEnd);
+                    var parsed = JSON.parse(jsonStr);
+                    if (parsed.characters_visual_prompts && parsed.script) {
+                        return true;
+                    }
+                }
+            }
+            
+            return false;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // Function to detect transcript in element values - FIXED for structured data
     function detectTranscripts() {
         var addEntryTab = document.getElementById('user_tab_add_entry');
         if (!addEntryTab) return;
@@ -5532,31 +6975,27 @@
             var timePattern = /[-_\(]?\d{1,2}:\d{2}[-_\)]?/;
             var hasTime = timePattern.test(value);
             
-            // Check if this transcript contains structured data
+            // Check if this transcript contains structured data - INDEPENDENT CHECK
             var hasStructuredData = detectStructuredCharacterData(value);
             
             var existingIndicator = document.getElementById('transcript_indicator_' + elementId);
             var existingResult = document.getElementById('transcript_result_' + elementId);
             
-            // Determine if we should show anything
+            // Determine if we should show anything - INDEPENDENT CHECKS
             var shouldShowTranscript = false;
             var shouldShowStructured = false;
+            var shouldShowConversion = false;
             
-            // INDEPENDENT CHECKS - each feature works separately
-            if (hasTime) {
-                // Regular transcript detection is independent
-                if (transcriptDetectionEnabled) {
-                    shouldShowTranscript = true;
-                }
+            // Regular transcript detection (time-based)
+            if (hasTime && transcriptDetectionEnabled) {
+                shouldShowTranscript = true;
             }
             
-            // Structured data detection is independent
-            if (hasStructuredData) {
-                if (structuredDetectionEnabled) {
-                    shouldShowStructured = true;
-                    // Structured data also counts as a transcript
-                    shouldShowTranscript = true;
-                }
+            // Structured data detection (JSON with both characters and script)
+            if (hasStructuredData && structuredDetectionEnabled) {
+                shouldShowStructured = true;
+                shouldShowTranscript = true;
+                shouldShowConversion = true;
             }
             
             // If we should show either type
@@ -5577,7 +7016,7 @@
                     var indicatorText = '';
                     var buttonsHtml = '';
                     
-                    if (shouldShowStructured) {
+                    if (shouldShowStructured && shouldShowConversion) {
                         // Structured data detected - Show Convert to Text button
                         indicatorText = '📝 Transcript with Structured Character Data Detected';
                         buttonsHtml = 
@@ -5640,18 +7079,6 @@
             copyToClipboard(data.value);
         } else {
             showDialog('Info', 'No transcript data to copy.');
-        }
-    }
-
-    // Detect if character data is in structured JSON format - ONLY when both characters_visual_prompts and script exist
-    function detectStructuredCharacterData(text) {
-        try {
-            // Check for both characters_visual_prompts and script to ensure it's complete structured data
-            var hasPrompts = text.match(/"characters_visual_prompts"\s*:\s*\{/);
-            var hasScript = text.match(/"script"\s*:\s*\[/);
-            return hasPrompts !== null && hasScript !== null;
-        } catch (e) {
-            return false;
         }
     }
 
@@ -6801,32 +8228,54 @@
     }
 
     // Helper: Copy to clipboard
-    function copyToClipboard(text) {
+    function setCopyButtonFeedback(button) {
+        if (!button) {
+            var active = document.activeElement;
+            if (active && active.tagName === 'BUTTON' && /copy/i.test(active.textContent || '')) button = active;
+        }
+        if (!button || !button.tagName) return;
+        if (!button.dataset.originalCopyLabel) button.dataset.originalCopyLabel = button.innerHTML;
+        button.innerHTML = '&#10003; Copied';
+        button.classList.add('copy-button-copied');
+        button.setAttribute('aria-label', 'Copied');
+        if (button._copyFeedbackTimer) clearTimeout(button._copyFeedbackTimer);
+        button._copyFeedbackTimer = setTimeout(function() {
+            button.innerHTML = button.dataset.originalCopyLabel;
+            button.classList.remove('copy-button-copied');
+            button.removeAttribute('aria-label');
+        }, 1800);
+    }
+
+    function copyToClipboard(text, button) {
+        var textToCopy = typeof text === 'string' ? text : String(text == null ? '' : text);
+        if (!textToCopy.trim()) return;
+        if (!button) {
+            var active = document.activeElement;
+            if (active && active.tagName === 'BUTTON' && /copy/i.test(active.textContent || '')) button = active;
+        }
         if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text).then(function() {
-                showDialog('Success', 'Copied to clipboard!');
+            navigator.clipboard.writeText(textToCopy).then(function() {
+                setCopyButtonFeedback(button);
             }).catch(function() {
-                fallbackCopy(text);
+                fallbackCopy(textToCopy, button);
             });
         } else {
-            fallbackCopy(text);
+            fallbackCopy(textToCopy, button);
         }
     }
 
-    function fallbackCopy(text) {
+    function fallbackCopy(text, button) {
         var textarea = document.createElement('textarea');
         textarea.value = text;
         textarea.style.position = 'fixed';
         textarea.style.opacity = '0';
+        textarea.style.pointerEvents = 'none';
         document.body.appendChild(textarea);
         textarea.select();
-        try {
-            document.execCommand('copy');
-            showDialog('Success', 'Copied to clipboard!');
-        } catch (e) {
-            showDialog('Error', 'Failed to copy. Please copy manually.');
-        }
+        var copied = false;
+        try { copied = document.execCommand('copy'); } catch (e) { copied = false; }
         document.body.removeChild(textarea);
+        if (copied) setCopyButtonFeedback(button);
     }
 
     // Start transcript detection
@@ -6872,5 +8321,460 @@
         }, 500);
     });
 </script>
+
+<script>
+/* Coordinate sticky navigation so exactly one row owns the top position. */
+(function () {
+    function initSingleWinnerStickyTabs() {
+        var root = document.getElementById('user_tab_add_entry');
+        var scrollHost = document.querySelector('.scroll-body');
+        var defaultNav = document.querySelector('.user-config-tabs');
+        if (!root || !scrollHost || !defaultNav) return;
+
+        var childSentinels = new Map();
+        var mainSentinel = null;
+        var scheduled = false;
+
+        function visible(el) {
+            return !!(el && el.getClientRects().length &&
+                getComputedStyle(el).display !== 'none' &&
+                getComputedStyle(el).visibility !== 'hidden');
+        }
+
+        function ensureMainSentinel() {
+            var nav = root.querySelector('#newProjectSubTabs');
+            if (!nav) return null;
+            if (mainSentinel && mainSentinel.isConnected && mainSentinel.nextElementSibling === nav) {
+                return mainSentinel;
+            }
+            mainSentinel = document.createElement('span');
+            mainSentinel.className = 'main-tab-sticky-sentinel';
+            mainSentinel.setAttribute('aria-hidden', 'true');
+            mainSentinel.style.cssText = 'display:block;height:1px;width:100%;margin:0;padding:0;pointer-events:none;';
+            nav.parentNode.insertBefore(mainSentinel, nav);
+            return mainSentinel;
+        }
+
+        function ensureChildSentinel(nav) {
+            var sentinel = childSentinels.get(nav);
+            if (sentinel && sentinel.isConnected && sentinel.nextElementSibling === nav) return sentinel;
+            sentinel = document.createElement('span');
+            sentinel.className = 'nested-tab-sticky-sentinel';
+            sentinel.setAttribute('aria-hidden', 'true');
+            sentinel.style.cssText = 'display:block;height:1px;width:100%;margin:0;padding:0;pointer-events:none;';
+            nav.parentNode.insertBefore(sentinel, nav);
+            childSentinels.set(nav, sentinel);
+            return sentinel;
+        }
+
+        function updatePriority() {
+            scheduled = false;
+            var hostTop = scrollHost.getBoundingClientRect().top;
+            var rootVisible = visible(root);
+            var mainNav = root.querySelector('#newProjectSubTabs');
+            var mainHasReachedTop = false;
+
+            if (rootVisible && mainNav && visible(mainNav)) {
+                var mainSentinelEl = ensureMainSentinel();
+                if (mainSentinelEl) {
+                    var mainRect = mainSentinelEl.getBoundingClientRect();
+                    mainHasReachedTop = mainRect.bottom <= hostTop;
+                }
+            }
+
+            defaultNav.classList.toggle('default-nav-released', mainHasReachedTop);
+
+            var childHasReachedTop = false;
+            if (rootVisible) {
+                root.querySelectorAll('.nested-project-tabs > .dynamic-sub-tabs').forEach(function (nav) {
+                    var content = nav.closest('.dynamic-sub-tab-content');
+                    if (!visible(nav) || (content && !content.classList.contains('active'))) return;
+                    var sentinel = ensureChildSentinel(nav);
+                    var rect = sentinel.getBoundingClientRect();
+                    if (rect.bottom <= hostTop) childHasReachedTop = true;
+                });
+            }
+
+            root.classList.toggle('child-nav-priority', childHasReachedTop);
+        }
+
+        function scheduleUpdate() {
+            if (scheduled) return;
+            scheduled = true;
+            requestAnimationFrame(updatePriority);
+        }
+
+        function refreshSentinels() {
+            ensureMainSentinel();
+            root.querySelectorAll('.nested-project-tabs > .dynamic-sub-tabs').forEach(ensureChildSentinel);
+            scheduleUpdate();
+        }
+
+        scrollHost.addEventListener('scroll', scheduleUpdate, { passive: true });
+        window.addEventListener('resize', scheduleUpdate, { passive: true });
+
+        if ('MutationObserver' in window) {
+            var observer = new MutationObserver(function () {
+                refreshSentinels();
+            });
+            observer.observe(root, {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['class']
+            });
+            observer.observe(defaultNav, {
+                attributes: true,
+                attributeFilter: ['class']
+            });
+        }
+
+        refreshSentinels();
+        setTimeout(refreshSentinels, 150);
+        setTimeout(refreshSentinels, 500);
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initSingleWinnerStickyTabs);
+    } else {
+        initSingleWinnerStickyTabs();
+    }
+})();</script>
+
+
+
+<script>
+/* Enforce the exact sticky-row height equation:
+   default tabs = main dynamic tabs - 1px
+   main dynamic tabs = nested sub-tabs - 1px
+   The main dynamic row remains the reference height; sticky hand-off is unchanged.
+*/
+(function () {
+    function initStickyNavHeightHierarchy() {
+        var root = document.getElementById('user_tab_add_entry');
+        var defaultNav = document.querySelector('.user-config-tabs');
+        if (!root || !defaultNav) return;
+
+        var scheduled = false;
+
+        function syncHeights() {
+            scheduled = false;
+            var mainNav = root.querySelector('#newProjectSubTabs');
+            if (!mainNav) return;
+
+            var mainHeight = mainNav.getBoundingClientRect().height;
+            if (!mainHeight || !isFinite(mainHeight)) return;
+
+            var defaultHeight = Math.max(0, mainHeight - 1);
+            var nestedHeight = mainHeight + 1;
+
+            function setPx(el, property, value) {
+                var px = value + 'px';
+                if (el.style.getPropertyValue(property) !== px) {
+                    el.style.setProperty(property, px);
+                }
+            }
+
+            setPx(defaultNav, 'height', defaultHeight);
+            setPx(defaultNav, 'min-height', defaultHeight);
+            defaultNav.style.setProperty('align-items', 'center', 'important');
+
+            root.querySelectorAll('.nested-project-tabs > .dynamic-sub-tabs').forEach(function (childNav) {
+                setPx(childNav, '--nested-sticky-nav-height', nestedHeight);
+                setPx(childNav, 'height', nestedHeight);
+                setPx(childNav, 'min-height', nestedHeight);
+                childNav.style.setProperty('align-items', 'center', 'important');
+            });
+        }
+
+        function scheduleSync() {
+            if (scheduled) return;
+            scheduled = true;
+            requestAnimationFrame(syncHeights);
+        }
+
+        syncHeights();
+        window.addEventListener('resize', scheduleSync, { passive: true });
+
+        if ('ResizeObserver' in window) {
+            var resizeObserver = new ResizeObserver(scheduleSync);
+            var mainNav = root.querySelector('#newProjectSubTabs');
+            if (mainNav) resizeObserver.observe(mainNav);
+        }
+
+        if ('MutationObserver' in window) {
+            var mutationObserver = new MutationObserver(scheduleSync);
+            mutationObserver.observe(root, {
+                subtree: true,
+                childList: true,
+                attributes: true,
+                attributeFilter: ['class', 'style']
+            });
+        }
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', initStickyNavHeightHierarchy, { once: true });
+    } else {
+        initStickyNavHeightHierarchy();
+    }
+})();
+</script>
+
+<style id="sceneiq-folder-navigation-style">
+/* SceneIQ folder/file navigation */
+.main-header.folder-mode{justify-content:center;position:relative;min-height:64px;padding:12px 72px}
+.main-header.folder-mode .folder-header-left{position:absolute;left:16px;top:50%;transform:translateY(-50%)}
+.main-header.folder-mode .folder-header-title{font-size:17px;font-weight:750;text-align:center;max-width:100%;overflow-wrap:anywhere}
+.main-header.folder-mode .folder-header-right{position:absolute;right:16px;top:50%;transform:translateY(-50%)}
+.folder-back-btn{width:40px;height:40px;border:1px solid rgba(255,255,255,.35);border-radius:12px;background:rgba(255,255,255,.15);color:#fff;font-size:24px;line-height:1;cursor:pointer;display:grid;place-items:center}
+.folder-back-btn:hover{background:rgba(255,255,255,.27)}
+.folder-nav-root{width:100%;max-width:1100px;margin:0 auto;padding:clamp(14px,3vw,30px) 0 35px}
+.folder-nav-heading{margin:0 0 7px;color:#102a43;font-size:clamp(21px,3vw,28px);font-weight:800;letter-spacing:-.035em}
+.folder-nav-description{color:#718096;font-size:13px;margin:0 0 22px;line-height:1.6}
+.folder-card-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.folder-card{appearance:none;position:relative;min-width:0;min-height:142px;text-align:left;padding:20px 18px;border:1px solid #e2e8f0;border-radius:18px;background:linear-gradient(145deg,#fff 0%,#f8fbfc 100%);box-shadow:0 5px 18px rgba(15,35,55,.055);cursor:pointer;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:17px;color:#142b3c;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;overflow:hidden}
+.folder-card:before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--folder-accent,#0f8b80);opacity:.85}
+.folder-card:hover{transform:translateY(-3px);border-color:#9bd7ce;box-shadow:0 12px 28px rgba(15,75,80,.11)}
+.folder-card:focus-visible{outline:3px solid #79d3c6;outline-offset:3px}
+.folder-card-top{display:flex;width:100%;align-items:flex-start;justify-content:space-between;gap:12px}
+.folder-card-icon{width:43px;height:43px;flex:0 0 43px;border-radius:13px;background:var(--folder-tint,#e6f7f4);display:grid;place-items:center;font-size:22px}
+.folder-card-arrow{color:#91a2b2;font-size:20px}
+.folder-card-title{font-size:15px;font-weight:780;line-height:1.35;overflow-wrap:anywhere}
+.folder-card-subtitle{margin-top:5px;font-size:12px;line-height:1.45;color:#81909e;overflow-wrap:anywhere}
+.folder-card.wide{grid-column:1/-1;min-height:112px}
+.folder-card.wide .folder-card-top{align-items:center}
+.folder-card.wide .folder-card-copy{flex:1;min-width:0}
+.folder-card-count{font-size:11px;font-weight:750;color:#087f75;background:#e6f7f4;border-radius:99px;padding:5px 9px;white-space:nowrap}
+.folder-page-content{min-width:0;width:100%;animation:folderPageIn .18s ease both}
+.folder-page-content .user-config-content{display:block!important;padding-top:0}
+.folder-page-content .user-config-content.folder-active-content{display:block!important}
+.folder-page-content .dynamic-sub-tabs,.folder-page-content .nested-project-tabs>.dynamic-sub-tabs{display:none!important}
+.folder-page-content .dynamic-sub-tab-content{display:none!important}
+.folder-page-content .dynamic-sub-tab-content.folder-active-content{display:block!important}
+.folder-page-content .nested-child-content{display:none!important}
+.folder-page-content .nested-child-content.folder-active-content{display:block!important}
+.folder-breadcrumb{font-size:12px;color:#8a9aa9;margin-bottom:15px;overflow-wrap:anywhere}
+.folder-breadcrumb span{color:#087f75;font-weight:700}
+@keyframes folderPageIn{from{opacity:.4;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:560px){.folder-card-grid{gap:10px}.folder-card{min-height:128px;padding:15px 13px;border-radius:15px}.folder-card-icon{width:37px;height:37px;flex-basis:37px;font-size:19px}.folder-card-title{font-size:13px}.folder-card-subtitle{font-size:11px}.main-header.folder-mode{padding-left:62px;padding-right:62px}.main-header.folder-mode .folder-header-left{left:10px}.main-header.folder-mode .folder-header-right{right:10px}.folder-back-btn{width:38px;height:38px}}
+@media(prefers-reduced-motion:reduce){.folder-card,.folder-page-content{animation:none!important;transition:none!important}}
+
+/* FINAL FOLDER-ONLY NAVIGATION OVERRIDES: no tab strips or tab-shaped navigation */
+body:has(#sceneiqFolderRoot) .dashboard-tabs,
+body:has(#sceneiqFolderRoot) .user-config-tabs,
+body:has(#sceneiqFolderRoot) #newProjectSubTabs,
+body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tabs,
+body:has(#sceneiqFolderRoot) .folder-page-content .nested-project-tabs > .dynamic-sub-tabs {
+    display:none !important;
+    visibility:hidden !important;
+    height:0 !important;
+    min-height:0 !important;
+    max-height:0 !important;
+    margin:0 !important;
+    padding:0 !important;
+    border:0 !important;
+    overflow:hidden !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .user-config-content {
+    display:block !important;
+    width:100%;
+    padding:0 !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tab-content {
+    display:none !important;
+    width:100%;
+    padding:0 !important;
+    border:0 !important;
+    background:transparent !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tab-content.folder-active-content {
+    display:block !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .nested-child-content {
+    display:none !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .nested-child-content.folder-active-content {
+    display:block !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .folder-page-content {
+    width:100%;
+    max-width:100%;
+    padding:0;
+    margin:0;
+}
+body:has(#sceneiqFolderRoot) .folder-nav-root {
+    padding-top:20px;
+}
+@media(max-width:560px) {
+    body:has(#sceneiqFolderRoot) .folder-nav-root { padding-top:14px; }
+}
+</style>
+<script id="sceneiq-folder-navigation">
+(function(){
+'use strict';
+function initSceneIQFolderNavigation(){
+ const header=document.querySelector('.main-header');
+ const contentArea=document.querySelector('.content-area');
+ const originalTabs=document.querySelector('.user-config-tabs');
+ if(!header||!contentArea||!originalTabs||!document.getElementById('user_tab_add_entry')) return;
+ if(document.getElementById('sceneiqFolderRoot')) return;
+
+ const contentIds=['add_entry','pending','completed','aborted','dynamic_tabs','submit_tabs','dynamic_fields'];
+ const labels={add_entry:'New Project',pending:'Pending',completed:'Complete',aborted:'Aborted',dynamic_tabs:'Dynamic Tabs',submit_tabs:'Submit Tabs',dynamic_fields:'Dynamic Content'};
+ const icons={add_entry:'✦',pending:'◷',completed:'✓',aborted:'×',dynamic_tabs:'▦',submit_tabs:'⇧',dynamic_fields:'▤'};
+ const accents={add_entry:['#0f8b80','#e5f7f3'],pending:['#d99416','#fff5dd'],completed:['#169b72','#e4f8ef'],aborted:['#e05252','#fff0f0'],dynamic_tabs:['#6575db','#eef0ff'],submit_tabs:['#9a62c7','#f6edff'],dynamic_fields:['#2686c8','#e9f5ff']};
+ const mainHeaderContent=header.innerHTML;
+ const scrollBody=document.querySelector('.scroll-body');
+ const root=document.createElement('div'); root.id='sceneiqFolderRoot';root.className='folder-nav-root';
+ const page=document.createElement('div');page.id='sceneiqFolderPage';page.className='folder-page-content';
+ root.appendChild(page);
+ contentArea.insertBefore(root,originalTabs);
+ const parking=document.createElement('div');parking.id='sceneiqFolderParking';parking.hidden=true;contentArea.appendChild(parking);
+ originalTabs.style.display='none';
+ contentIds.forEach(id=>{const el=document.getElementById('user_tab_'+id);if(el){el.classList.remove('active');el.style.display='none';parking.appendChild(el);}});
+ function clearPage(){
+   contentIds.forEach(id=>{
+     const node=document.getElementById('user_tab_'+id);
+     if(node && node.parentNode!==parking){node.classList.remove('active');node.style.display='none';parking.appendChild(node);}
+   });
+   page.innerHTML='';
+ }
+ // Ensure only the selected account's own content is presented in this view.
+ const flashNodes=scrollBody?Array.from(scrollBody.querySelectorAll('.notification')):[];
+ flashNodes.forEach(n=>n.style.display='none');
+
+ let stack=[];
+ let currentTitle='';
+ let currentRender=null;
+ function setHeader(title,rootMode){
+   header.classList.toggle('folder-mode',!rootMode);
+   if(rootMode){header.innerHTML=mainHeaderContent;return;}
+   header.innerHTML='<div class="folder-header-left"><button type="button" class="folder-back-btn" aria-label="Go back" title="Go back">‹</button></div><div class="folder-header-title"></div>';
+   header.querySelector('.folder-header-title').textContent=title;
+   header.querySelector('.folder-back-btn').addEventListener('click',goBack);
+ }
+ function showCards(title,description,cards,rootMode){
+   currentTitle=title;setHeader(title,rootMode);
+   clearPage();
+   const h=document.createElement('h2');h.className='folder-nav-heading';h.textContent=title;page.appendChild(h);
+   if(description){const p=document.createElement('p');p.className='folder-nav-description';p.textContent=description;page.appendChild(p);}
+   const grid=document.createElement('div');grid.className='folder-card-grid';
+   cards.forEach(c=>{
+     const b=document.createElement('button');b.type='button';b.className='folder-card'+(c.wide?' wide':'');
+     b.style.setProperty('--folder-accent',c.accent||'#0f8b80');b.style.setProperty('--folder-tint',c.tint||'#e5f7f3');
+     b.innerHTML='<div class="folder-card-top"><span class="folder-card-icon" aria-hidden="true"></span><span class="folder-card-arrow" aria-hidden="true">↗</span></div><div class="folder-card-copy"><div class="folder-card-title"></div><div class="folder-card-subtitle"></div></div>';
+     b.querySelector('.folder-card-icon').textContent=c.icon||'▰';
+     b.querySelector('.folder-card-title').textContent=c.title;
+     b.querySelector('.folder-card-subtitle').textContent=c.subtitle||'Open';
+     if(c.count!==undefined){const count=document.createElement('span');count.className='folder-card-count';count.textContent=String(c.count);b.querySelector('.folder-card-top').appendChild(count);}
+     b.addEventListener('click',c.open);grid.appendChild(b);
+   });
+   page.appendChild(grid);
+ }
+ function navigate(render){if(currentRender)stack.push(currentRender);currentRender=render;render();}
+ function goBack(){if(!stack.length)return;currentRender=stack.pop();currentRender();}
+ function baseCards(){
+   const cards=contentIds.map(id=>{
+     const pair=accents[id];let subtitle='';
+     if(id==='add_entry')subtitle='Start a new project';
+     if(id==='pending')subtitle='Projects awaiting action';
+     if(id==='completed')subtitle='Finished projects';
+     if(id==='aborted')subtitle='Stopped or cancelled projects';
+     if(id==='dynamic_tabs')subtitle='Organise project steps';
+     if(id==='submit_tabs')subtitle='Choose which tab data is submitted';
+     if(id==='dynamic_fields')subtitle='Manage account fields';
+     return {title:labels[id],subtitle,icon:icons[id],accent:pair[0],tint:pair[1],wide:id==='dynamic_fields',open:()=>openTop(id)};
+   });
+   return cards;
+ }
+ function rootPage(){stack=[];currentRender=rootPage;showCards('Workspace','Choose a folder to continue. Each view opens on its own, with a back path to the previous location.',baseCards(),true);}
+ function openTop(id){
+   if(id==='add_entry'){openNewProjectRoot();return;}
+   const render=()=> {
+     const el=document.getElementById('user_tab_'+id);
+     if(!el)return;
+     // Use existing application renderers so dynamic editors and status lists remain functional.
+     if(typeof switchUserConfigTab==='function')switchUserConfigTab(id,null);
+     showContentPage(labels[id],el,()=>{});
+   };
+   navigate(render);
+ }
+ function showContentPage(title,el,after){
+   setHeader(title,false);clearPage();
+   const shell=document.createElement('div');shell.className='folder-page-content';page.appendChild(shell);
+   contentIds.forEach(id=>{const node=document.getElementById('user_tab_'+id);if(node){node.classList.remove('active');node.style.display='none';}});
+   el.style.display='block';el.classList.add('active');shell.appendChild(el);
+   after&&after();
+ }
+ function escapeHtml(s){return String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+ function openNewProjectRoot(){
+   const render=()=>{
+     const buttons=Array.from(document.querySelectorAll('#newProjectSubTabs .dynamic-sub-tab-btn'));
+     const cards=[];
+     buttons.forEach((btn,index)=>{
+       if(btn.offsetParent===null && getComputedStyle(btn).display==='none')return;
+       const tabId=btn.getAttribute('data-tab')||'';
+       const title=(btn.textContent||'').trim()||('Project section '+(index+1));
+       cards.push({title,subtitle:'Open this project section',icon:'▰',accent:'#0f8b80',tint:'#e5f7f3',open:()=>openDynamicTab(tabId,title)});
+     });
+     if(!cards.length){
+       const el=document.getElementById('user_tab_add_entry');
+       showContentPage('New Project',el,()=>{});
+       return;
+     }
+     showCards('New Project','Choose a project section. The global header now shows only your current location and the back button.',cards,false);
+   };
+   navigate(render);
+ }
+ function openDynamicTab(tabId,title){
+   navigate(()=>{
+     const el=document.getElementById('user_tab_add_entry');
+     showContentPage(title,el,()=>{
+       const nav=document.getElementById('newProjectSubTabs');if(nav)nav.style.display='none';
+       document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
+       const target=document.getElementById('newProjectSubTab_'+tabId);
+       if(!target)return;
+       target.classList.add('folder-active-content');target.style.display='block';
+       const nested=target.querySelector('.nested-project-tabs');
+       if(nested){
+         const childButtons=Array.from(nested.querySelectorAll('.nested-child-btn'));
+         const childContents=Array.from(nested.querySelectorAll('.nested-child-content'));
+         if(childButtons.length){
+           const cards=childButtons.map((btn,i)=>({title:(btn.textContent||'').trim()||('Section '+(i+1)),subtitle:'Open this section',icon:'▰',accent:'#6575db',tint:'#eef0ff',open:()=>openNested(target,nested,btn,i,title)}));
+           showCards(title,'Choose a section within '+title+'.',cards,false);
+           return;
+         }
+       }
+       // If no nested navigation exists, display the selected tab content directly.
+       target.style.display='block';
+       const headerTitle=header.querySelector('.folder-header-title');if(headerTitle)headerTitle.textContent=title;
+     });
+   });
+ }
+ function openNested(parent,nested,btn,index,parentTitle){
+   navigate(()=>{
+     const children=Array.from(nested.querySelectorAll('.nested-child-content'));
+     const child=children[index];
+     const title=(btn.textContent||'').trim()||'Section';
+     const el=document.getElementById('user_tab_add_entry');
+     showContentPage(title,el,()=>{
+       const nav=document.getElementById('newProjectSubTabs');if(nav)nav.style.display='none';
+       document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
+       parent.classList.add('folder-active-content');parent.style.display='block';
+       nested.querySelectorAll('.dynamic-sub-tabs').forEach(n=>n.style.display='none');
+       children.forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
+       if(child){child.classList.add('folder-active-content');child.style.display='block';}
+       const headerTitle=header.querySelector('.folder-header-title');if(headerTitle)headerTitle.textContent=title;
+     });
+   });
+ }
+ rootPage();
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initSceneIQFolderNavigation,{once:true});
+else initSceneIQFolderNavigation();
+})();
+</script>
+
 </body>
 </html>
