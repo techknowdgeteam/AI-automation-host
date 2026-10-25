@@ -4033,7 +4033,7 @@
                             <?php endforeach; ?>
                         </div>
                         <div style="margin-top:10px; display:flex; gap:8px; flex-wrap:wrap;">
-                            <button type="button" class="btn btn-secondary btn-sm" onclick="copyObjectFromDOM('object_<?php echo $key; ?>_container')">📋 Copy data</button>
+                            <button type="button" class="btn btn-secondary btn-sm" onclick="copyObjectFromDOM(this)">📋 Copy data</button>
                         </div>
                         <input type="hidden" id="object_<?php echo $key; ?>_data" value="">
                     </div>
@@ -4070,8 +4070,8 @@
                                     <span style="color:#6b7280; font-size:12px; margin-left:5px;">(12h format)</span>
                                 </div>
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display: none">📋 Copy Default Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM(this)">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue(this)" style="display: none">📋 Copy Default Value</button>
                                 </div>
                             </div>
                         <?php elseif ($elementType === 'textarea'): ?>
@@ -4089,8 +4089,8 @@
                                 <?php else: ?>
                                     <textarea id="entry_<?php echo $key; ?>" rows="3" placeholder="Enter <?php echo htmlspecialchars($field['field-title'] ?? $key); ?>..." class="field-with-default new-project-field" data-field-key="<?php echo $key; ?>"><?php echo htmlspecialchars($defaultValue); ?></textarea>
                                     <div style="margin-top:5px;display:flex;gap:8px;flex-wrap:wrap;">
-                                        <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
-                                        <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display:none">📋 Copy Default Value</button>
+                                        <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM(this)">📋 Copy Data</button>
+                                        <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue(this)" style="display:none">📋 Copy Default Value</button>
                                     </div>
                                 <?php endif; ?>
                             </div>
@@ -4103,8 +4103,8 @@
                                     <?php endforeach; ?>
                                 </select>
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display: none">📋 Copy Default Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM(this)">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue(this)" style="display: none">📋 Copy Default Value</button>
                                 </div>
                             </div>
                         <?php elseif ($elementType === 'button'): ?>
@@ -4114,15 +4114,15 @@
                                 </button>
                                 <input type="hidden" id="entry_<?php echo $key; ?>" value="<?php echo htmlspecialchars($buttonUrl); ?>" class="new-project-field" data-field-key="<?php echo $key; ?>">
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM(this)">📋 Copy Data</button>
                                 </div>
                             </div>
                         <?php else: ?>
                             <div id="field_<?php echo $key; ?>_container">
                                 <input type="text" id="entry_<?php echo $key; ?>" placeholder="Enter <?php echo htmlspecialchars($field['field-title'] ?? $key); ?>..." value="<?php echo htmlspecialchars($defaultValue); ?>" class="new-project-field" data-field-key="<?php echo $key; ?>">
                                 <div style="margin-top:5px; display:flex; gap:8px; flex-wrap:wrap;">
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM('field_<?php echo $key; ?>_container')">📋 Copy Data</button>
-                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue('field_<?php echo $key; ?>_container')" style="display: none">📋 Copy Default Value</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM(this)">📋 Copy Data</button>
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualDefaultValue(this)" style="display: none">📋 Copy Default Value</button>
                                 </div>
                             </div>
                         <?php endif; ?>
@@ -4221,160 +4221,202 @@
     // ===== COPY FUNCTIONS =====
     // ============================================================
 
-    function copyIndividualFromDOM(containerId) {
-        var container = document.getElementById(containerId);
-        if (!container) {
-            showDialog('Error', 'Field not found');
-            return;
-        }
-        var valueElement = container.querySelector('input, textarea, select');
-        if (!valueElement) {
-            showDialog('Error', 'Value element not found');
-            return;
-        }
-        var id = valueElement.id;
-        if (!id) {
-            showDialog('Error', 'Element ID not found');
-            return;
-        }
-        var textToCopy = '';
-        var cacheKey = id.replace('entry_', '');
-        if (window._fieldValueCache && window._fieldValueCache[cacheKey] !== undefined) {
-            textToCopy = window._fieldValueCache[cacheKey];
-        } else {
-            textToCopy = valueElement.value || valueElement.textContent || '';
-        }
-        if (!textToCopy || textToCopy.trim() === '') {
-            showDialog('Info', 'No value to copy. Please enter some text first.');
-            return;
-        }
-        copyToClipboard(textToCopy);
-    }
-
-    function copyObjectFromDOM(containerId) {
-        var container = document.getElementById(containerId);
-        if (!container) {
-            showDialog('Error', 'Object container not found');
-            return;
-        }
-        var objectKey = containerId.replace('object_', '').replace('_container', '');
-        var objectData = {};
-        if (window._fieldValueCache && window._fieldValueCache[objectKey]) {
-            objectData = window._fieldValueCache[objectKey];
-        } else {
-            var subFields = container.querySelectorAll('.sub-field-group');
-            subFields.forEach(function(subField) {
-                var inputs = subField.querySelectorAll('input, textarea, select');
-                inputs.forEach(function(input) {
-                    if (input.id && input.id.startsWith('entry_' + objectKey + '_')) {
-                        var subKey = input.id.replace('entry_' + objectKey + '_', '');
-                        if (subKey.includes('_date') || subKey.includes('_hour_12') || 
-                            subKey.includes('_minute_12') || subKey.includes('_ampm')) {
-                            return;
-                        }
-                        objectData[subKey] = input.value || '';
+    // Resolve the field from the button that was actually clicked.
+    // This avoids selecting a different copy of a field when the same field
+    // key is rendered in more than one tab or view.
+    function resolveCopyContainer(buttonOrContainer, kind) {
+        if (buttonOrContainer && buttonOrContainer.nodeType === 1) {
+            if (kind === 'object') {
+                // The object Copy Data button is rendered AFTER (as a sibling of)
+                // the object container, not inside it. Search the surrounding
+                // field group first, then fall back to the closest object container.
+                var objectGroup = buttonOrContainer.closest('.form-group');
+                if (objectGroup) {
+                    var objectContainer = objectGroup.querySelector('[id^="object_"][id$="_container"]');
+                    if (objectContainer) {
+                        return objectContainer;
                     }
-                });
-            });
-        }
-        var subKeys = Object.keys(objectData);
-        if (subKeys.length === 0) {
-            showDialog('Info', 'No values to copy');
-            return;
-        }
-        var copyText = '';
-        subKeys.forEach(function(subKey) {
-            var value = objectData[subKey];
-            if (value && value.trim() !== '') {
-                if (copyText) copyText += '\n';
-                copyText += value.trim();
+                }
+                return buttonOrContainer.closest('[id^="object_"][id$="_container"]');
             }
-        });
-        if (!copyText) {
-            showDialog('Info', 'No values to copy. Please enter some text first.');
-            return;
+
+            // Individual-field buttons are normally inside their field container.
+            var fieldContainer = buttonOrContainer.closest('[id^="field_"][id$="_container"]');
+            if (fieldContainer) {
+                return fieldContainer;
+            }
+
+            // Fallback for fields whose Copy Data button is adjacent to the
+            // value control rather than nested in the container.
+            var fieldGroup = buttonOrContainer.closest('.form-group');
+            if (fieldGroup) {
+                return fieldGroup.querySelector('[id^="field_"][id$="_container"]') || fieldGroup;
+            }
+            return null;
         }
-        copyToClipboard(copyText);
+
+        // Backward compatibility for callers still passing an element ID.
+        if (typeof buttonOrContainer === 'string') {
+            return document.getElementById(buttonOrContainer);
+        }
+        return null;
     }
 
-    function copyIndividualDefaultValue(containerId) {
-        var container = document.getElementById(containerId);
+    function copyIndividualFromDOM(buttonOrContainer) {
+        var container = resolveCopyContainer(buttonOrContainer, 'individual');
         if (!container) {
-            showDialog('Error', 'Field not found');
+            showDialog('Error', 'Could not find the field connected to this Copy Data button.');
             return;
         }
-        var valueElement = container.querySelector('input, textarea, select');
+
+        // Read the live form control inside the exact field whose button was clicked.
+        // Never use defaults, cached values, or text rendered in another tab.
+        var valueElement = container.querySelector('.new-project-field, .field-with-default, textarea, select, input');
         if (!valueElement) {
-            showDialog('Error', 'Value element not found');
+            showDialog('Error', 'Value element not found in the selected field.');
             return;
         }
-        var textToCopy = '';
-        if (valueElement.tagName.toLowerCase() === 'select') {
-            var selectedOption = valueElement.options[valueElement.selectedIndex];
-            textToCopy = selectedOption ? selectedOption.value : '';
-        } else {
-            textToCopy = valueElement.getAttribute('value') || valueElement.value || '';
+
+        var textToCopy = valueElement.value;
+        if (textToCopy === undefined || textToCopy === null) {
+            textToCopy = '';
         }
-        if (!textToCopy || textToCopy.trim() === '') {
-            showDialog('Info', 'No default value set for this field.');
-            return;
-        }
-        copyToClipboard(textToCopy);
+        copyToClipboard(String(textToCopy), buttonOrContainer);
     }
 
-    function copyObjectDefaultValues(containerId) {
-        var container = document.getElementById(containerId);
+    function copyObjectFromDOM(buttonOrContainer) {
+        var container = resolveCopyContainer(buttonOrContainer, 'object');
         if (!container) {
-            showDialog('Error', 'Object container not found');
+            showDialog('Error', 'Could not find the object connected to this Copy Data button.');
             return;
         }
+
         var subFields = container.querySelectorAll('.sub-field-group');
-        if (subFields.length === 0) {
-            showDialog('Info', 'No sub-fields to copy');
-            return;
-        }
-        var copyText = '';
+        var rows = [];
+
         subFields.forEach(function(subField) {
+            var values = [];
             var inputs = subField.querySelectorAll('input, textarea, select');
-            var value = '';
+
             inputs.forEach(function(input) {
-                if (input.id && (input.id.includes('_date') || input.id.includes('_hour_12') || 
-                    input.id.includes('_minute_12') || input.id.includes('_ampm'))) {
+                if (input.id && (
+                    input.id.includes('_date') ||
+                    input.id.includes('_hour_12') ||
+                    input.id.includes('_minute_12') ||
+                    input.id.includes('_ampm')
+                )) {
                     return;
                 }
-                var val = '';
-                if (input.tagName.toLowerCase() === 'select') {
-                    var selectedOption = input.options[input.selectedIndex];
-                    val = selectedOption ? selectedOption.value : '';
-                } else {
-                    val = input.getAttribute('value') || input.value || '';
+                if (input.type === 'button' || input.type === 'submit' ||
+                    input.type === 'reset' || input.type === 'hidden') {
+                    return;
                 }
-                if (val && val.trim() !== '') {
-                    if (value) value += ' ';
-                    value += val.trim();
-                }
+                values.push(input.value === undefined || input.value === null
+                    ? ''
+                    : String(input.value));
             });
-            if (value && value.trim() !== '') {
-                if (copyText) copyText += '\n';
-                copyText += value.trim();
-            }
+
+            rows.push(values.join(' '));
         });
-        if (!copyText) {
-            showDialog('Info', 'No default values set for this object.');
-            return;
-        }
-        copyToClipboard(copyText);
+
+        copyToClipboard(rows.join('\n'), buttonOrContainer);
     }
 
-    function copyToClipboard(text) {
-        var textToCopy = typeof text === 'string' ? text : String(text);
-        if (!textToCopy || textToCopy.trim() === '') {
-            showDialog('Info', 'No text to copy');
+    function getElementDefaultValue(valueElement) {
+        if (!valueElement) {
+            return '';
+        }
+
+        var tagName = valueElement.tagName ? valueElement.tagName.toLowerCase() : '';
+
+        if (tagName === 'select') {
+            // defaultSelected reflects the option marked as selected in the
+            // original markup, not the option currently selected by the user.
+            var defaultOption = null;
+            for (var i = 0; i < valueElement.options.length; i++) {
+                if (valueElement.options[i].defaultSelected) {
+                    defaultOption = valueElement.options[i];
+                    break;
+                }
+            }
+            return defaultOption ? defaultOption.value : '';
+        }
+
+        // For input and textarea, defaultValue is the original value from the
+        // markup. It remains independent of edits to the live .value property.
+        if (typeof valueElement.defaultValue === 'string') {
+            return valueElement.defaultValue;
+        }
+
+        return '';
+    }
+
+    function copyIndividualDefaultValue(buttonOrContainer) {
+        var container = resolveCopyContainer(buttonOrContainer, 'individual');
+        if (!container) {
+            showDialog('Error', 'Field not found');
             return;
         }
+
+        var valueElement = container.querySelector('input, textarea, select');
+        if (!valueElement) {
+            showDialog('Error', 'Value element not found');
+            return;
+        }
+
+        // Copy Default Values reads the element's original default separately
+        // from Copy Data and never uses the current edited value or cache.
+        copyToClipboard(getElementDefaultValue(valueElement));
+    }
+
+    function copyObjectDefaultValues(buttonOrContainer) {
+        var container = resolveCopyContainer(buttonOrContainer, 'object');
+        if (!container) {
+            showDialog('Error', 'Object container not found');
+            return;
+        }
+
+        var subFields = container.querySelectorAll('.sub-field-group');
+        var rows = [];
+
+        subFields.forEach(function(subField) {
+            var values = [];
+            var inputs = subField.querySelectorAll('input, textarea, select');
+
+            inputs.forEach(function(input) {
+                if (input.id && (
+                    input.id.includes('_date') ||
+                    input.id.includes('_hour_12') ||
+                    input.id.includes('_minute_12') ||
+                    input.id.includes('_ampm')
+                )) {
+                    return;
+                }
+
+                if (input.type === 'button' || input.type === 'submit' || input.type === 'reset') {
+                    return;
+                }
+
+                values.push(getElementDefaultValue(input));
+            });
+
+            rows.push(values.join(' '));
+        });
+
+        // Empty default values are valid and are copied as empty text/rows.
+        copyToClipboard(rows.join('\n'));
+    }
+
+    function copyToClipboard(text, triggerElement) {
+        // Do not reject an empty string. Copy Data must be able to copy a
+        // field after its current value has been erased.
+        var textToCopy = typeof text === 'string'
+            ? text
+            : (text === undefined || text === null ? '' : String(text));
+
         if (navigator.clipboard && navigator.clipboard.writeText) {
             navigator.clipboard.writeText(textToCopy).then(function() {
-                showDialog('Success', 'Copied to clipboard!');
+                showDialog('Success', textToCopy === '' ? 'Copied an empty value to clipboard.' : 'Copied to clipboard!');
             }).catch(function() {
                 fallbackCopy(textToCopy);
             });
@@ -4385,21 +4427,30 @@
 
     function fallbackCopy(text) {
         var textarea = document.createElement('textarea');
-        textarea.value = text;
+        textarea.value = text === undefined || text === null ? '' : String(text);
         textarea.style.position = 'fixed';
         textarea.style.left = '-9999px';
         textarea.style.top = '-9999px';
         textarea.style.width = '1px';
         textarea.style.height = '1px';
         document.body.appendChild(textarea);
+        textarea.focus();
         textarea.select();
+
+        var copied = false;
         try {
-            document.execCommand('copy');
-            showDialog('Success', 'Copied to clipboard!');
+            copied = document.execCommand('copy');
         } catch (e) {
+            copied = false;
+        }
+
+        document.body.removeChild(textarea);
+
+        if (copied) {
+            showDialog('Success', textarea.value === '' ? 'Copied an empty value to clipboard.' : 'Copied to clipboard!');
+        } else {
             showDialog('Error', 'Failed to copy. Please select and copy manually.');
         }
-        document.body.removeChild(textarea);
     }
 
     // ============================================================
@@ -6861,46 +6912,91 @@
         return isNaN(tabIndex) ? -1 : tabIndex;
     }
 
-    // Function to get additional features for the active tab
+    // Get feature flags for the currently active New Project tab, including nested tabs.
     function getActiveTabFeatures() {
-        var tabIndex = getActiveTabIndex();
-        
-        // Check if we're on the all_fields tab
-        var allFieldsTab = document.getElementById('newProjectSubTab_all_fields');
-        if (allFieldsTab && allFieldsTab.classList.contains('active')) {
-            // All fields tab - return default features (all enabled)
-            return {
-                copy_button: true,
-                transcript_detection: true,
-                transcript_with_structured_data_detection: true
-            };
-        }
-        
-        if (tabIndex < 0 || tabIndex >= userDynamicTabs.length) {
-            // Default: all features enabled
-            return {
-                copy_button: true,
-                transcript_detection: true,
-                transcript_with_structured_data_detection: true
-            };
-        }
-        
-        var tab = userDynamicTabs[tabIndex];
-        if (!tab) {
-            return {
-                copy_button: true,
-                transcript_detection: true,
-                transcript_with_structured_data_detection: true
-            };
-        }
-        
-        // Return the tab's features, with defaults if missing
-        var features = tab.additional_features || {};
-        return {
-            copy_button: features.copy_button === true,
-            transcript_detection: features.transcript_detection === true,
-            transcript_with_structured_data_detection: features.transcript_with_structured_data_detection === true
+        var enabledDefaults = {
+            copy_button: true,
+            transcript_detection: true,
+            transcript_with_structured_data_detection: true
         };
+
+        function normalizeFeatures(tab) {
+            var f = (tab && tab.additional_features) || {};
+            return {
+                copy_button: f.copy_button === true,
+                transcript_detection: f.transcript_detection === true,
+                transcript_with_structured_data_detection: f.transcript_with_structured_data_detection === true
+            };
+        }
+
+        // The All Fields view intentionally enables all three helpers.
+        var allFieldsButton = document.getElementById('newProjectSubTabBtn_all_fields') ||
+                              document.getElementById('newProjectSubTab_all_fields');
+        if ((allFieldsButton && allFieldsButton.classList.contains('active')) ||
+            (document.getElementById('newProjectSubTab_all_fields') &&
+             document.getElementById('newProjectSubTab_all_fields').classList.contains('active'))) {
+            return enabledDefaults;
+        }
+
+        var addEntryTab = document.getElementById('user_tab_add_entry');
+        if (!addEntryTab) return enabledDefaults;
+
+        // Resolve the actual visible content first. Root content IDs are rendered as
+        // newProjectSubTab_tab_N, where N is the index in userDynamicTabs.
+        var activeRootContent = addEntryTab.querySelector('.dynamic-sub-tab-content.active');
+        if (activeRootContent) {
+            var rootMatch = (activeRootContent.id || '').match(/^newProjectSubTab_tab_(\d+)$/);
+            if (rootMatch) {
+                var rootIndex = parseInt(rootMatch[1], 10);
+                var rootTab = userDynamicTabs && userDynamicTabs[rootIndex];
+
+                if (rootTab) {
+                    // Nested child tabs have no IDs/data attributes in the markup.
+                    // Their position in the active wrapper maps directly to sub_tabs.
+                    var activeChildContent = activeRootContent.querySelector('.nested-child-content.active');
+                    var activeNestedWrapper = activeChildContent ? activeChildContent.closest('.nested-project-tabs') : null;
+
+                    if (activeChildContent && activeNestedWrapper && Array.isArray(rootTab.sub_tabs)) {
+                        var visibleChildContents = Array.prototype.slice.call(
+                            activeNestedWrapper.querySelectorAll('.nested-child-content')
+                        );
+                        var childIndex = visibleChildContents.indexOf(activeChildContent);
+                        var visibleChildButtons = Array.prototype.slice.call(
+                            activeNestedWrapper.querySelectorAll('.nested-child-btn')
+                        );
+                        var activeChildButton = activeNestedWrapper.querySelector('.nested-child-btn.active');
+
+                        if (childIndex < 0 && activeChildButton) {
+                            childIndex = visibleChildButtons.indexOf(activeChildButton);
+                        }
+
+                        // PHP filters hidden children before rendering, so map by the
+                        // displayed child order, matching the rendered child content.
+                        var displayedChildren = rootTab.sub_tabs.filter(function(child) {
+                            return !Object.prototype.hasOwnProperty.call(child, 'display_tab') || !!child.display_tab;
+                        });
+                        if (childIndex >= 0 && displayedChildren[childIndex]) {
+                            return normalizeFeatures(displayedChildren[childIndex]);
+                        }
+                    }
+
+                    // A root without a nested active child uses the root's own features.
+                    return normalizeFeatures(rootTab);
+                }
+            }
+        }
+
+        // Fallback for legacy/All Fields layouts.
+        var activeButton = addEntryTab.querySelector('#newProjectSubTabs .dynamic-sub-tab-btn.active');
+        if (activeButton) {
+            var onclick = activeButton.getAttribute('onclick') || '';
+            var match = onclick.match(/switchNewProjectSubTab\(['"]tab_(\d+)['"]/);
+            if (match && userDynamicTabs && userDynamicTabs[parseInt(match[1], 10)]) {
+                return normalizeFeatures(userDynamicTabs[parseInt(match[1], 10)]);
+            }
+        }
+
+        return enabledDefaults;
     }
 
     // Detect if character data is in structured JSON format with improved detection
@@ -6954,121 +7050,99 @@
     function detectTranscripts() {
         var addEntryTab = document.getElementById('user_tab_add_entry');
         if (!addEntryTab) return;
-        
-        var activeContent = addEntryTab.querySelector('.dynamic-sub-tab-content.active');
-        if (!activeContent) return;
-        
-        var elements = activeContent.querySelectorAll('input, textarea, select');
-        
-        // Get features for the active tab
+
+        var activeRoot = addEntryTab.querySelector('.dynamic-sub-tab-content.active');
+        if (!activeRoot) return;
+
+        // Only inspect the active nested child when the selected root has child tabs.
+        // For a non-nested root, inspect the root itself.
+        var activeChild = activeRoot.querySelector('.nested-child-content.active');
+        var scanContainer = activeChild || activeRoot;
+        var elements = Array.prototype.slice.call(scanContainer.querySelectorAll('input, textarea, select'))
+            .filter(function(el) {
+                return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
+            });
+
         var features = getActiveTabFeatures();
         var transcriptDetectionEnabled = features.transcript_detection === true;
         var structuredDetectionEnabled = features.transcript_with_structured_data_detection === true;
         var copyButtonEnabled = features.copy_button === true;
-        
-        elements.forEach(function(element) {
-            var value = element.value || element.textContent || '';
-            var elementId = element.id || '';
-            
-            if (!value || !elementId) return;
-            
-            var timePattern = /[-_\(]?\d{1,2}:\d{2}[-_\)]?/;
-            var hasTime = timePattern.test(value);
-            
-            // Check if this transcript contains structured data - INDEPENDENT CHECK
+
+        elements.forEach(function(element, elementIndex) {
+            var value = (typeof element.value === 'string' ? element.value : '') ||
+                        element.textContent || '';
+            var fieldId = element.id || '';
+            if (!fieldId) return;
+
+            // renderNewProjectForm() is called repeatedly for All Fields, root tabs,
+            // and nested tabs, so the same field ID can exist several times in the DOM.
+            // A global getElementById() then finds the hidden copy and the button appears
+            // in the wrong tab. Use a unique key for this visible element instance.
+            var elementId = fieldId + '__transcript__' +
+                (activeRoot.id || 'active_root') + '__' + elementIndex;
+
+            var hasTime = /\b\d{1,2}:\d{2}\b/.test(value);
             var hasStructuredData = detectStructuredCharacterData(value);
-            
             var existingIndicator = document.getElementById('transcript_indicator_' + elementId);
             var existingResult = document.getElementById('transcript_result_' + elementId);
-            
-            // Determine if we should show anything - INDEPENDENT CHECKS
-            var shouldShowTranscript = false;
-            var shouldShowStructured = false;
-            var shouldShowConversion = false;
-            
-            // Regular transcript detection (time-based)
-            if (hasTime && transcriptDetectionEnabled) {
-                shouldShowTranscript = true;
+
+            var shouldShowTranscript = (hasTime && transcriptDetectionEnabled) ||
+                                       (hasStructuredData && structuredDetectionEnabled);
+            var shouldShowStructured = hasStructuredData && structuredDetectionEnabled;
+
+            if (!shouldShowTranscript) {
+                if (existingIndicator) existingIndicator.remove();
+                if (existingResult) existingResult.remove();
+                if (window._transcriptData) delete window._transcriptData[elementId];
+                if (window._conversionResults) delete window._conversionResults[elementId];
+                return;
             }
-            
-            // Structured data detection (JSON with both characters and script)
-            if (hasStructuredData && structuredDetectionEnabled) {
-                shouldShowStructured = true;
-                shouldShowTranscript = true;
-                shouldShowConversion = true;
+
+            window._transcriptData = window._transcriptData || {};
+            window._conversionResults = window._conversionResults || {};
+            window._transcriptData[elementId] = { value: value, element: element };
+            if (typeof detectCharacterData === 'function') detectCharacterData();
+
+            // Always refresh the existing indicator. The old implementation only
+            // created it once, leaving stale/missing buttons after feature changes.
+            var indicator = existingIndicator;
+            if (!indicator) {
+                indicator = document.createElement('div');
+                indicator.id = 'transcript_indicator_' + elementId;
+                indicator.style.cssText = 'margin-top:8px;padding:8px 12px;background:#d1fae5;border-radius:8px;border-left:4px solid #00695c;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;';
+                var container = element.closest('.form-group') || element.closest('.sub-field-group') || element.parentElement;
+                if (container) container.appendChild(indicator);
+                else if (element.parentNode) element.parentNode.insertBefore(indicator, element.nextSibling);
             }
-            
-            // If we should show either type
-            if (shouldShowTranscript) {
-                window._transcriptData[elementId] = {
-                    value: value,
-                    element: element
-                };
-                
-                // Also look for character data in other elements
-                detectCharacterData();
-                
-                if (!existingIndicator) {
-                    var indicator = document.createElement('div');
-                    indicator.id = 'transcript_indicator_' + elementId;
-                    indicator.style.cssText = 'margin-top:8px; padding:8px 12px; background:#d1fae5; border-radius:8px; border-left:4px solid #00695c; display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:8px;';
-                    
-                    var indicatorText = '';
-                    var buttonsHtml = '';
-                    
-                    if (shouldShowStructured && shouldShowConversion) {
-                        // Structured data detected - Show Convert to Text button
-                        indicatorText = '📝 Transcript with Structured Character Data Detected';
-                        buttonsHtml = 
-                            '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-                            '<button type="button" class="btn btn-primary btn-sm" onclick="convertToText(\'' + elementId + '\')" style="padding:4px 12px; font-size:12px; background:#7c3aed; color:white;">📄 Convert to Text</button>' +
-                            '</div>';
-                    } else if (shouldShowTranscript) {
-                        // Regular transcript detected - Show Convert to JSON and View buttons
-                        indicatorText = '📝 Transcript Detected';
-                        buttonsHtml = 
-                            '<div style="display:flex; gap:8px; flex-wrap:wrap;">' +
-                            '<button type="button" class="btn btn-success btn-sm" onclick="convertAndDisplayInline(\'' + elementId + '\')" style="padding:4px 12px; font-size:12px;">🔄 Convert to JSON</button>' +
-                            '<button type="button" class="btn btn-primary btn-sm" onclick="openTranscriptDialog(\'' + elementId + '\')" style="padding:4px 12px; font-size:12px;">View</button>' +
-                            '</div>';
-                    }
-                    
-                    // Add copy button if enabled
-                    if (copyButtonEnabled) {
-                        buttonsHtml = buttonsHtml.replace('</div>', '');
-                        buttonsHtml += '<button type="button" class="btn btn-secondary btn-sm" onclick="copyTranscriptValue(\'' + elementId + '\')" style="padding:4px 12px; font-size:12px;">📋 Copy</button>';
-                        buttonsHtml += '</div>';
-                    }
-                    
-                    indicator.innerHTML = 
-                        '<span style="color:#065f46; font-weight:500;">' + indicatorText + '</span>' +
-                        buttonsHtml;
-                    
-                    var container = element.closest('.form-group') || element.closest('.sub-field-group') || element.parentElement;
-                    if (container) {
-                        container.appendChild(indicator);
-                    } else {
-                        element.parentNode.insertBefore(indicator, element.nextSibling);
-                    }
-                } else {
-                    // Update existing indicator - check visibility
-                    if (!shouldShowTranscript) {
-                        existingIndicator.style.display = 'none';
-                    } else {
-                        existingIndicator.style.display = 'flex';
-                    }
-                }
+
+            var label = shouldShowStructured
+                ? '📝 Transcript with Structured Character Data Detected'
+                : '📝 Transcript Detected';
+            var elementIdArg = "'" + elementId.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
+            var buttonsHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
+
+            if (shouldShowStructured) {
+                buttonsHtml += '<button type="button" class="btn btn-primary btn-sm" onclick="convertToText(' +
+                    elementIdArg +
+                    ')" style="padding:4px 12px;font-size:12px;background:#7c3aed;color:white;">📄 Convert to Text</button>';
             } else {
-                // Remove if no transcript or structured data
-                if (existingIndicator) {
-                    existingIndicator.remove();
-                    delete window._transcriptData[elementId];
-                }
-                if (existingResult) {
-                    existingResult.remove();
-                    delete window._conversionResults[elementId];
-                }
+                buttonsHtml += '<button type="button" class="btn btn-success btn-sm" onclick="convertAndDisplayInline(' +
+                    elementIdArg +
+                    ')" style="padding:4px 12px;font-size:12px;">🔄 Convert to JSON</button>';
+                buttonsHtml += '<button type="button" class="btn btn-primary btn-sm" onclick="openTranscriptDialog(' +
+                    elementIdArg +
+                    ')" style="padding:4px 12px;font-size:12px;">View</button>';
             }
+
+            if (copyButtonEnabled) {
+                buttonsHtml += '<button type="button" class="btn btn-secondary btn-sm" onclick="copyTranscriptValue(' +
+                    elementIdArg +
+                    ')" style="padding:4px 12px;font-size:12px;">📋 Copy</button>';
+            }
+            buttonsHtml += '</div>';
+
+            indicator.innerHTML = '<span style="color:#065f46;font-weight:500;">' + label + '</span>' + buttonsHtml;
+            indicator.style.display = 'flex';
         });
     }
 
@@ -7987,35 +8061,28 @@
         // ===== Build script entries WITHOUT view_focus_characters =====
         var scriptLines = [];
         
-        for (var i = 0; i < matches.length - 1; i++) {
+        // Include every timestamp, including the final timestamp. Preserve all trailing text.
+        for (var i = 0; i < matches.length; i++) {
             var current = matches[i];
-            var nextMatch = matches[i + 1];
-            
+            var nextMatch = (i + 1 < matches.length) ? matches[i + 1] : null;
             var dialogueStart = current.end_pos;
-            var dialogueEnd = nextMatch.start_pos;
+            var dialogueEnd = nextMatch ? nextMatch.start_pos : normalizedText.length;
             var dialogueText = normalizedText.substring(dialogueStart, dialogueEnd).trim();
-            
-            // Clean up dialogue - remove any extra timestamps
-            dialogueText = dialogueText.replace(/\d{1,2}:\d{2}/g, '').trim();
-            dialogueText = dialogueText.replace(/\s+/g, ' ');
-            
+            dialogueText = dialogueText.replace(/\d{1,2}:\d{2}/g, '').replace(/\s+/g, ' ').trim();
+
             if (dialogueText) {
-                var duration = nextMatch.time_seconds - current.time_seconds;
-                
-                // Build the script entry WITHOUT view_focus_characters
                 var scriptEntry = {
                     start: current.time_str,
-                    stop: nextMatch.time_str,
-                    duration: duration + ' seconds',
-                    view_focus_characters: '', // Always empty
+                    stop: nextMatch ? nextMatch.time_str : 'the end',
+                    duration: nextMatch ? (nextMatch.time_seconds - current.time_seconds) + ' seconds' : 'until the end',
+                    view_focus_characters: '',
                     dialogue: dialogueText,
                     Scene_Pov_promt: ''
                 };
-                
                 scriptLines.push(scriptEntry);
             }
         }
-        
+
         if (scriptLines.length === 0) {
             throw new Error('No dialogue entries could be parsed');
         }
@@ -8247,8 +8314,9 @@
     }
 
     function copyToClipboard(text, button) {
+        // Empty strings are valid values too; do not silently skip copying
+        // when the current field has intentionally been cleared.
         var textToCopy = typeof text === 'string' ? text : String(text == null ? '' : text);
-        if (!textToCopy.trim()) return;
         if (!button) {
             var active = document.activeElement;
             if (active && active.tagName === 'BUTTON' && /copy/i.test(active.textContent || '')) button = active;
@@ -8310,6 +8378,18 @@
             updateCopyButtonsVisibility();
         }, 100);
     };
+
+    // Re-detect immediately when transcript fields are edited or pasted.
+    document.addEventListener('input', function(event) {
+        if (event.target && event.target.matches && event.target.matches('#user_tab_add_entry input, #user_tab_add_entry textarea, #user_tab_add_entry select')) {
+            setTimeout(detectTranscripts, 50);
+        }
+    });
+    document.addEventListener('change', function(event) {
+        if (event.target && event.target.matches && event.target.matches('#user_tab_add_entry input, #user_tab_add_entry textarea, #user_tab_add_entry select')) {
+            setTimeout(detectTranscripts, 50);
+        }
+    });
 
     // Initialize on DOM ready
     document.addEventListener('DOMContentLoaded', function() {
