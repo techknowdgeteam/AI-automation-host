@@ -5183,7 +5183,7 @@ def produce_video_from_images_entries():
     from PIL import Image, ImageDraw, ImageFont
     import numpy as np
     # Import from MoviePy's public package namespace. MoviePy 2.x removed
-    # the old \\\`moviepy.editor\\\` module, so do not fall back to that path.
+    # the old \\\\`moviepy.editor\\\\` module, so do not fall back to that path.
     try:
         from moviepy import VideoClip, AudioFileClip, concatenate_videoclips
     except ImportError as exc:
@@ -5514,21 +5514,19 @@ def produce_video_from_images_entries():
         display_text = caption.upper()
         max_text_width = int(width * 0.84)
         full_lines = wrap_words(draw, display_text, font, max_text_width)
-        # Reveal text across the fixed line layout, rather than re-centering
-        # the growing string on every frame. The scene duration controls the
-        # typing speed: the final character appears on the final displayed
-        # frame of this scene, instead of the caption completing early.
+        # Finish typing by 72% of the scene, then hold the complete caption
+        # on screen. This gives every final character time to display before
+        # the next scene replaces it.
         safe_duration = max(0.001, float(duration))
         elapsed = max(0.0, float(local_time))
-        final_frame_window = 1.0 / 24.0
-        if elapsed >= max(0.0, safe_duration - final_frame_window):
+        typing_duration = max(0.001, safe_duration * 0.72)
+        progress = min(1.0, elapsed / typing_duration)
+        visible_count = min(
+            len(display_text),
+            max(0, int(progress * len(display_text))),
+        )
+        if progress >= 1.0:
             visible_count = len(display_text)
-        else:
-            progress = min(1.0, elapsed / safe_duration)
-            visible_count = min(
-                len(display_text),
-                max(0, int(progress * len(display_text))),
-            )
         if visible_count <= 0:
             return frame_image
         visible_lines = []
@@ -5585,6 +5583,25 @@ def produce_video_from_images_entries():
                 )
             y += line_height + line_gap
         return frame_image
+    def apply_image_motion(image, local_time, duration, scene_index):
+        """Apply a subtle Ken Burns-style zoom/pan without changing caption layout."""
+        width, height = image.size
+        safe_duration = max(0.001, float(duration))
+        progress = min(1.0, max(0.0, float(local_time) / safe_duration))
+        # Alternate gentle zoom directions and pan directions from scene to scene.
+        zoom = 1.0 + 0.045 * progress
+        crop_width = max(2, int(width / zoom))
+        crop_height = max(2, int(height / zoom))
+        max_x = max(0, width - crop_width)
+        max_y = max(0, height - crop_height)
+        # Ease the motion so it starts and ends smoothly.
+        eased = progress * progress * (3.0 - 2.0 * progress)
+        direction = 1 if scene_index % 2 == 0 else -1
+        x = int((max_x * eased) if direction > 0 else (max_x * (1.0 - eased)))
+        y = int((max_y * eased) if (scene_index // 2) % 2 == 0 else (max_y * (1.0 - eased)))
+        cropped = image.crop((x, y, x + crop_width, y + crop_height))
+        return cropped.resize((width, height), Image.Resampling.LANCZOS)
+
     count = min(len(entries), len(image_files))
     if len(entries) != len(image_files):
         print(f"⚠️ Entry/image count differs: {len(entries)} entries, {len(image_files)} images; processing {count} pairs")
@@ -5666,7 +5683,7 @@ def produce_video_from_images_entries():
                 total_duration = float(audio_duration)
             print("⚠️ Scene timings exceeded the audio; fitted earlier scenes so the final image remains until audio ends")
     # Existing outputs are preserved. If the target project filename already
-    # exists, it will be renamed to <project>_old_N.mp4 before the new render
+    # exists, it will be renamed to \<project>_old_N.mp4 before the new render
     # is written, where N is one greater than the highest existing old number.
     clips = []
     final_clip = None
@@ -5726,13 +5743,15 @@ def produce_video_from_images_entries():
                 t,
                 base=base_image,
                 text=caption,
-                clip_duration=caption_duration,
+                clip_duration=duration,
                 previous=previous_image,
                 effect=transition_type,
                 trans_duration=active_transition,
+                motion_scene_index=scene_index,
             ):
                 t = max(0.0, float(t))
-                current = base.copy()
+                animated_current = apply_image_motion(base, t, clip_duration, motion_scene_index)
+                current = animated_current.copy()
                 # Mix the previous scene into the beginning of this scene.
                 # Transitions are deterministic so repeated renders are stable.
                 if previous is not None and trans_duration > 0 and t < trans_duration:
@@ -5746,19 +5765,19 @@ def produce_video_from_images_entries():
                         reveal = int(w * progress)
                         if effect == "wipe_left":
                             if reveal > 0:
-                                current.paste(base.crop((0, 0, reveal, h)), (0, 0))
+                                current.paste(animated_current.crop((0, 0, reveal, h)), (0, 0))
                         else:
                             if reveal > 0:
-                                current.paste(base.crop((w - reveal, 0, w, h)), (w - reveal, 0))
+                                current.paste(animated_current.crop((w - reveal, 0, w, h)), (w - reveal, 0))
                     else:  # slide_left / slide_right
                         current = Image.new("RGB", (w, h), (0, 0, 0))
                         offset = int(w * progress)
                         if effect == "slide_left":
                             current.paste(old.crop((offset, 0, w, h)), (0, 0))
-                            current.paste(base.crop((0, 0, offset, h)), (w - offset, 0))
+                            current.paste(animated_current.crop((0, 0, offset, h)), (w - offset, 0))
                         else:
                             current.paste(old.crop((0, 0, w - offset, h)), (offset, 0))
-                            current.paste(base.crop((w - offset, 0, w, h)), (0, 0))
+                            current.paste(animated_current.crop((w - offset, 0, w, h)), (0, 0))
                 rendered = draw_animated_caption(current, text, t, clip_duration)
                 return np.asarray(rendered, dtype=np.uint8)
             clip = VideoClip(frame_function=make_frame, duration=duration)
@@ -5787,7 +5806,7 @@ def produce_video_from_images_entries():
             else:
                 final_clip = final_clip.set_audio(audio_clip)
         # Preserve the previous project output instead of deleting it.
-        # Continue numbering after the highest existing <project>_old_N.mp4.
+        # Continue numbering after the highest existing \<project>_old_N.mp4.
         if os.path.isfile(output_path):
             old_pattern = re.compile(
                 rf"^{re.escape(normalized_project_title)}_old_(\d+)\.mp4$",
@@ -5807,7 +5826,6 @@ def produce_video_from_images_entries():
                 backup_path = os.path.join(edited_folder, backup_filename)
             os.replace(output_path, backup_path)
             print(f"📦 Preserved previous output as: {backup_path}")
-
         print(f"💾 Writing: {output_path}")
         print(f"   Duration: {total_duration:.2f}s | FPS: 24 | Size: {video_width}x{video_height}")
         print("📊 Rendering progress will be shown in this console. No extra window will open.")
@@ -5900,6 +5918,7 @@ def main():
     produce_video_from_images_entries()
   
 if __name__ == "__main__":
+   #generate_google_flow_images()
    produce_video_from_images_entries()
 
    
