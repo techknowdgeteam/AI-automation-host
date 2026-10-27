@@ -3208,13 +3208,55 @@ def generate_google_flow_images():
     script_json = panel_data.get('project_name', {}).get('script_json', {})
     script_data = script_json.get('script', {})
 
+    # Support the new scene-by-scene structure:
+    # {
+    #   "characters_prompt": [...],
+    #   "script": [
+    #       {
+    #           "shot_number": 1,
+    #           "characters_reference": {...},
+    #           "scene_Image_generation": "...",
+    #           ...
+    #       }
+    #   ]
+    # }
+    # Also retain compatibility with the previous nested batches/entries format.
     all_entries = []
-    for batch_key, batch_data in script_data.items():
-        if isinstance(batch_data, dict) and 'entries' in batch_data:
-            entries = batch_data.get('entries', [])
-            for entry in entries:
-                if 'scene_pov_prompt' in entry:
-                    all_entries.append(entry)
+
+    def _is_new_scene_entry(item):
+        return (
+            isinstance(item, dict)
+            and "characters_reference" in item
+            and "scene_Image_generation" in item
+        )
+
+    def _collect_scene_entries(node):
+        if isinstance(node, list):
+            for item in node:
+                if _is_new_scene_entry(item):
+                    all_entries.append(item)
+                elif isinstance(item, (dict, list)):
+                    _collect_scene_entries(item)
+        elif isinstance(node, dict):
+            # A direct scene object should be collected once.
+            if _is_new_scene_entry(node):
+                all_entries.append(node)
+                return
+            # Old format: batches containing an "entries" list.
+            entries = node.get("entries")
+            if isinstance(entries, list):
+                for entry in entries:
+                    if isinstance(entry, dict) and (
+                        _is_new_scene_entry(entry) or "scene_pov_prompt" in entry
+                    ):
+                        all_entries.append(entry)
+                # Continue through other branches too, in case the structure mixes formats.
+            for key, value in node.items():
+                if key not in ("characters_prompt", "entries"):
+                    if isinstance(value, (dict, list)):
+                        _collect_scene_entries(value)
+
+    _collect_scene_entries(script_data)
 
     total_entries = len(all_entries)
     print(f"📊 [CONFIG] Found {total_entries} total entries")
@@ -3234,6 +3276,9 @@ def generate_google_flow_images():
     operation_status_message = ""
     operation_aborted = False
 
+    # Only these two fields are sent to Google Flow for each new-format scene.
+    # Timing, dialogue, shot_number, and all other metadata are intentionally excluded.
+    SCENE_PROMPT_FIELDS = ("characters_reference", "scene_Image_generation")
     FIELDS_TO_STRIP = {"start", "stop", "duration", "audio_focus"}
     SEND_LOCATION_TOLERANCE = 20
 
@@ -3306,12 +3351,47 @@ def generate_google_flow_images():
             raise SystemExit("Operation status invalid")
 
     def format_entry_for_paste(entry_data):
+        """Serialize only the two approved prompt fields for the new scene schema."""
         try:
-            cleaned = {k: v for k, v in entry_data.items() if k not in FIELDS_TO_STRIP}
+            if not isinstance(entry_data, dict):
+                print("⚠️ [PREPARE] Scene entry is not a JSON object.")
+                return ""
+
+            # New structure: copy only characters_reference and scene_Image_generation.
+            if (
+                "characters_reference" in entry_data
+                or "scene_Image_generation" in entry_data
+            ):
+                cleaned = {
+                    key: entry_data[key]
+                    for key in SCENE_PROMPT_FIELDS
+                    if key in entry_data
+                }
+
+                missing = [
+                    key for key in SCENE_PROMPT_FIELDS
+                    if key not in cleaned
+                ]
+                if missing:
+                    print(
+                        "⚠️ [PREPARE] New-format scene is missing required field(s): "
+                        + ", ".join(missing)
+                    )
+                    return ""
+
+                return json.dumps(cleaned, indent=4, ensure_ascii=False)
+
+            # Legacy fallback: keep the former scene prompt behaviour for old entries,
+            # while still stripping timing/audio metadata.
+            cleaned = {
+                key: value
+                for key, value in entry_data.items()
+                if key not in FIELDS_TO_STRIP
+            }
             return json.dumps(cleaned, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"⚠️ [PREPARE] Error preparing scene data: {e}")
-            return entry_data.get('scene_pov_prompt', '')
+            return ""
 
     # --- DYNAMIC FALLBACK HELPERS ---
     def get_image_variants(base_name):
@@ -5083,92 +5163,88 @@ def generate_google_flow_images():
 
 def produce_video_from_images_entries():
     """
-    Build a video from entry_N images and script_json timings.
-
-    Fixes:
-    - Avoids concatenate_videoclips(..., method="compose"), which can allocate
-      large masks/composites and trigger NumPy memory errors.
-    - Normalizes all images to the same dimensions before video assembly.
-    - Uses method="chain" and lets MoviePy/FFmpeg render frames incrementally.
-    - Correctly handles audio that is shorter or longer than the image timeline.
-    - Closes MoviePy resources and keeps temporary caption images on failure
-      so the output can be diagnosed.
-
-    This function expects the same global constants/imports as the original:
-    PANEL_PATH, IMAGES_PATH, Image, ImageDraw, ImageFont, ImageClip,
-    AudioFileClip, concatenate_videoclips, json, os, re.
+    Assemble entry_N images into a narrated video with animated captions.
+    Caption animation:
+      - Typewriter reveal: characters appear progressively.
+      - Word emphasis: the word currently being revealed is highlighted.
+      - Gentle pop-in: the caption line scales in slightly at the start.
+      - Captions are rendered frame-by-frame over the image, not burned into
+        the source image files.
+    Keeps the original project lookup, script_json timing, audio matching,
+    image normalization, and memory-conscious sequential clip assembly.
+    Requires: PANEL_PATH, IMAGES_PATH, plus Pillow and MoviePy.
     """
-
     import os
     import re
     import json
     import shutil
     import traceback
+    import time
     from PIL import Image, ImageDraw, ImageFont
-
-    # MoviePy 2.x uses with_duration/with_audio/subclipped. This function
-    # uses with_duration and subclipped when available, with older-version fallbacks.
-
+    import numpy as np
+    # Import from MoviePy's public package namespace. MoviePy 2.x removed
+    # the old \\\`moviepy.editor\\\` module, so do not fall back to that path.
+    try:
+        from moviepy import VideoClip, AudioFileClip, concatenate_videoclips
+    except ImportError as exc:
+        print(
+            "❌ MoviePy imports failed. Install/upgrade MoviePy with: "
+            "python -m pip install --upgrade moviepy"
+        )
+        print(f"   Import details: {exc}")
+        return None
     if not os.path.exists(PANEL_PATH):
         print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
         return None
-
     try:
         with open(PANEL_PATH, "r", encoding="utf-8") as file:
             panel_data = json.load(file)
-    except Exception as e:
-        print(f"❌ Error reading panel.json: {e}")
+    except Exception as exc:
+        print(f"❌ Error reading panel.json: {exc}")
         return None
-
+    project_info = panel_data.get("project_name", {})
     project_title = (
-        panel_data.get("project_name", {}).get("project_title")
-        if isinstance(panel_data.get("project_name"), dict)
+        project_info.get("project_title")
+        if isinstance(project_info, dict)
         else None
     ) or panel_data.get("project_title")
-
     if not project_title:
         print("❌ Error: project_title not found in panel.json")
         return None
-
     def normalize_project_title(name):
         normalized = re.sub(r"[^a-zA-Z0-9\s_]", "", str(name or ""))
         normalized = re.sub(r"\s+", "_", normalized)
         normalized = re.sub(r"_+", "_", normalized).strip("_")
         return normalized or "unnamed_project"
-
     normalized_project_title = normalize_project_title(project_title)
     project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
     possible_image_folders = [
         os.path.join(project_folder, "images"),
         project_folder,
     ]
-
     source_folder = None
     for folder_path in possible_image_folders:
         if not os.path.isdir(folder_path):
             continue
         try:
             found = [
-                f for f in os.listdir(folder_path)
-                if f.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"))
-                and re.match(r"entry[_-]?\d+", f, re.IGNORECASE)
+                name for name in os.listdir(folder_path)
+                if name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"))
+                and re.match(r"entry[_-]?\d+", name, re.IGNORECASE)
             ]
             if found:
                 source_folder = folder_path
                 print(f"✅ Found {len(found)} images in: {folder_path}")
                 break
-        except OSError as e:
-            print(f"⚠️ Error checking folder {folder_path}: {e}")
-
+        except OSError as exc:
+            print(f"⚠️ Could not inspect {folder_path}: {exc}")
     if not source_folder:
         print("❌ No entry images found")
         return None
-
     edited_folder = os.path.join(project_folder, "edited")
     temp_folder = os.path.join(project_folder, "temp_captions")
     os.makedirs(edited_folder, exist_ok=True)
     os.makedirs(temp_folder, exist_ok=True)
-
     def parse_timestamp_to_seconds(value):
         if value is None:
             return 0.0
@@ -5182,52 +5258,159 @@ def produce_video_from_images_entries():
         except (ValueError, TypeError):
             pass
         return 0.0
-
     def get_entries(data):
-        project_data = data.get("project_name", {})
-        script_json = project_data.get("script_json", {}) if isinstance(project_data, dict) else {}
+        """
+        Read scenes from the SAME panel.json location used by the Google Flow
+        image-generation function:
+            panel_data["project_name"]["script_json"]["script"]
+        Supports both:
+          1. New scene-by-scene script lists containing fields such as
+             characters_reference and scene_Image_generation.
+          2. Older nested batches containing an "entries" list and
+             scene_pov_prompt.
+        Caption text is taken from a narration/dialogue field if one exists.
+        No separate JSON file is required.
+        """
+        project = data.get("project_name", {})
+        script_json = project.get("script_json", {}) if isinstance(project, dict) else {}
         script_data = script_json.get("script", {}) if isinstance(script_json, dict) else {}
-        result = []
-
-        if not isinstance(script_data, dict):
-            return result
-
-        for batch_data in script_data.values():
-            if not isinstance(batch_data, dict):
-                continue
-            entries = batch_data.get("entries", [])
-            if not isinstance(entries, list):
-                continue
-            for entry in entries:
-                if not isinstance(entry, dict) or "scene_pov_prompt" not in entry:
+        if not isinstance(script_data, (dict, list)):
+            print(
+                "⚠️ [CAPTIONS] project_name.script_json.script exists but is not "
+                f"a dictionary/list (found {type(script_data).__name__})."
+            )
+            return []
+        collected = []
+        seen_ids = set()
+        # These fields identify a scene object without requiring the legacy
+        # scene_pov_prompt field to exist.
+        scene_markers = {
+            "scene_pov_prompt",
+            "scene_Image_generation",
+            "characters_reference",
+            "shot_number",
+            "dialogue",
+            "narration",
+            "voiceover",
+            "voice_over",
+            "spoken_text",
+        }
+        def is_scene_entry(item):
+            return isinstance(item, dict) and bool(scene_markers.intersection(item.keys()))
+        def add_entry(item):
+            if not isinstance(item, dict):
+                return
+            # Deduplicate the same dictionary if encountered through a wrapper.
+            identity = id(item)
+            if identity in seen_ids:
+                return
+            seen_ids.add(identity)
+            collected.append(dict(item))
+        def walk(node):
+            if isinstance(node, list):
+                for child in node:
+                    if is_scene_entry(child):
+                        add_entry(child)
+                    elif isinstance(child, (dict, list)):
+                        walk(child)
+                return
+            if not isinstance(node, dict):
+                return
+            # Legacy batch format: {"entries": [scene, scene, ...]}.
+            entries_list = node.get("entries")
+            if isinstance(entries_list, list):
+                for child in entries_list:
+                    if isinstance(child, dict):
+                        add_entry(child)
+            # New direct scene object, e.g. an item in script: [...].
+            if is_scene_entry(node):
+                add_entry(node)
+                return
+            # Recurse through nested script containers while avoiding a second
+            # pass through an entries list already collected above.
+            for key, value in node.items():
+                if key == "entries":
                     continue
-                start = parse_timestamp_to_seconds(entry.get("start", "0:00"))
-                stop = parse_timestamp_to_seconds(entry.get("stop", "0:05"))
+                if isinstance(value, (dict, list)):
+                    walk(value)
+        walk(script_data)
+        def first_text(entry, keys):
+            for key in keys:
+                value = entry.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+                if isinstance(value, (int, float)) and not isinstance(value, bool):
+                    return str(value)
+            return ""
+        caption_keys = (
+            "dialogue",
+            "narration",
+            "voiceover",
+            "voice_over",
+            "voice_over_script",
+            "spoken_text",
+            "caption",
+            "subtitle",
+            "text",
+        )
+        result = []
+        running_cursor = 0.0
+        for index, entry in enumerate(collected):
+            # A scene can qualify in the new format without scene_pov_prompt.
+            # Ignore obvious non-scene metadata dictionaries.
+            if not is_scene_entry(entry):
+                continue
+            raw_start = entry.get("start", entry.get("start_time", entry.get("scene_start")))
+            raw_stop = entry.get("stop", entry.get("end", entry.get("stop_time", entry.get("scene_end"))))
+            start = parse_timestamp_to_seconds(raw_start) if raw_start is not None else running_cursor
+            stop = parse_timestamp_to_seconds(raw_stop) if raw_stop is not None else None
+            raw_duration = entry.get("duration", entry.get("duration_seconds", entry.get("scene_duration")))
+            try:
+                explicit_duration = float(raw_duration) if raw_duration is not None else None
+            except (ValueError, TypeError):
+                explicit_duration = None
+            if stop is not None and stop > start:
                 duration = stop - start
-                if duration <= 0:
-                    duration = 1.0
-                item = dict(entry)
-                item["start_seconds"] = start
-                item["stop_seconds"] = stop
-                item["duration_seconds"] = duration
-                item["dialogue"] = entry.get("dialogue", "") or ""
-                result.append(item)
-
-        result.sort(key=lambda item: item.get("start_seconds", 0))
+            elif explicit_duration is not None and explicit_duration > 0:
+                duration = explicit_duration
+                stop = start + duration
+            else:
+                # A reasonable fallback when the scene has no timing metadata.
+                duration = 5.0
+                stop = start + duration
+            if duration <= 0:
+                duration = 5.0
+                stop = start + duration
+            item = dict(entry)
+            item["start_seconds"] = start
+            item["stop_seconds"] = stop
+            item["duration_seconds"] = duration
+            item["dialogue"] = first_text(entry, caption_keys)
+            result.append(item)
+            running_cursor = max(running_cursor, stop)
+        # Preserve explicit timing order where present; for entries without
+        # timestamps, the walk order is retained through running_cursor.
+        result.sort(key=lambda item: item.get("start_seconds", 0.0))
+        print(f"📚 [CAPTIONS] Read {len(result)} scene entries from panel.json")
+        if result:
+            caption_count = sum(bool(item.get("dialogue")) for item in result)
+            print(f"📝 [CAPTIONS] {caption_count}/{len(result)} scenes contain caption/narration text")
+            if caption_count == 0:
+                print(
+                    "⚠️ [CAPTIONS] Scene entries were found, but none contains dialogue/narration "
+                    "text. Animated captions need a text field such as dialogue, narration, "
+                    "voiceover, spoken_text, caption, or subtitle."
+                )
         return result
-
     entries = get_entries(panel_data)
     if not entries:
-        print("❌ No entries found in project_name.script_json.script")
+        print("❌ No scene entries found in project_name.script_json.script (new and legacy formats were checked).")
         return None
-
     def get_sorted_images(folder_path):
         items = []
         for filename in os.listdir(folder_path):
             match = re.match(r"entry[_-]?(\d+)", filename, re.IGNORECASE)
-            if not match:
-                continue
-            if os.path.splitext(filename)[1].lower() not in {
+            if not match or os.path.splitext(filename)[1].lower() not in {
                 ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"
             }:
                 continue
@@ -5236,36 +5419,27 @@ def produce_video_from_images_entries():
                 "filename": filename,
                 "path": os.path.join(folder_path, filename),
             })
-        items.sort(key=lambda item: item["number"])
-        return items
-
+        return sorted(items, key=lambda item: item["number"])
     image_files = get_sorted_images(source_folder)
     if not image_files:
         print("❌ No usable entry images found")
         return None
-
     def find_audio_file(title):
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
         if not os.path.isdir(downloads):
-            print(f"⚠️ Downloads folder not found: {downloads}")
             return None
         audio_exts = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".wma")
-        matches = []
-        for filename in os.listdir(downloads):
-            if filename.lower().endswith(audio_exts) and title.lower() in filename.lower():
-                matches.append(os.path.join(downloads, filename))
-        if not matches:
-            return None
-        # Prefer the most recently modified matching file.
-        return max(matches, key=os.path.getmtime)
-
+        matches = [
+            os.path.join(downloads, name)
+            for name in os.listdir(downloads)
+            if name.lower().endswith(audio_exts) and title.lower() in name.lower()
+        ]
+        return max(matches, key=os.path.getmtime) if matches else None
     audio_file_path = find_audio_file(project_title)
     if audio_file_path:
         print(f"🎵 Found audio: {os.path.basename(audio_file_path)}")
     else:
-        print("⚠️ No matching audio file found; video will be silent")
-
-    # Use the first readable image as the common output size.
+        print("⚠️ No matching audio found; video will be silent")
     video_width, video_height = 1920, 1080
     for item in image_files:
         try:
@@ -5274,214 +5448,327 @@ def produce_video_from_images_entries():
             break
         except Exception:
             continue
-
-    # Ensure dimensions are even, as required by common H.264 encoders.
-    video_width = max(2, int(video_width) - (int(video_width) % 2))
-    video_height = max(2, int(video_height) - (int(video_height) % 2))
-    print(f"📐 Standard output size: {video_width}x{video_height}")
-
-    def fit_image_to_canvas(image, width, height):
-        """Resize to fit without distortion, then center on a matching canvas."""
+    video_width = max(2, int(video_width) - int(video_width) % 2)
+    video_height = max(2, int(video_height) - int(video_height) % 2)
+    print(f"📐 Output size: {video_width}x{video_height}")
+    def fit_image(image, width, height):
         image = image.convert("RGB")
         image.thumbnail((width, height), Image.Resampling.LANCZOS)
         canvas = Image.new("RGB", (width, height), (0, 0, 0))
-        x = (width - image.width) // 2
-        y = (height - image.height) // 2
-        canvas.paste(image, (x, y))
+        canvas.paste(image, ((width - image.width) // 2, (height - image.height) // 2))
         return canvas
-
-    def add_caption_with_pil(image_path, output_path, caption, width, height):
-        try:
-            with Image.open(image_path) as source:
-                img = fit_image_to_canvas(source, width, height)
-
-            if caption:
-                draw = ImageDraw.Draw(img)
-                font_size = max(24, int(width / 45))
-                font = None
-                for font_path in (
-                    "arial.ttf",
-                    "Arial.ttf",
-                    r"C:\Windows\Fonts\arial.ttf",
-                    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-                ):
-                    try:
-                        font = ImageFont.truetype(font_path, font_size)
-                        break
-                    except Exception:
-                        continue
-                if font is None:
-                    font = ImageFont.load_default()
-
-                text = str(caption).upper().strip()
-                max_text_width = int(width * 0.60)
-                words = text.split()
-                lines = []
-                current = ""
-
-                for word in words:
-                    candidate = f"{current} {word}".strip()
-                    # Measure actual rendered width instead of estimating by character count.
-                    if draw.textbbox((0, 0), candidate, font=font)[2] <= max_text_width:
-                        current = candidate
-                    else:
-                        if current:
-                            lines.append(current)
-                        # Break an unusually long word so it cannot overflow.
-                        chunk = ""
-                        for char in word:
-                            test = chunk + char
-                            if draw.textbbox((0, 0), test, font=font)[2] <= max_text_width:
-                                chunk = test
-                            else:
-                                if chunk:
-                                    lines.append(chunk)
-                                chunk = char
-                        current = chunk
-
+    def load_font(size):
+        candidates = [
+            r"C:\Windows\Fonts\arialbd.ttf",
+            r"C:\Windows\Fonts\arial.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        for font_path in candidates:
+            try:
+                return ImageFont.truetype(font_path, size)
+            except Exception:
+                continue
+        return ImageFont.load_default()
+    def wrap_words(draw, text, font, max_width):
+        words = text.split()
+        lines, current = [], ""
+        for word in words:
+            candidate = f"{current} {word}".strip()
+            if draw.textbbox((0, 0), candidate, font=font, stroke_width=2)[2] <= max_width:
+                current = candidate
+            else:
                 if current:
                     lines.append(current)
-
-                wrapped = "\n".join(lines)
-                bbox = draw.multiline_textbbox((0, 0), wrapped, font=font, spacing=6, align="center", stroke_width=0)
-                text_w = bbox[2] - bbox[0]
-                text_h = bbox[3] - bbox[1]
-                x = max(0, (width - text_w) // 2)
-                y = max(0, height - text_h - 60)
-
-                draw.multiline_text(
-                    (x, y), wrapped, font=font, fill="white",
-                    spacing=6, align="center",
-                    stroke_width=1, stroke_fill=(60, 60, 60),
+                # Keep exceptionally long words from running off-screen.
+                chunk = ""
+                for char in word:
+                    test = chunk + char
+                    if draw.textbbox((0, 0), test, font=font, stroke_width=2)[2] <= max_width:
+                        chunk = test
+                    else:
+                        if chunk:
+                            lines.append(chunk)
+                        chunk = char
+                current = chunk
+        if current:
+            lines.append(current)
+        return lines
+    def draw_animated_caption(frame_image, caption, local_time, duration):
+        """
+        Render text directly over the image: no caption panel/background.
+        The typewriter starts at a fixed left edge and reveals characters to
+        the right. Text uses a tiny black outline plus a soft black shadow.
+        """
+        caption = re.sub(r"\s+", " ", str(caption or "").strip())
+        # A comma at the very end of a scene caption is a scene-boundary
+        # punctuation artifact; remove only that trailing comma. Commas
+        # inside the sentence remain unchanged.
+        caption = re.sub(r",\s*$", "", caption).rstrip()
+        if not caption:
+            return frame_image
+        width, height = frame_image.size
+        font_size = max(24, min(64, int(width / 24)))
+        font = load_font(font_size)
+        draw = ImageDraw.Draw(frame_image)
+        display_text = caption.upper()
+        max_text_width = int(width * 0.84)
+        full_lines = wrap_words(draw, display_text, font, max_text_width)
+        # Reveal text across the fixed line layout, rather than re-centering
+        # the growing string on every frame. The scene duration controls the
+        # typing speed: the final character appears on the final displayed
+        # frame of this scene, instead of the caption completing early.
+        safe_duration = max(0.001, float(duration))
+        elapsed = max(0.0, float(local_time))
+        final_frame_window = 1.0 / 24.0
+        if elapsed >= max(0.0, safe_duration - final_frame_window):
+            visible_count = len(display_text)
+        else:
+            progress = min(1.0, elapsed / safe_duration)
+            visible_count = min(
+                len(display_text),
+                max(0, int(progress * len(display_text))),
+            )
+        if visible_count <= 0:
+            return frame_image
+        visible_lines = []
+        remaining = visible_count
+        for full_line in full_lines:
+            if remaining <= 0:
+                break
+            take = min(len(full_line), remaining)
+            visible_lines.append(full_line[:take])
+            remaining -= take
+            # Account for the spaces removed by word wrapping.
+            if take == len(full_line) and remaining > 0:
+                remaining = max(0, remaining - 1)
+        line_gap = max(6, int(font_size * 0.20))
+        metrics = []
+        for line in visible_lines[-3:]:
+            bbox = draw.textbbox((0, 0), line or " ", font=font, stroke_width=1)
+            metrics.append((line, bbox[2] - bbox[0], bbox[3] - bbox[1]))
+        if not metrics:
+            return frame_image
+        total_height = sum(row[2] for row in metrics) + line_gap * (len(metrics) - 1)
+        bottom_margin = int(height * 0.075)
+        y = max(4, height - bottom_margin - total_height)
+        # Anchor all lines to the left edge of the FULL caption block. This
+        # anchor does not move as characters appear, so the typewriter grows
+        # only to the right rather than expanding from the center.
+        full_block_width = max(
+            (
+                draw.textbbox((0, 0), line, font=font, stroke_width=1)[2]
+                for line in full_lines[-3:]
+            ),
+            default=1,
+        )
+        x_left = max(10, (width - min(max_text_width, full_block_width)) // 2)
+        for line, line_width, line_height in metrics:
+            if line:
+                # Small soft shadow, then a thin black edge and bright text.
+                shadow_offset = max(2, font_size // 28)
+                draw.text(
+                    (x_left + shadow_offset, y + shadow_offset),
+                    line,
+                    font=font,
+                    fill=(0, 0, 0),
+                    stroke_width=2,
+                    stroke_fill=(0, 0, 0),
                 )
-
-            img.save(output_path, "JPEG", quality=95, optimize=True)
-            return True
-        except Exception as e:
-            print(f"⚠️ Caption/image processing failed for {image_path}: {e}")
-            return False
-
-    captioned_images = []
-    processed = 0
-    total_duration = 0.0
-
-    print("\n🎬 Processing images and captions...")
+                draw.text(
+                    (x_left, y),
+                    line,
+                    font=font,
+                    fill=(255, 255, 255),
+                    stroke_width=1,
+                    stroke_fill=(0, 0, 0),
+                )
+            y += line_height + line_gap
+        return frame_image
     count = min(len(entries), len(image_files))
     if len(entries) != len(image_files):
         print(f"⚠️ Entry/image count differs: {len(entries)} entries, {len(image_files)} images; processing {count} pairs")
-
-    for i in range(count):
-        entry = entries[i]
-        image_info = image_files[i]
-        duration = float(entry.get("duration_seconds", 5.0))
-        if duration <= 0:
-            duration = 1.0
-
-        temp_path = os.path.join(temp_folder, f"captioned_{image_info['number']}.jpg")
-        dialogue = entry.get("dialogue", "")
-        print(f"🎬 [{i + 1}/{count}] {image_info['filename']} - {duration:.1f}s")
-
-        success = add_caption_with_pil(
-            image_info["path"], temp_path, dialogue, video_width, video_height
-        )
-        if not success:
-            # Still normalize the image dimensions even when captioning fails.
-            try:
-                with Image.open(image_info["path"]) as source:
-                    normalized = fit_image_to_canvas(source, video_width, video_height)
-                    normalized.save(temp_path, "JPEG", quality=95, optimize=True)
-            except Exception as e:
-                print(f"❌ Skipping unreadable image {image_info['path']}: {e}")
-                continue
-
-        captioned_images.append({
-            "number": image_info["number"],
-            "path": temp_path,
-            "duration": duration,
-        })
-        total_duration += duration
-        processed += 1
-
-    if not captioned_images:
+    prepared = []
+    for index in range(count):
+        entry = entries[index]
+        image_info = image_files[index]
+        duration = max(0.1, float(entry.get("duration_seconds", 5.0)))
+        try:
+            with Image.open(image_info["path"]) as source:
+                base_image = fit_image(source, video_width, video_height)
+            prepared.append({
+                "number": image_info["number"],
+                "image": base_image,
+                "duration": duration,
+                "caption": entry.get("dialogue", ""),
+                "filename": image_info["filename"],
+            })
+            print(f"🎬 [{index + 1}/{count}] {image_info['filename']} — {duration:.1f}s")
+        except Exception as exc:
+            print(f"⚠️ Skipping unreadable image {image_info['path']}: {exc}")
+    if not prepared:
         print("❌ No images could be processed")
         return None
-
-    # Determine audio duration and adjust the image timeline to it.
     audio_duration = None
+    audio_probe = None
     if audio_file_path:
-        audio_probe = None
         try:
-            from moviepy import AudioFileClip
             audio_probe = AudioFileClip(audio_file_path)
             audio_duration = float(audio_probe.duration)
             print(f"🎵 Audio duration: {audio_duration:.2f}s")
-        except Exception as e:
-            print(f"⚠️ Could not read audio duration: {e}")
-            audio_duration = None
+        except Exception as exc:
+            print(f"⚠️ Could not read audio duration: {exc}")
         finally:
             if audio_probe is not None:
                 try:
                     audio_probe.close()
                 except Exception:
                     pass
-
-    print(f"🎬 Image timeline duration: {total_duration:.2f}s")
-    if audio_duration and audio_duration > 0:
-        diff = audio_duration - total_duration
-        if diff > 0:
-            if diff <= 30:
-                captioned_images[-1]["duration"] += diff
-                total_duration = audio_duration
-                print(f"🔄 Extended final image by {diff:.2f}s to match audio")
+    total_duration = sum(item["duration"] for item in prepared)
+    if audio_duration and audio_duration > 0 and prepared:
+        # Keep the final image visible through the exact end of the narration.
+        # Earlier scenes keep their durations when they fit within the audio.
+        previous_duration = sum(float(item["duration"]) for item in prepared[:-1])
+        original_last_duration = max(0.1, float(prepared[-1]["duration"]))
+        last_available = float(audio_duration) - previous_duration
+        if last_available > 0:
+            # Extend OR shorten only the final image so the video ends with audio.
+            prepared[-1]["duration"] = last_available
+            total_duration = float(audio_duration)
+            change = last_available - original_last_duration
+            if change > 0.01:
+                print(f"🔄 Extended final image by {change:.2f}s to reach audio end")
+            elif change < -0.01:
+                print(f"✂️ Adjusted final image by {change:.2f}s so it ends with audio")
             else:
-                # Audio is substantially longer: preserve image timing and trim audio.
-                print(f"✂️ Audio is {diff:.2f}s longer; audio will be trimmed to video duration")
-        elif diff < 0:
-            # Trim the image timeline at the exact audio endpoint.
-            target = audio_duration
-            remaining = target
-            adjusted = []
-            for item in captioned_images:
-                if remaining <= 0:
-                    break
-                new_item = dict(item)
-                new_item["duration"] = min(float(item["duration"]), remaining)
-                if new_item["duration"] > 0:
-                    adjusted.append(new_item)
-                    remaining -= new_item["duration"]
-            captioned_images = adjusted
-            total_duration = sum(item["duration"] for item in captioned_images)
-            print(f"✂️ Video image timeline trimmed to {total_duration:.2f}s to match audio")
-
-    # Remove old output MP4s only after input processing succeeded.
-    for filename in os.listdir(edited_folder):
-        if filename.lower().endswith(".mp4"):
-            try:
-                os.remove(os.path.join(edited_folder, filename))
-            except OSError as e:
-                print(f"⚠️ Could not remove old output {filename}: {e}")
-
+                print("🎯 Final image timing already matches the audio end")
+        else:
+            # If all preceding scenes alone exceed the audio, preserve the final
+            # image and proportionally fit the preceding scenes into the remaining
+            # time rather than cutting off the final image entirely.
+            last_duration = min(original_last_duration, max(0.1, float(audio_duration) * 0.15))
+            available_for_previous = max(0.0, float(audio_duration) - last_duration)
+            if previous_duration > 0 and available_for_previous > 0:
+                scale = available_for_previous / previous_duration
+                for item in prepared[:-1]:
+                    item["duration"] = max(0.01, float(item["duration"]) * scale)
+            elif available_for_previous <= 0:
+                prepared = prepared[-1:]
+                last_duration = float(audio_duration)
+            prepared[-1]["duration"] = last_duration
+            total_duration = sum(float(item["duration"]) for item in prepared)
+            # Remove tiny floating-point discrepancies so the last frame lands
+            # on the audio endpoint.
+            if prepared:
+                prepared[-1]["duration"] = max(
+                    0.01, float(audio_duration) - sum(float(item["duration"]) for item in prepared[:-1])
+                )
+                total_duration = float(audio_duration)
+            print("⚠️ Scene timings exceeded the audio; fitted earlier scenes so the final image remains until audio ends")
+    # Existing outputs are preserved. If the target project filename already
+    # exists, it will be renamed to <project>_old_N.mp4 before the new render
+    # is written, where N is one greater than the highest existing old number.
     clips = []
     final_clip = None
     audio_clip = None
     output_filename = f"{normalized_project_title}.mp4"
     output_path = os.path.join(edited_folder, output_filename)
-
     try:
-        from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
-
-        print(f"\n🎬 Creating {len(captioned_images)} clips (memory-safe chain concatenation)...")
-        for item in captioned_images:
-            clip = ImageClip(item["path"])
-            if hasattr(clip, "with_duration"):
-                clip = clip.with_duration(float(item["duration"]))
+        print(f"🎞️ Building {len(prepared)} animated scene clips...")
+        print("🎬 Transitions enabled: alternating crossfade, directional wipe, and slide")
+        print("🖥️ Keep-awake request: preventing Windows sleep and display timeout during rendering")
+        # Prevent Windows from sleeping or turning off the display during the
+        # render. This is reverted in the finally block below.
+        keep_awake_enabled = False
+        try:
+            if os.name == "nt":
+                import ctypes
+                ES_CONTINUOUS = 0x80000000
+                ES_SYSTEM_REQUIRED = 0x00000001
+                ES_DISPLAY_REQUIRED = 0x00000002
+                result = ctypes.windll.kernel32.SetThreadExecutionState(
+                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+                )
+                keep_awake_enabled = bool(result)
+                print("✅ Windows keep-awake request active" if keep_awake_enabled
+                      else "⚠️ Windows keep-awake request could not be confirmed")
             else:
-                clip = clip.set_duration(float(item["duration"]))
+                print("ℹ️ Keep-awake control is Windows-specific; continuing normally")
+        except Exception as awake_exc:
+            print(f"⚠️ Could not enable keep-awake: {awake_exc}")
+        transition_duration = 0.45  # seconds per image change
+        transition_types = ("crossfade", "wipe_left", "slide_left", "wipe_right", "crossfade", "slide_right")
+        clips = []
+        scene_start = 0.0
+        # Show each next scene's image and caption 1 second before its narration
+        # segment begins. The audio track and total video duration remain unchanged:
+        # the first visual scene is shortened by 1 second and the final scene is
+        # extended by 1 second; intermediate scenes keep their original duration.
+        early_display_seconds = 1.0
+        visual_durations = [float(item["duration"]) for item in prepared]
+        if len(visual_durations) > 1:
+            # Keep very short first scenes valid while preserving total duration.
+            actual_early_shift = min(
+                early_display_seconds,
+                max(0.0, visual_durations[0] - 0.05),
+            )
+            visual_durations[0] -= actual_early_shift
+            visual_durations[-1] += actual_early_shift
+        for scene_index, item in enumerate(prepared):
+            base_image = item["image"]
+            duration = float(visual_durations[scene_index])
+            caption_duration = float(item["duration"])
+            caption = item["caption"]
+            previous_image = prepared[scene_index - 1]["image"] if scene_index > 0 else None
+            transition_type = transition_types[(scene_index - 1) % len(transition_types)] if scene_index > 0 else "none"
+            active_transition = min(transition_duration, duration * 0.45) if previous_image is not None else 0.0
+            def make_frame(
+                t,
+                base=base_image,
+                text=caption,
+                clip_duration=caption_duration,
+                previous=previous_image,
+                effect=transition_type,
+                trans_duration=active_transition,
+            ):
+                t = max(0.0, float(t))
+                current = base.copy()
+                # Mix the previous scene into the beginning of this scene.
+                # Transitions are deterministic so repeated renders are stable.
+                if previous is not None and trans_duration > 0 and t < trans_duration:
+                    progress = min(1.0, max(0.0, t / trans_duration))
+                    old = previous
+                    w, h = current.size
+                    if effect == "crossfade":
+                        current = Image.blend(old, current, progress)
+                    elif effect in ("wipe_left", "wipe_right"):
+                        current = old.copy()
+                        reveal = int(w * progress)
+                        if effect == "wipe_left":
+                            if reveal > 0:
+                                current.paste(base.crop((0, 0, reveal, h)), (0, 0))
+                        else:
+                            if reveal > 0:
+                                current.paste(base.crop((w - reveal, 0, w, h)), (w - reveal, 0))
+                    else:  # slide_left / slide_right
+                        current = Image.new("RGB", (w, h), (0, 0, 0))
+                        offset = int(w * progress)
+                        if effect == "slide_left":
+                            current.paste(old.crop((offset, 0, w, h)), (0, 0))
+                            current.paste(base.crop((0, 0, offset, h)), (w - offset, 0))
+                        else:
+                            current.paste(old.crop((0, 0, w - offset, h)), (offset, 0))
+                            current.paste(base.crop((w - offset, 0, w, h)), (0, 0))
+                rendered = draw_animated_caption(current, text, t, clip_duration)
+                return np.asarray(rendered, dtype=np.uint8)
+            clip = VideoClip(frame_function=make_frame, duration=duration)
             clips.append(clip)
-
-        # All frames have identical dimensions, so "chain" avoids compose masks.
+            print(
+                f"🎞️ Clip {scene_index + 1}/{len(prepared)} ready: "
+                f"{item.get('filename', 'entry')} | {duration:.2f}s | "
+                f"transition={transition_type}"
+            )
         final_clip = concatenate_videoclips(clips, method="chain")
-
         if audio_file_path and os.path.exists(audio_file_path):
             audio_clip = AudioFileClip(audio_file_path)
             if audio_duration and audio_duration > total_duration:
@@ -5490,45 +5777,79 @@ def produce_video_from_images_entries():
                 except AttributeError:
                     audio_clip = audio_clip.subclip(0, total_duration)
             elif audio_duration and audio_duration < total_duration:
-                # Normally handled above; guard against floating-point differences.
                 try:
                     final_clip = final_clip.subclipped(0, audio_duration)
                 except AttributeError:
                     final_clip = final_clip.subclip(0, audio_duration)
                 total_duration = audio_duration
-
             if hasattr(final_clip, "with_audio"):
                 final_clip = final_clip.with_audio(audio_clip)
             else:
                 final_clip = final_clip.set_audio(audio_clip)
+        # Preserve the previous project output instead of deleting it.
+        # Continue numbering after the highest existing <project>_old_N.mp4.
+        if os.path.isfile(output_path):
+            old_pattern = re.compile(
+                rf"^{re.escape(normalized_project_title)}_old_(\d+)\.mp4$",
+                re.IGNORECASE,
+            )
+            existing_numbers = []
+            for existing_name in os.listdir(edited_folder):
+                match = old_pattern.match(existing_name)
+                if match:
+                    existing_numbers.append(int(match.group(1)))
+            next_old_number = max(existing_numbers, default=0) + 1
+            backup_filename = f"{normalized_project_title}_old_{next_old_number}.mp4"
+            backup_path = os.path.join(edited_folder, backup_filename)
+            while os.path.exists(backup_path):
+                next_old_number += 1
+                backup_filename = f"{normalized_project_title}_old_{next_old_number}.mp4"
+                backup_path = os.path.join(edited_folder, backup_filename)
+            os.replace(output_path, backup_path)
+            print(f"📦 Preserved previous output as: {backup_path}")
 
         print(f"💾 Writing: {output_path}")
         print(f"   Duration: {total_duration:.2f}s | FPS: 24 | Size: {video_width}x{video_height}")
-
-        # 24 FPS is a normal output frame rate for a still-image narration video.
-        # MoviePy sends frames to FFmpeg incrementally rather than building one giant array.
-        final_clip.write_videofile(
-            output_path,
-            fps=24,
-            codec="libx264",
-            audio_codec="aac" if audio_file_path else None,
-            preset="ultrafast",
-            threads=2,
-            logger=None,
-        )
-
+        print("📊 Rendering progress will be shown in this console. No extra window will open.")
+        render_started = time.monotonic()
+        try:
+            final_clip.write_videofile(
+                output_path,
+                fps=24,
+                codec="libx264",
+                audio_codec="aac" if audio_file_path else None,
+                preset="ultrafast",
+                threads=max(2, min(8, os.cpu_count() or 2)),
+                logger="bar",
+            )
+        finally:
+            if keep_awake_enabled and os.name == "nt":
+                try:
+                    import ctypes
+                    ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+                    print("🖥️ Windows sleep/display prevention released")
+                except Exception as awake_restore_exc:
+                    print(f"⚠️ Could not restore Windows power state: {awake_restore_exc}")
+        elapsed_minutes = (time.monotonic() - render_started) / 60.0
+        print(f"⏱️ Render elapsed time: {elapsed_minutes:.2f} minutes")
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             raise RuntimeError("FFmpeg finished without creating a valid output file")
-
         print(f"✅ Video saved: {output_path}")
         print(f"📊 Size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
-
-    except Exception as e:
-        print(f"❌ Video assembly failed: {e}")
+    except Exception as exc:
+        print(f"❌ Video assembly failed: {exc}")
         traceback.print_exc()
         return None
     finally:
-        # Close all resources even when encoding fails.
+        # Safety net: release the Windows keep-awake request even if clip
+        # construction or encoding failed before the normal release point.
+        if locals().get("keep_awake_enabled", False) and os.name == "nt":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
+                keep_awake_enabled = False
+            except Exception:
+                pass
         seen = set()
         for resource in [final_clip, audio_clip, *clips]:
             if resource is None or id(resource) in seen:
@@ -5538,41 +5859,39 @@ def produce_video_from_images_entries():
                 resource.close()
             except Exception:
                 pass
-
-    # Clean up caption files only after successful encoding.
+    # Clean temporary folder left by older versions, if present.
     try:
-        shutil.rmtree(temp_folder)
-        print("🧹 Cleaned up temporary caption images")
-    except Exception as e:
-        print(f"⚠️ Could not clean temporary folder: {e}")
-
+        if os.path.isdir(temp_folder):
+            shutil.rmtree(temp_folder)
+    except Exception as exc:
+        print(f"⚠️ Could not clean temporary folder: {exc}")
     print("\n" + "=" * 60)
     print("📊 SUMMARY")
     print("=" * 60)
     print(f"   Project: {project_title}")
     print(f"   Entries found: {len(entries)}")
-    print(f"   Images processed: {processed}")
+    print(f"   Images processed: {len(prepared)}")
     print(f"   Final duration: {total_duration:.2f}s")
-    print(f"   Captions: uppercase, max 60% width, 60px bottom padding, light outline")
+    print("   Captions: animated typewriter reveal, pop-in, yellow current-word underline")
     print(f"   Audio: {'✅ Added' if audio_file_path else '❌ None'}")
     if audio_file_path:
         print(f"   Audio file: {os.path.basename(audio_file_path)}")
     print(f"   Output: {output_path}")
     print("=" * 60)
     print("✅ Complete!")
-
     return {
         "project_title": project_title,
         "entries_count": len(entries),
-        "images_processed": processed,
+        "images_processed": len(prepared),
         "total_duration": total_duration,
         "audio_added": bool(audio_file_path),
         "audio_file": os.path.basename(audio_file_path) if audio_file_path else None,
         "output_folder": edited_folder,
         "output_file": output_filename,
         "output_path": output_path,
+        "caption_animation": "typewriter_pop",
     }
- 
+
 def main():
     fetch_settings()
     distribute_characters()
