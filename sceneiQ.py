@@ -68,6 +68,7 @@ GEMINI_URL = "https://gemini.google.com/app"
 GOOGLE_FLOW_URL = "https://flow.google.com/#overview"
 GUI_IMAGES = r"C:\xampp\htdocs\AI automation\scenIQ\gui_images"
 PANEL_PATH = r"C:\xampp\htdocs\AI automation\scenIQ\panel.json"
+READY_SCRIPT = r"C:\xampp\htdocs\AI automation\scenIQ\ready_script.json"
 GUI_REGION_SAVER = r"C:\xampp\htdocs\AI automation\scenIQ\gui.json"
 
 class AutomationHUD:
@@ -3068,12 +3069,13 @@ def generate_google_flow_images():
     - Uses GOOGLE_FLOW_URL and GUI_IMAGES path variable
     - Checks panel.json for image_generation_engine == "Google Flow" (case-insensitive)
     - If engine is not Google Flow, function exits immediately
-    - Runs only when currently_running is None/"none"/empty,
-      "distribute_characters_successful", or "generate_google_flow_images()"
+    - Always runs when the selected image engine is Google Flow; no currently_running gate
     - On start sets currently_running to "generate_google_flow_images()"
-    - On clean success sets currently_running to "generate_google_flow_images_successful"
+    - On completion, verifies all scene images exist, appends the completed project
+      snapshot to READY_SCRIPT, then removes project_name from PANEL_PATH
     - On any error/abort keeps currently_running as "generate_google_flow_images()"
-    - (All original Google Flow behaviour preserved)
+    - Retries failed workflow runs indefinitely until manually stopped with Alt+/
+    - Restores the image-hover cursor position before each download retry
     """
     import os
     import json
@@ -3138,8 +3140,131 @@ def generate_google_flow_images():
             data["operation_status"] = operation_status
         return _save_panel(data)
 
+    def _transfer_completed_project_to_ready_script(images_folder, expected_entries):
+        """
+        Append a completed project snapshot to READY_SCRIPT without overwriting
+        existing projects. Only remove project_name from PANEL_PATH after the
+        append has been successfully written and verified.
+        """
+        import copy
+
+        # Confirm every expected scene has a corresponding completed image.
+        image_extensions = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
+        missing = []
+        for number in range(1, expected_entries + 1):
+            expected_stem = f"entry_{number}"
+            found = False
+            if os.path.isdir(images_folder):
+                for filename in os.listdir(images_folder):
+                    stem, ext = os.path.splitext(filename)
+                    if stem.lower() == expected_stem.lower() and ext.lower() in image_extensions:
+                        full_path = os.path.join(images_folder, filename)
+                        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+                            found = True
+                            break
+            if not found:
+                missing.append(expected_stem)
+
+        if missing:
+            print("❌ [READY-SCRIPT] Transfer cancelled; missing image(s): " + ", ".join(missing))
+            update_operation_status(
+                "Project was not transferred because one or more scene images are missing",
+                is_error=True
+            )
+            return False
+
+        # Re-read the source so status updates made during the workflow are retained.
+        try:
+            with open(PANEL_PATH, "r", encoding="utf-8") as source_file:
+                source_data = json.load(source_file)
+            if not isinstance(source_data, dict) or "project_name" not in source_data:
+                print("❌ [READY-SCRIPT] Source panel has no project_name to transfer.")
+                return False
+
+            project_snapshot = copy.deepcopy(source_data)
+            project_snapshot["currently_running"] = "generate_google_flow_images_successful"
+            project_snapshot["status"] = "completed"
+            project_snapshot["operation_status"] = (
+                f"Completed project '{project_snapshot.get('project_name', {}).get('project_title', 'Untitled')}' "
+                f"with {expected_entries} verified image(s)"
+            )
+
+            ready_dir = os.path.dirname(READY_SCRIPT)
+            if ready_dir:
+                os.makedirs(ready_dir, exist_ok=True)
+
+            if os.path.exists(READY_SCRIPT) and os.path.getsize(READY_SCRIPT) > 0:
+                with open(READY_SCRIPT, "r", encoding="utf-8") as ready_file:
+                    ready_data = json.load(ready_file)
+            else:
+                ready_data = {"projects": []}
+
+            # Supported append formats: a JSON list, {"projects": [...]}, or a
+            # legacy single-project object. Preserve existing metadata/projects.
+            if isinstance(ready_data, list):
+                ready_data.append(project_snapshot)
+            elif isinstance(ready_data, dict):
+                if isinstance(ready_data.get("projects"), list):
+                    ready_data["projects"].append(project_snapshot)
+                elif "project_name" in ready_data:
+                    existing_project = ready_data
+                    ready_data = {"projects": [existing_project, project_snapshot]}
+                else:
+                    ready_data["projects"] = [project_snapshot]
+            else:
+                raise ValueError("ready_script.json must contain a JSON object or list")
+
+            with open(READY_SCRIPT, "w", encoding="utf-8") as ready_file:
+                json.dump(ready_data, ready_file, indent=4, ensure_ascii=False)
+                ready_file.flush()
+                os.fsync(ready_file.fileno())
+
+            # Verify the appended project can be read back before touching source.
+            with open(READY_SCRIPT, "r", encoding="utf-8") as verify_file:
+                verified_data = json.load(verify_file)
+            if isinstance(verified_data, list):
+                verified = any(
+                    isinstance(item, dict)
+                    and item.get("project_name", {}).get("project_title")
+                        == project_snapshot.get("project_name", {}).get("project_title")
+                    for item in verified_data
+                )
+            else:
+                verified = any(
+                    isinstance(item, dict)
+                    and item.get("project_name", {}).get("project_title")
+                        == project_snapshot.get("project_name", {}).get("project_title")
+                    for item in verified_data.get("projects", [])
+                )
+            if not verified:
+                raise IOError("Could not verify the project in ready_script.json")
+
+            # Remove only the completed project payload; retain engine/status settings.
+            source_data.pop("project_name", None)
+            source_data["currently_running"] = "generate_google_flow_images_successful"
+            source_data["status"] = "completed"
+            source_data["operation_status"] = (
+                f"Project transferred to ready script: "
+                f"{project_snapshot.get('project_name', {}).get('project_title', 'Untitled')}"
+            )
+            with open(PANEL_PATH, "w", encoding="utf-8") as source_file:
+                json.dump(source_data, source_file, indent=4, ensure_ascii=False)
+
+            print(
+                f"✅ [READY-SCRIPT] Appended completed project "
+                f"'{project_snapshot.get('project_name', {}).get('project_title', 'Untitled')}' "
+                f"to {READY_SCRIPT}; removed project_name from {PANEL_PATH}"
+            )
+            return True
+
+        except Exception as exc:
+            print(f"❌ [READY-SCRIPT] Failed to transfer completed project: {exc}")
+            traceback.print_exc()
+            update_operation_status(f"Failed to transfer completed project: {exc}", is_error=True)
+            return False
+
     # ------------------------------------------------------------------
-    # Engine + status gate
+    # Engine check (no currently_running gate)
     # ------------------------------------------------------------------
     if not os.path.exists(PANEL_PATH):
         print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
@@ -3180,17 +3305,6 @@ def generate_google_flow_images():
             hud.print("Could not read the configuration file.", "error")
         except Exception:
             pass
-        return
-
-    current = _get_currently_running()
-    allowed = (
-        current is None
-        or current == "distribute_characters_successful"
-        or current == "generate_google_flow_images()"
-    )
-    if not allowed:
-        print(f"⏭️ [GF] Skipping – currently_running is '{current}' "
-              f"(expected None, 'distribute_characters_successful' or 'generate_google_flow_images()')")
         return
 
     # Claim the slot
@@ -3341,7 +3455,6 @@ def generate_google_flow_images():
         terminate_automation = True
         update_operation_status("Google Flow operation manually terminated by user (Alt+/)", is_abort=True)
 
-    keyboard.add_hotkey('alt+/', on_terminate_shortcut)
 
     def check_for_termination():
         if terminate_automation:
@@ -4606,6 +4719,25 @@ def generate_google_flow_images():
                 except Exception:
                     pass
                 update_operation_status(f"Retrying download for {entry_name}... (attempt {download_attempts + 1})")
+
+                # Restore the same hover position used while the submitted image
+                # is rendering. Google Flow may reveal image actions only when
+                # the pointer is hovering over the generated image.
+                check_for_termination()
+                search_location = find_image("searchgfimage.png", confidence=0.7)
+                if search_location:
+                    move_cursor_below_search(search_location, offset_px=100)
+                    print(
+                        "🖱️ [GF-DOWNLOAD-RETRY] Restored cursor to the "
+                        "rendering/hover position before retrying download."
+                    )
+                    time.sleep(0.5)
+                else:
+                    print(
+                        "⚠️ [GF-DOWNLOAD-RETRY] searchgfimage.png not found; "
+                        "continuing with the existing download retry flow."
+                    )
+
                 check_and_click_done_editing()
                 click_right_edge_of_image("moregf.png", confidence=0.7)
                 check_and_click_done_editing()
@@ -4984,12 +5116,14 @@ def generate_google_flow_images():
                     hud.print("All images are already complete.", "success")
                 except Exception:
                     pass
-                _set_currently_running(
-                    "generate_google_flow_images_successful",
-                    status="pending",
-                    operation_status=f"✅ All {total_entries} entries already processed"
-                )
-                print("🏁 [GF] currently_running set to 'generate_google_flow_images_successful'")
+                transferred = _transfer_completed_project_to_ready_script(images_folder, total_entries)
+                if transferred:
+                    _set_currently_running(
+                        "generate_google_flow_images_successful",
+                        status="completed",
+                        operation_status=f"✅ All {total_entries} entries verified and transferred to ready_script.json"
+                    )
+                    print("🏁 [GF] Completed project appended to ready_script.json")
                 return
 
             print(f"📊 [MAIN] Starting from entry {start_index + 1}")
@@ -5127,12 +5261,16 @@ def generate_google_flow_images():
             except Exception:
                 pass
 
-            _set_currently_running(
-                "generate_google_flow_images_successful",
-                status="pending",
-                operation_status=f"✅ All {total_entries} entries processed successfully"
-            )
-            print("🏁 [GF] currently_running set to 'generate_google_flow_images_successful'")
+            transferred = _transfer_completed_project_to_ready_script(images_folder, total_entries)
+            if transferred:
+                _set_currently_running(
+                    "generate_google_flow_images_successful",
+                    status="completed",
+                    operation_status=f"✅ All {total_entries} entries processed and transferred to ready_script.json"
+                )
+                print("🏁 [GF] Completed project appended to ready_script.json")
+            else:
+                print("⚠️ [GF] Images may be generated, but project transfer did not complete.")
 
         except KeyboardInterrupt as ki:
             update_operation_status("Google Flow operation manually terminated by user", is_abort=True)
@@ -5159,7 +5297,69 @@ def generate_google_flow_images():
             except Exception:
                 pass
 
-    main_google_flow_workflow()
+    # ------------------------------------------------------------------
+    # Automatic full-workflow restart supervisor
+    # ------------------------------------------------------------------
+    # Any unexpected failure, timeout, or failed scene causes the workflow
+    # to start again without a retry limit. Alt+/ remains the explicit manual
+    # stop control. Successful completion exits normally.
+    restart_number = 0
+    while True:
+        if terminate_automation:
+            print("🛑 [RESTART] Manual stop requested; not restarting.")
+            break
+
+        restart_number += 1
+        operation_status_flag = True
+        operation_status_message = ""
+        operation_aborted = False
+
+        print(
+            f"\\n🔁 [RESTART] Starting Google Flow workflow from the beginning "
+            f"(workflow attempt {restart_number}; unlimited automatic retries)."
+        )
+        _set_currently_running(
+            "generate_google_flow_images()",
+            status="pending",
+            operation_status=f"Restarting Google Flow workflow (attempt {restart_number})"
+        )
+
+        try:
+            keyboard.add_hotkey('alt+/', on_terminate_shortcut)
+        except Exception as hotkey_error:
+            print(f"⚠️ [RESTART] Could not register Alt+/ manual stop hotkey: {hotkey_error}")
+
+        main_google_flow_workflow()
+
+        # main_google_flow_workflow catches most failures internally, so inspect
+        # the persisted state to decide whether it completed or should restart.
+        final_panel = _load_panel()
+        final_running = str(final_panel.get("currently_running", "") or "").strip()
+        final_status = str(final_panel.get("status", "") or "").strip().lower()
+
+        try:
+            keyboard.remove_hotkey('alt+/')
+        except Exception:
+            pass
+
+        if final_running == "generate_google_flow_images_successful":
+            print("✅ [RESTART] Workflow completed successfully; supervisor is exiting.")
+            break
+
+        if terminate_automation:
+            print("🛑 [RESTART] Workflow stopped manually; supervisor is exiting.")
+            break
+
+        print(
+            f"⚠️ [RESTART] Workflow did not complete "
+            f"(status={final_status or 'unknown'}, currently_running={final_running or 'empty'}). "
+            "Waiting 3 seconds, then restarting from the beginning."
+        )
+        try:
+            hud.print("The workflow encountered a problem. Restarting automatically...", "warning")
+        except Exception:
+            pass
+        time.sleep(3)
 
 def produce_video_from_images_entries():
     """
@@ -5193,29 +5393,93 @@ def produce_video_from_images_entries():
         )
         print(f"   Import details: {exc}")
         return None
-    if not os.path.exists(PANEL_PATH):
-        print(f"❌ Error: panel.json missing at: {PANEL_PATH}")
+    # READY_SCRIPT is the queue. Deduplicate by normalized project title,
+    # then process the first project whose final video does not already exist.
+    # Existing completed videos are skipped; no project is overwritten.
+    if not os.path.exists(READY_SCRIPT):
+        print(f"❌ READY_SCRIPT missing: {READY_SCRIPT}")
         return None
-    try:
-        with open(PANEL_PATH, "r", encoding="utf-8") as file:
-            panel_data = json.load(file)
-    except Exception as exc:
-        print(f"❌ Error reading panel.json: {exc}")
-        return None
-    project_info = panel_data.get("project_name", {})
-    project_title = (
-        project_info.get("project_title")
-        if isinstance(project_info, dict)
-        else None
-    ) or panel_data.get("project_title")
-    if not project_title:
-        print("❌ Error: project_title not found in panel.json")
-        return None
+
     def normalize_project_title(name):
         normalized = re.sub(r"[^a-zA-Z0-9\s_]", "", str(name or ""))
         normalized = re.sub(r"\s+", "_", normalized)
         normalized = re.sub(r"_+", "_", normalized).strip("_")
         return normalized or "unnamed_project"
+
+    try:
+        with open(READY_SCRIPT, "r", encoding="utf-8") as file:
+            ready_data = json.load(file)
+    except Exception as exc:
+        print(f"❌ Error reading READY_SCRIPT: {exc}")
+        return None
+
+    if isinstance(ready_data, list):
+        queued_projects = ready_data
+    elif isinstance(ready_data, dict) and isinstance(ready_data.get("projects"), list):
+        queued_projects = ready_data["projects"]
+    elif isinstance(ready_data, dict) and isinstance(ready_data.get("project_name"), dict):
+        queued_projects = [ready_data]  # legacy single-project format
+    else:
+        print("❌ READY_SCRIPT must contain a project list or a {'projects': [...]} object")
+        return None
+
+    unique_projects = []
+    seen_titles = set()
+    for candidate in queued_projects:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_info = candidate.get("project_name", {})
+        candidate_title = (
+            candidate_info.get("project_title")
+            if isinstance(candidate_info, dict)
+            else None
+        ) or candidate.get("project_title")
+        if not candidate_title or not str(candidate_title).strip():
+            print("⚠️ [READY-SCRIPT] Skipping project without a title")
+            continue
+        title_key = normalize_project_title(candidate_title).casefold()
+        if title_key in seen_titles:
+            print(f"⏭️ [READY-SCRIPT] Duplicate project title skipped: {candidate_title}")
+            continue
+        seen_titles.add(title_key)
+        unique_projects.append((candidate, str(candidate_title).strip()))
+
+    panel_data = None
+    project_title = None
+    for candidate, candidate_title in unique_projects:
+        normalized_candidate_title = normalize_project_title(candidate_title)
+        candidate_folder = os.path.join(IMAGES_PATH, normalized_candidate_title)
+        candidate_edited_folder = os.path.join(candidate_folder, "edited")
+        expected_video = os.path.join(candidate_edited_folder, f"{normalized_candidate_title}.mp4")
+        if os.path.isfile(expected_video) and os.path.getsize(expected_video) > 0:
+            print(f"⏭️ [READY-SCRIPT] Video already exists; skipping '{candidate_title}': {expected_video}")
+            continue
+        candidate_script = candidate.get("project_name", {})
+        candidate_script_json = candidate_script.get("script_json", {}) if isinstance(candidate_script, dict) else {}
+        candidate_script_data = candidate_script_json.get("script") if isinstance(candidate_script_json, dict) else None
+        if not isinstance(candidate_script_data, (dict, list)):
+            print(f"⚠️ [READY-SCRIPT] Skipping '{candidate_title}': script_json.script is missing or invalid")
+            continue
+        candidate_images_folder = os.path.join(candidate_folder, "images")
+        possible_folders = [candidate_images_folder, candidate_folder]
+        if not any(
+            os.path.isdir(folder) and any(
+                re.match(r"entry[_-]?\d+", name, re.IGNORECASE)
+                and os.path.splitext(name)[1].lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
+                for name in os.listdir(folder)
+            )
+            for folder in possible_folders
+        ):
+            print(f"⏭️ [READY-SCRIPT] No entry images found yet; skipping '{candidate_title}'")
+            continue
+        panel_data = candidate
+        project_title = candidate_title
+        print(f"🎯 [READY-SCRIPT] Selected next unfinished project: '{project_title}'")
+        break
+
+    if panel_data is None or not project_title:
+        print("✅ [READY-SCRIPT] No unfinished projects remain (or no eligible project has images and script data).")
+        return None
     normalized_project_title = normalize_project_title(project_title)
     project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
     possible_image_folders = [
@@ -5897,7 +6161,7 @@ def produce_video_from_images_entries():
     print(f"   Output: {output_path}")
     print("=" * 60)
     print("✅ Complete!")
-    return {
+    completed_result = {
         "project_title": project_title,
         "entries_count": len(entries),
         "images_processed": len(prepared),
@@ -5909,6 +6173,14 @@ def produce_video_from_images_entries():
         "output_path": output_path,
         "caption_animation": "typewriter_pop",
     }
+
+    # Continue through READY_SCRIPT in the same invocation. The next call
+    # re-scans the queue, skips this newly-created output, and selects the next
+    # unfinished project. Return the current result if no further project is
+    # eligible; otherwise return the last successful project's result.
+    print("🔎 [READY-SCRIPT] Looking for the next unfinished project...")
+    next_result = produce_video_from_images_entries()
+    return next_result if isinstance(next_result, dict) else completed_result
 
 def main():
     fetch_settings()
