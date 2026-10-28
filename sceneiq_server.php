@@ -1077,9 +1077,6 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>SceneIQ Server - Admin</title>
 <style>
-        /* Folder/file navigation is the only visible layout for a selected account. */
-        body.sceneiq-folder-pending .custom-body { visibility: hidden !important; }
-        body.sceneiq-folder-ready .custom-body { visibility: visible !important; }
         .copy-button-copied { background:#dcfce7 !important; border-color:#16a34a !important; color:#166534 !important; }
 
         /* ===== RESET & BODY ===== */
@@ -3822,7 +3819,7 @@
 @media (max-width:640px) { .account-list-select { align-items:flex-start; flex-direction:column; gap:5px; } .account-list-email { text-align:left; } }
 </style>
 </head>
-<body class="<?php echo $selectedUserId > 0 ? 'sceneiq-folder-pending' : ''; ?>">
+<body>
     <div class="custom-body">
         <div class="main-header" style="display:flex;">
             <div><h1>SceneIQ <span>Server</span></h1></div>
@@ -5143,43 +5140,7 @@
                     try {
                         value = parseTypedJsonValue(trimmedValue);
                     } catch (e) {
-                        // Repair common pasted separators such as literal \\n between
-                        // JSON records, while preserving escaped characters inside strings.
-                        try {
-                            var repairedJsonText = trimmedValue.replace(/^\uFEFF/, '');
-                            var repairedChars = '';
-                            var inJsonString = false;
-                            var escapedJsonChar = false;
-                            for (var jsonCharIndex = 0; jsonCharIndex < repairedJsonText.length; jsonCharIndex++) {
-                                var jsonChar = repairedJsonText.charAt(jsonCharIndex);
-                                if (inJsonString) {
-                                    repairedChars += jsonChar;
-                                    if (escapedJsonChar) {
-                                        escapedJsonChar = false;
-                                    } else if (jsonChar === '\\') {
-                                        escapedJsonChar = true;
-                                    } else if (jsonChar === '"') {
-                                        inJsonString = false;
-                                    }
-                                } else {
-                                    if (jsonChar === '"') {
-                                        inJsonString = true;
-                                        repairedChars += jsonChar;
-                                    } else if (jsonChar === '\\' &&
-                                        (repairedJsonText.charAt(jsonCharIndex + 1) === 'n' ||
-                                         repairedJsonText.charAt(jsonCharIndex + 1) === 'r' ||
-                                         repairedJsonText.charAt(jsonCharIndex + 1) === 't')) {
-                                        // Drop literal escaped whitespace outside JSON strings.
-                                        jsonCharIndex++;
-                                    } else if (jsonChar.charCodeAt(0) >= 0x20 || jsonChar === '\n' || jsonChar === '\r' || jsonChar === '\t') {
-                                        repairedChars += jsonChar;
-                                    }
-                                }
-                            }
-                            value = parseTypedJsonValue(repairedChars);
-                        } catch (repairCopyJsonError) {
-                            // Leave malformed legacy text as text rather than losing user data.
-                        }
+                        // Keep malformed legacy text unchanged; valid JSON is copied as native data.
                     }
                 }
             }
@@ -5218,19 +5179,35 @@
             return;
         }
 
-        // Pending data is copied as valid, flat root-level JSON: an array of records.
-        // JSON.stringify safely escapes control characters and other characters that
-        // would otherwise make the copied JSON invalid.
-        var formatted;
-        if (status === 'pending') {
-            formatted = JSON.stringify(records, null, 2);
-        } else {
-            // Preserve the existing copy format for completed and aborted records.
-            formatted = records.map(function(record) {
-                return JSON.stringify(record, null, 2);
-            }).join(',\\n');
-        }
+        /*
+         * Copy the selected status as a valid JSON array.
+         * If a saved record is only a wrapper such as:
+         *     { "{value}": { ...actual data... } }
+         * remove that wrapper key and copy the inner data directly.
+         * Records that contain multiple properties (for example status and
+         * operation_status) are kept intact to avoid discarding real data.
+         */
+        var flatRecords = records.map(function(record) {
+            if (
+                record &&
+                typeof record === 'object' &&
+                !Array.isArray(record)
+            ) {
+                var keys = Object.keys(record);
+                if (
+                    keys.length === 1 &&
+                    record[keys[0]] !== null &&
+                    typeof record[keys[0]] === 'object'
+                ) {
+                    return record[keys[0]];
+                }
+            }
+            return record;
+        });
 
+        // Root-level flat list: [ { ... }, { ... }, ... ]
+        // Native JSON values remain objects/arrays, not escaped strings.
+        var formatted = JSON.stringify(flatRecords, null, 2);
         copyToClipboard(formatted, button);
     }
 
@@ -5245,11 +5222,6 @@
             }
             return false;
         });
-        // New entries are appended to userSettings, so reverse pending entries
-        // for display only; stored order and the other statuses remain unchanged.
-        if (status === 'pending') {
-            entries.sort(function(a, b) { return b._index - a._index; });
-        }
         renderEntryList(entries, container, status);
     }
 
@@ -5270,9 +5242,6 @@
             }
             return false;
         });
-        if (status === 'pending') {
-            entries.sort(function(a, b) { return b._index - a._index; });
-        }
         var filteredEntries = entries.map(function(entry) {
             var filtered = {};
             displayFields.forEach(function(fieldKey) {
@@ -9072,39 +9041,10 @@
         }, 1800);
     }
 
-    // When copied content is a single parent wrapper such as
-    // { "keynametitlevalue": { ... } }, copy only the inner JSON value.
-    // Leave normal objects, arrays, plain text, and comma-separated records unchanged.
-    function removeSingleJsonParentWrapper(text) {
-        if (typeof text !== 'string') return text;
-        var trimmed = text.trim();
-        if (!trimmed || trimmed.charAt(0) !== '{' || trimmed.charAt(trimmed.length - 1) !== '}') {
-            return text;
-        }
-
-        try {
-            var parsed = JSON.parse(trimmed);
-            if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return text;
-
-            var keys = Object.keys(parsed);
-            if (keys.length !== 1) return text;
-
-            var innerValue = parsed[keys[0]];
-            // Only unwrap a parent key whose value is itself an object/array.
-            if (innerValue && typeof innerValue === 'object') {
-                return JSON.stringify(innerValue, null, 2);
-            }
-        } catch (e) {
-            // Not a complete JSON object; preserve the original clipboard text.
-        }
-        return text;
-    }
-
     function copyToClipboard(text, button) {
         // Empty strings are valid values too; do not silently skip copying
         // when the current field has intentionally been cleared.
         var textToCopy = typeof text === 'string' ? text : String(text == null ? '' : text);
-        textToCopy = removeSingleJsonParentWrapper(textToCopy);
         if (!button) {
             var active = document.activeElement;
             if (active && active.tagName === 'BUTTON' && /copy/i.test(active.textContent || '')) button = active;
@@ -9570,7 +9510,7 @@ body:has(#sceneiqFolderRoot) .folder-nav-root {
     const header=document.querySelector('.main-header');
     const contentArea=document.querySelector('.content-area');
     const originalTabs=document.querySelector('.user-config-tabs');
-    if(!header||!contentArea||!originalTabs||!document.getElementById('user_tab_add_entry')) { document.body.classList.remove('sceneiq-folder-pending'); document.body.classList.add('sceneiq-folder-ready'); return; }
+    if(!header||!contentArea||!originalTabs||!document.getElementById('user_tab_add_entry')) return;
     if(document.getElementById('sceneiqFolderRoot')) return;
 
     const contentIds=['add_entry','pending','completed','aborted','dynamic_tabs','submit_tabs','dynamic_fields'];
@@ -9641,7 +9581,7 @@ body:has(#sceneiqFolderRoot) .folder-nav-root {
     });
     return cards;
     }
-    function rootPage(){stack=[];currentRender=rootPage;showCards('Workspace','Choose a folder to continue. Each view opens on its own, with a back path to the previous location.',baseCards(),true);document.body.classList.remove('sceneiq-folder-pending');document.body.classList.add('sceneiq-folder-ready');}
+    function rootPage(){stack=[];currentRender=rootPage;showCards('Workspace','Choose a folder to continue. Each view opens on its own, with a back path to the previous location.',baseCards(),true);}
     function openTop(id){
     if(id==='add_entry'){openNewProjectRoot();return;}
     const render=()=> {
