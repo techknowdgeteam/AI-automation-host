@@ -1,6 +1,9 @@
 <?php
     // sceneiq_server.php - Server Admin Interface for SceneIQ
     session_start();
+    if (empty($_SESSION['password_csrf_token'])) {
+        $_SESSION['password_csrf_token'] = bin2hex(random_bytes(32));
+    }
 
     // Enable error reporting for debugging
     error_reporting(E_ALL);
@@ -109,6 +112,71 @@
                 ':dynamic_tabs' => json_encode($dynamicTabs)
             ]);
         }
+    }
+
+    // Convert submitted dynamic-field values according to their configured type.
+    // JSON values remain arrays/objects/numbers/booleans/null; integers remain numeric.
+    function castDynamicValueByType($value, $type) {
+        $type = strtolower((string)$type);
+        if ($value === null) return null;
+
+        // JSON-looking content is data, not a string. Detect it even when an old
+        // or incorrectly configured field says "string", so pasted objects and
+        // arrays are saved as native JSON structures in settings.
+        if (is_string($value)) {
+            $jsonText = trim($value);
+            $looksLikeJsonContainer = ($jsonText !== '' && ($jsonText[0] === '{' || $jsonText[0] === '['));
+            $looksLikePropertyFragment = ($jsonText !== '' &&
+                preg_match('/^"[^"]+"\s*:/s', $jsonText) === 1);
+            $looksLikeEncodedJsonString = false;
+            if ($jsonText !== '' && $jsonText[0] === '"') {
+                $outerDecoded = json_decode($jsonText, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_string($outerDecoded)) {
+                    $innerText = trim($outerDecoded);
+                    $looksLikeEncodedJsonString = ($innerText !== '' &&
+                        ($innerText[0] === '{' || $innerText[0] === '[' ||
+                         preg_match('/^"[^"]+"\s*:/s', $innerText) === 1));
+                }
+            }
+            if ($type === 'json' || $looksLikeJsonContainer || $looksLikePropertyFragment || $looksLikeEncodedJsonString) {
+                if ($jsonText === '') return null;
+                $decoded = json_decode($jsonText, true);
+                if (json_last_error() !== JSON_ERROR_NONE && $looksLikePropertyFragment) {
+                    $decoded = json_decode('{' . $jsonText . '}', true);
+                }
+                if (json_last_error() !== JSON_ERROR_NONE) {
+                    throw new InvalidArgumentException('This value looks like JSON but is invalid. Paste valid JSON with matching quotes, commas, braces and brackets.');
+                }
+                // Unwrap a JSON-encoded string only when the string itself contains
+                // an object, array, or property fragment. Keep ordinary text strings intact.
+                if (is_string($decoded)) {
+                    $innerText = trim($decoded);
+                    $innerLooksLikeJson = ($innerText !== '' &&
+                        ($innerText[0] === '{' || $innerText[0] === '[' ||
+                         preg_match('/^"[^"]+"\s*:/s', $innerText) === 1));
+                    if ($innerLooksLikeJson) {
+                        return castDynamicValueByType($innerText, 'json');
+                    }
+                }
+                return $decoded;
+            }
+        } elseif ($type === 'json') {
+            // Values that were already parsed by the browser stay native.
+            if (is_array($value) || is_object($value) || is_int($value) || is_float($value) || is_bool($value)) return $value;
+        }
+
+        if ($type === 'json') {
+            if (is_array($value) || is_object($value) || is_int($value) || is_float($value) || is_bool($value)) return $value;
+            throw new InvalidArgumentException('A field configured as JSON must contain valid JSON.');
+        }
+        if ($type === 'int' || $type === 'integer') {
+            if ($value === '') return '';
+            if (is_int($value)) return $value;
+            if (is_string($value) && preg_match('/^-?\d+$/', trim($value))) return (int)trim($value);
+            if (is_float($value) && floor($value) === $value) return (int)$value;
+            throw new InvalidArgumentException('A field configured as Integer must contain a whole number.');
+        }
+        return is_string($value) ? $value : (is_scalar($value) ? (string)$value : $value);
     }
 
     function repairSettings($settings) {
@@ -318,10 +386,23 @@
                 if (isset($fieldData['field_type']) && $fieldData['field_type'] === 'objects') {
                     $fieldKey = $fieldData['field-name'] ?? '';
                     if ($fieldKey) {
+                        $subFields = $fieldData['fieldkeyvalue'] ?? [];
+                        if (!is_array($subFields)) $subFields = [];
+                        // Preserve each sub-field's data_type. Previously this save
+                        // path rebuilt object fields and silently discarded data_type,
+                        // causing JSON sub-fields to be stored as strings.
+                        foreach ($subFields as &$subField) {
+                            if (!is_array($subField)) $subField = [];
+                            $subType = strtolower((string)($subField['data_type'] ?? 'string'));
+                            $subField['data_type'] = in_array($subType, ['string', 'int', 'integer', 'json'], true)
+                                ? ($subType === 'integer' ? 'int' : $subType)
+                                : 'string';
+                        }
+                        unset($subField);
                         $dynamicFields[$fieldKey] = [
                             'field-title' => $fieldData['field-title'] ?? $fieldKey,
                             'field_type' => 'objects',
-                            'fieldkeyvalue' => $fieldData['fieldkeyvalue'] ?? []
+                            'fieldkeyvalue' => $subFields
                         ];
                     }
                 } else {
@@ -331,6 +412,7 @@
                             'field-title' => $fieldData['field-title'] ?? $fieldKey,
                             'field_type' => 'individual',
                             'element_type' => $fieldData['element_type'] ?? 'input',
+                            'data_type' => in_array(($fieldData['data_type'] ?? 'string'), ['string','int','json'], true) ? $fieldData['data_type'] : 'string',
                             'default_value' => $fieldData['default_value'] ?? '',
                             'default_values' => $fieldData['default_values'] ?? [],
                         ];
@@ -480,13 +562,15 @@
                             if ($subKey === '_object') {
                                 continue;
                             }
-                            $objectData[$subKey] = $subValue;
+                            $subType = $subFieldDefinitions[$subKey]['data_type'] ?? 'string';
+                            $objectData[$subKey] = castDynamicValueByType($subValue, $subType);
                         }
                         $flatEntry[$key] = $objectData;
                     }
                 } else {
                     if (in_array($key, $submittedFieldKeys)) {
-                        $flatEntry[$key] = $value;
+                        $fieldType = $globalDynamicFields[$key]['data_type'] ?? 'string';
+                        $flatEntry[$key] = castDynamicValueByType($value, $fieldType);
                     }
                 }
             }
@@ -863,6 +947,47 @@
         exit;
     }
 
+
+    // Change password for the currently selected account.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['change_account_password'])) {
+        $userId = intval($_POST['password_user_id'] ?? 0);
+        $newPassword = (string)($_POST['new_password'] ?? '');
+        $confirmPassword = (string)($_POST['confirm_password'] ?? '');
+        $postedToken = (string)($_POST['password_csrf_token'] ?? '');
+
+        if (empty($_SESSION['password_csrf_token']) ||
+            !hash_equals($_SESSION['password_csrf_token'], $postedToken)) {
+            $_SESSION['flash_error'] = 'Security check failed. Please try again.';
+        } elseif ($userId <= 0 || $userId !== intval($_SESSION['selected_user_id'] ?? 0)) {
+            $_SESSION['flash_error'] = 'Please select the account whose password you want to change.';
+        } elseif (strlen($newPassword) < 8) {
+            $_SESSION['flash_error'] = 'Password must be at least 8 characters long.';
+        } elseif ($newPassword !== $confirmPassword) {
+            $_SESSION['flash_error'] = 'The new password and confirmation do not match.';
+        } else {
+            try {
+                $hashedPassword = password_hash($newPassword, PASSWORD_DEFAULT);
+                $stmt = $pdo->prepare('UPDATE users SET password = :password WHERE id = :id');
+                $stmt->execute([':password' => $hashedPassword, ':id' => $userId]);
+                if ($stmt->rowCount() > 0) {
+                    $_SESSION['flash_success'] = 'Password changed successfully.';
+                } else {
+                    // rowCount can be zero when the value is unchanged; verify account exists.
+                    $check = $pdo->prepare('SELECT id FROM users WHERE id = :id');
+                    $check->execute([':id' => $userId]);
+                    $exists = (bool)$check->fetchColumn();
+                    $_SESSION[$exists ? 'flash_success' : 'flash_error'] =
+                        $exists ? 'Password changed successfully.' : 'Account not found.';
+                }
+                $_SESSION['password_csrf_token'] = bin2hex(random_bytes(32));
+            } catch (Throwable $e) {
+                error_log('Password update failed: ' . $e->getMessage());
+                $_SESSION['flash_error'] = 'Unable to change the password. Please try again.';
+            }
+        }
+        $redirect = true;
+    }
+
     // If any POST request that should redirect, do it here
     if ($redirect) {
         header('Location: ' . $_SERVER['PHP_SELF']);
@@ -952,6 +1077,9 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>SceneIQ Server - Admin</title>
 <style>
+        /* Folder/file navigation is the only visible layout for a selected account. */
+        body.sceneiq-folder-pending .custom-body { visibility: hidden !important; }
+        body.sceneiq-folder-ready .custom-body { visibility: visible !important; }
         .copy-button-copied { background:#dcfce7 !important; border-color:#16a34a !important; color:#166534 !important; }
 
         /* ===== RESET & BODY ===== */
@@ -3684,10 +3812,17 @@
 .menu-account-email { color:#64748b; font-size:13px; }
 .menu-drawer-item { width:100%; text-align:left; padding:13px 12px; border:0; border-radius:8px; background:#fff; color:#1f2937; font-size:15px; cursor:pointer; }
 .menu-drawer-item:hover { background:#f1f5f9; color:#00695c; }
+.change-password-form { padding:12px; margin:0 0 6px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; }
+.change-password-form label { display:block; margin:8px 0 5px; color:#334155; font-size:13px; font-weight:600; }
+.change-password-form input { display:block; width:100%; min-width:0; padding:10px; border:1px solid #cbd5e1; border-radius:7px; background:#fff; color:#0f172a; }
+.menu-password-save { width:100%; margin-top:12px; padding:11px 12px; border:0; border-radius:8px; background:#00695c; color:#fff; font-weight:700; cursor:pointer; }
+.menu-password-save:hover { background:#004d40; }
+.password-form-message { margin-top:8px; color:#b91c1c; font-size:12px; }
+
 @media (max-width:640px) { .account-list-select { align-items:flex-start; flex-direction:column; gap:5px; } .account-list-email { text-align:left; } }
 </style>
 </head>
-<body>
+<body class="<?php echo $selectedUserId > 0 ? 'sceneiq-folder-pending' : ''; ?>">
     <div class="custom-body">
         <div class="main-header" style="display:flex;">
             <div><h1>SceneIQ <span>Server</span></h1></div>
@@ -3724,14 +3859,23 @@
                             </div>
                             
                             <div id="user_tab_pending" class="user-config-content active">
+                                <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllStatusEntries('pending', this)">📋 Copy All Pending Data</button>
+                                </div>
                                 <div id="pendingEntriesList"></div>
                             </div>
-                            
+
                             <div id="user_tab_completed" class="user-config-content">
+                                <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllStatusEntries('completed', this)">📋 Copy All Completed Data</button>
+                                </div>
                                 <div id="completedEntriesList"></div>
                             </div>
-                            
+
                             <div id="user_tab_aborted" class="user-config-content">
+                                <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllStatusEntries('aborted', this)">📋 Copy All Aborted Data</button>
+                                </div>
                                 <div id="abortedEntriesList"></div>
                             </div>
 
@@ -3767,7 +3911,13 @@
                                     <!-- Dynamic Sub Tabs for New Project -->
                                     <div class="dynamic-sub-tabs" id="newProjectSubTabs">
                                         <?php 
-                                        $firstTabIndex = !empty($userDynamicTabs) ? array_key_first($userDynamicTabs) : -1;
+                                        $firstTabIndex = -1;
+                                    foreach ($userDynamicTabs as $candidateIndex => $candidateTab) {
+                                        if (!array_key_exists('display_tab', $candidateTab) || !empty($candidateTab['display_tab'])) {
+                                            $firstTabIndex = $candidateIndex;
+                                            break;
+                                        }
+                                    }
                                         foreach ($userDynamicTabs as $tabIndex => $tab): 
                                             if (array_key_exists('display_tab', $tab) && empty($tab['display_tab'])) continue;
                                             $isActive = ($tabIndex === $firstTabIndex) ? 'active' : '';
@@ -3783,7 +3933,13 @@
                                     
                                     <!-- Dynamic Tab Contents -->
                                     <?php 
-                                    $firstTabIndex = !empty($userDynamicTabs) ? array_key_first($userDynamicTabs) : -1;
+                                    $firstTabIndex = -1;
+                                    foreach ($userDynamicTabs as $candidateIndex => $candidateTab) {
+                                        if (!array_key_exists('display_tab', $candidateTab) || !empty($candidateTab['display_tab'])) {
+                                            $firstTabIndex = $candidateIndex;
+                                            break;
+                                        }
+                                    }
                                     foreach ($userDynamicTabs as $tabIndex => $tab): 
                                         if (array_key_exists('display_tab', $tab) && empty($tab['display_tab'])) continue;
                                         $isActive = ($tabIndex === $firstTabIndex) ? 'active' : '';
@@ -3919,6 +4075,20 @@
                 <div class="menu-account-username">Username: <?php echo htmlspecialchars($selectedUser['username'] ?? '—'); ?></div>
                 <div class="menu-account-email">Email: <?php echo htmlspecialchars($selectedUser['email'] ?? '—'); ?></div>
             </div>
+            <?php if ($selectedUser): ?>
+            <button type="button" class="menu-drawer-item" id="changePasswordToggle" onclick="toggleChangePasswordForm()" aria-expanded="false">Change Password</button>
+            <form method="POST" id="changePasswordForm" class="change-password-form" style="display:none;">
+                <input type="hidden" name="change_account_password" value="1">
+                <input type="hidden" name="password_user_id" value="<?php echo (int)$selectedUser['id']; ?>">
+                <input type="hidden" name="password_csrf_token" value="<?php echo htmlspecialchars($_SESSION['password_csrf_token'], ENT_QUOTES, 'UTF-8'); ?>">
+                <label for="newPassword">New password</label>
+                <input type="password" id="newPassword" name="new_password" minlength="8" autocomplete="new-password" required>
+                <label for="confirmPassword">Confirm password</label>
+                <input type="password" id="confirmPassword" name="confirm_password" minlength="8" autocomplete="new-password" required>
+                <button type="submit" class="menu-password-save">Save Password</button>
+                <p id="passwordFormMessage" class="password-form-message" aria-live="polite"></p>
+            </form>
+            <?php endif; ?>
             <button type="button" class="menu-drawer-item" onclick="goToDashboard()">Dashboard</button>
             <button type="button" class="menu-drawer-item" onclick="window.location.href='index.php'">Task</button>
         </aside>
@@ -3964,10 +4134,10 @@
             return;
         }
         ?>
-        <form method="POST" id="addEntryForm">
+        <form method="POST" class="addEntryForm">
             <input type="hidden" name="add_entry" value="true">
             <input type="hidden" name="user_id" value="<?php echo $selectedUserId; ?>">
-            <input type="hidden" name="entry_data" id="entryDataInput">
+            <input type="hidden" name="entry_data" class="entryDataInput">
             
             <?php foreach ($dynamicFields as $key => $field): ?>
                 <?php if ($field['field_type'] === 'objects'): ?>
@@ -4131,7 +4301,7 @@
             <?php endforeach; ?>
             
             <div class="form-actions">
-                <button type="button" id="saveEntryButton" class="btn btn-success" onclick="submitUserEntry()" style="display:none;"> Save Entry</button>
+                <button type="button" class="btn btn-success saveEntryButton" onclick="submitUserEntry()" style="display:none;" hidden aria-hidden="true"> Save Entry</button>
             </div>
         </form>
         <?php
@@ -4547,6 +4717,37 @@
         overlay.setAttribute('aria-hidden', 'true');
         document.body.classList.remove('menu-open');
     }
+    function toggleChangePasswordForm() {
+        var form = document.getElementById('changePasswordForm');
+        var toggle = document.getElementById('changePasswordToggle');
+        if (!form || !toggle) return;
+        var opening = form.style.display === 'none' || form.style.display === '';
+        form.style.display = opening ? 'block' : 'none';
+        toggle.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        if (opening) {
+            var input = document.getElementById('newPassword');
+            if (input) input.focus();
+        }
+    }
+
+    var changePasswordForm = document.getElementById('changePasswordForm');
+    if (changePasswordForm) {
+        changePasswordForm.addEventListener('submit', function(event) {
+            var newPassword = document.getElementById('newPassword').value;
+            var confirmPassword = document.getElementById('confirmPassword').value;
+            var message = document.getElementById('passwordFormMessage');
+            if (newPassword.length < 8) {
+                event.preventDefault();
+                message.textContent = 'Password must be at least 8 characters long.';
+            } else if (newPassword !== confirmPassword) {
+                event.preventDefault();
+                message.textContent = 'The passwords do not match.';
+            } else {
+                message.textContent = '';
+            }
+        });
+    }
+
     function goToDashboard() {
         closeMenuDrawer();
         var form = document.createElement('form');
@@ -4909,6 +5110,130 @@
     // ===== RENDER STATUS ENTRIES =====
     // ============================================================
 
+    // Copy every record in the selected status as separate JSON objects.
+    // Objects are comma-separated, with no surrounding JSON array, matching
+    // the requested export format. Internal UI-only keys such as _index are excluded.
+    function normalizeRecordTypesForCopy(record) {
+        var normalized = {};
+        Object.keys(record || {}).forEach(function(key) {
+            if (key.charAt(0) === '_') return;
+            var value = record[key];
+            var definition = (typeof globalDynamicFields !== 'undefined' && globalDynamicFields)
+                ? globalDynamicFields[key] : null;
+            var dataType = definition && definition.data_type ? String(definition.data_type).toLowerCase() : 'string';
+
+            // Repair older records that were stored as strings before JSON field types
+            // were preserved. Export/copy them as actual objects/arrays/numbers/booleans.
+            if (typeof value === 'string') {
+                var trimmedValue = value.trim();
+                var looksLikeJsonContainer = trimmedValue.charAt(0) === '{' || trimmedValue.charAt(0) === '[';
+                var looksLikePropertyFragment = /^"[^"]+"\s*:/s.test(trimmedValue);
+                var looksLikeEncodedJsonString = false;
+                if (trimmedValue.charAt(0) === '"') {
+                    try {
+                        var outerValue = JSON.parse(trimmedValue);
+                        if (typeof outerValue === 'string') {
+                            var innerValue = outerValue.trim();
+                            looksLikeEncodedJsonString = innerValue.charAt(0) === '{' ||
+                                innerValue.charAt(0) === '[' || /^"[^"]+"\s*:/s.test(innerValue);
+                        }
+                    } catch (ignoreCopyJsonError) {}
+                }
+                if (dataType === 'json' || looksLikeJsonContainer || looksLikePropertyFragment || looksLikeEncodedJsonString) {
+                    try {
+                        value = parseTypedJsonValue(trimmedValue);
+                    } catch (e) {
+                        // Repair common pasted separators such as literal \\n between
+                        // JSON records, while preserving escaped characters inside strings.
+                        try {
+                            var repairedJsonText = trimmedValue.replace(/^\uFEFF/, '');
+                            var repairedChars = '';
+                            var inJsonString = false;
+                            var escapedJsonChar = false;
+                            for (var jsonCharIndex = 0; jsonCharIndex < repairedJsonText.length; jsonCharIndex++) {
+                                var jsonChar = repairedJsonText.charAt(jsonCharIndex);
+                                if (inJsonString) {
+                                    repairedChars += jsonChar;
+                                    if (escapedJsonChar) {
+                                        escapedJsonChar = false;
+                                    } else if (jsonChar === '\\') {
+                                        escapedJsonChar = true;
+                                    } else if (jsonChar === '"') {
+                                        inJsonString = false;
+                                    }
+                                } else {
+                                    if (jsonChar === '"') {
+                                        inJsonString = true;
+                                        repairedChars += jsonChar;
+                                    } else if (jsonChar === '\\' &&
+                                        (repairedJsonText.charAt(jsonCharIndex + 1) === 'n' ||
+                                         repairedJsonText.charAt(jsonCharIndex + 1) === 'r' ||
+                                         repairedJsonText.charAt(jsonCharIndex + 1) === 't')) {
+                                        // Drop literal escaped whitespace outside JSON strings.
+                                        jsonCharIndex++;
+                                    } else if (jsonChar.charCodeAt(0) >= 0x20 || jsonChar === '\n' || jsonChar === '\r' || jsonChar === '\t') {
+                                        repairedChars += jsonChar;
+                                    }
+                                }
+                            }
+                            value = parseTypedJsonValue(repairedChars);
+                        } catch (repairCopyJsonError) {
+                            // Leave malformed legacy text as text rather than losing user data.
+                        }
+                    }
+                }
+            }
+
+            if (definition && definition.field_type === 'objects' && value && typeof value === 'object' && !Array.isArray(value)) {
+                var subDefinitions = definition.fieldkeyvalue || {};
+                Object.keys(value).forEach(function(subKey) {
+                    var subDefinition = subDefinitions[subKey] || {};
+                    if (typeof value[subKey] === 'string') {
+                        var nestedText = value[subKey].trim();
+                        var nestedLooksJson = nestedText.charAt(0) === '{' || nestedText.charAt(0) === '[' ||
+                            /^"(?:\\.|[^"\\])*"\s*:/s.test(nestedText);
+                        if (String(subDefinition.data_type || 'string').toLowerCase() === 'json' || nestedLooksJson) {
+                            try { value[subKey] = parseTypedJsonValue(nestedText); } catch (e) {}
+                        }
+                    }
+                    if ((String(subDefinition.data_type || 'string').toLowerCase() === 'int' ||
+                         String(subDefinition.data_type || 'string').toLowerCase() === 'integer') &&
+                        typeof value[subKey] === 'string' && /^-?\d+$/.test(value[subKey].trim())) {
+                        value[subKey] = Number(value[subKey]);
+                    }
+                });
+            }
+            normalized[key] = value;
+        });
+        return normalized;
+    }
+
+    function copyAllStatusEntries(status, button) {
+        var records = (Array.isArray(userSettings) ? userSettings : []).filter(function(entry) {
+            return String((entry && entry.status) || 'pending').toLowerCase() === status;
+        }).map(normalizeRecordTypesForCopy);
+
+        if (!records.length) {
+            showDialog('Info', 'There are no ' + status + ' records to copy.');
+            return;
+        }
+
+        // Pending data is copied as valid, flat root-level JSON: an array of records.
+        // JSON.stringify safely escapes control characters and other characters that
+        // would otherwise make the copied JSON invalid.
+        var formatted;
+        if (status === 'pending') {
+            formatted = JSON.stringify(records, null, 2);
+        } else {
+            // Preserve the existing copy format for completed and aborted records.
+            formatted = records.map(function(record) {
+                return JSON.stringify(record, null, 2);
+            }).join(',\\n');
+        }
+
+        copyToClipboard(formatted, button);
+    }
+
     function renderStatusEntries(status, containerId) {
         var container = document.getElementById(containerId);
         if (!container) return;
@@ -4920,6 +5245,11 @@
             }
             return false;
         });
+        // New entries are appended to userSettings, so reverse pending entries
+        // for display only; stored order and the other statuses remain unchanged.
+        if (status === 'pending') {
+            entries.sort(function(a, b) { return b._index - a._index; });
+        }
         renderEntryList(entries, container, status);
     }
 
@@ -4940,6 +5270,9 @@
             }
             return false;
         });
+        if (status === 'pending') {
+            entries.sort(function(a, b) { return b._index - a._index; });
+        }
         var filteredEntries = entries.map(function(entry) {
             var filtered = {};
             displayFields.forEach(function(fieldKey) {
@@ -4970,6 +5303,9 @@
     // ============================================================
 
     function renderEntryFields(entry, index) {
+        // Repair legacy values at render time too, so the field-level Copy button
+        // copies a real JSON object/array instead of the old escaped string.
+        entry = normalizeRecordTypesForCopy(entry || {});
         var displayFields = Object.keys(entry).filter(function(k) {
             return k !== 'status' && k !== 'operation_status' && k !== '_user' && k !== '_user_id' && k !== '_index' && k !== '_object';
         });
@@ -5556,20 +5892,95 @@
 
     // Show Save Entry only when the currently displayed main tab is enabled
     // in Submit Tabs. Nested child tabs inherit their parent tab's setting.
-    function updateSaveEntryButtonVisibility() {
-        var saveButton = document.getElementById('saveEntryButton');
-        if (!saveButton) return;
+    // Centralized diagnostics for why Save Entry is visible or hidden.
+    // Works with both the original tab UI and the folder-navigation UI.
+    function getActiveNewProjectContext() {
+        var root = document.getElementById('user_tab_add_entry');
+        if (!root) return { root: null, rootContent: null, scope: null, tabId: null, tabButton: null };
 
-        var activeContent = document.querySelector('#user_tab_add_entry .dynamic-sub-tab-content.active');
-        var enabled = false;
-
-        if (activeContent && activeContent.id !== 'newProjectSubTab_all_fields') {
-            var tabId = activeContent.id.replace('newProjectSubTab_', '');
-            var tabButton = document.querySelector('#user_tab_add_entry #newProjectSubTabs .dynamic-sub-tab-btn[data-tab="' + tabId + '"]');
-            enabled = !!(tabButton && tabButton.getAttribute('data-submit-enabled') === '1');
+        // The folder UI marks the selected root/child with folder-active-content;
+        // the classic UI uses .active. Resolve the root tab first.
+        var rootContent = root.querySelector('.dynamic-sub-tab-content.folder-active-content[id^="newProjectSubTab_tab_"], .dynamic-sub-tab-content.active[id^="newProjectSubTab_tab_"]');
+        if (!rootContent) {
+            rootContent = root.querySelector('.dynamic-sub-tab-content.folder-active-content[id^="newProjectSubTab_"], .dynamic-sub-tab-content.active[id^="newProjectSubTab_"]');
         }
 
-        saveButton.style.display = enabled ? 'inline-flex' : 'none';
+        var scope = rootContent;
+        if (rootContent) {
+            // For nested tabs, only collect/show the button belonging to the selected child.
+            var child = rootContent.querySelector('.nested-child-content.folder-active-content') ||
+                        rootContent.querySelector('.nested-child-content.active');
+            if (child) scope = child;
+        }
+
+        var tabId = null;
+        var tabButton = null;
+        if (rootContent && rootContent.id && rootContent.id !== 'newProjectSubTab_all_fields') {
+            tabId = rootContent.id.replace('newProjectSubTab_', '');
+            var nav = document.getElementById('newProjectSubTabs');
+            tabButton = nav ? Array.from(nav.querySelectorAll('.dynamic-sub-tab-btn')).find(function(button) {
+                return button.getAttribute('data-tab') === tabId;
+            }) : null;
+        }
+        return { root: root, rootContent: rootContent, scope: scope, tabId: tabId, tabButton: tabButton };
+    }
+
+    function updateSaveEntryButtonVisibility() {
+        var context = getActiveNewProjectContext();
+        var root = context.root;
+        var activeContent = context.rootContent;
+        var activeScope = context.scope;
+        var tabsBar = document.getElementById('newProjectSubTabs');
+        var tabButton = context.tabButton;
+        var tabId = context.tabId;
+        var enabled = !!(tabButton && tabButton.getAttribute('data-submit-enabled') === '1');
+
+        // There is one Save Entry button per rendered form. Never use getElementById:
+        // it would always select the first button (inside the hidden All Fields form).
+        var saveButton = activeScope ? activeScope.querySelector('.saveEntryButton') : null;
+        var reason = '';
+        if (!root) reason = 'New Project container #user_tab_add_entry was not found.';
+        else if (!activeContent) reason = 'No active main dynamic tab was found.';
+        else if (activeContent.id === 'newProjectSubTab_all_fields') reason = 'All Fields view is selected; only configured Submit Tabs main tabs can save.';
+        else if (!tabButton) reason = 'Active content has no matching main tab button in #newProjectSubTabs.';
+        else if (!saveButton) reason = 'The selected tab/child has no rendered form or Save Entry button.';
+        else reason = enabled ? 'Active tab is enabled in Submit Tabs.' : 'Active tab data-submit-enabled is not 1.';
+
+        // Hide buttons in all other (inactive) forms so stale visibility cannot leak
+        // when navigating between root tabs, nested tabs, or the folder interface.
+        if (root) {
+            root.querySelectorAll('.saveEntryButton').forEach(function(button) {
+                var showThisButton = !!(enabled && saveButton && button === saveButton);
+                button.style.display = showThisButton ? 'inline-flex' : 'none';
+                button.hidden = !showThisButton;
+                button.setAttribute('aria-hidden', showThisButton ? 'false' : 'true');
+            });
+        }
+
+        var debugState = {
+            selectedUserId: selectedUserId,
+            folderNavigationActive: !!document.getElementById('sceneiqFolderRoot'),
+            addEntryRootFound: !!root,
+            tabsBarFound: !!tabsBar,
+            activeRootContentId: activeContent ? activeContent.id : null,
+            activeRootContentClasses: activeContent ? activeContent.className : null,
+            activeScopeId: activeScope ? activeScope.id : null,
+            activeScopeClasses: activeScope ? activeScope.className : null,
+            matchingTabId: tabId,
+            matchingTabFound: !!tabButton,
+            matchingTabSubmitEnabled: tabButton ? tabButton.getAttribute('data-submit-enabled') : null,
+            saveButtonFoundInActiveScope: !!saveButton,
+            saveButtonDisplay: saveButton ? saveButton.style.display : null,
+            saveButtonComputedDisplay: saveButton ? getComputedStyle(saveButton).display : null,
+            saveButtonHidden: saveButton ? saveButton.hidden : null,
+            enabled: enabled,
+            reason: reason
+        };
+        console.groupCollapsed('[SceneIQ Save Entry Debug] Visibility check');
+        console.log(debugState);
+        if (!enabled || !saveButton) console.warn('[SceneIQ Save Entry Debug] Save Entry is hidden:', reason);
+        else console.info('[SceneIQ Save Entry Debug] Save Entry is enabled for active tab:', tabId);
+        console.groupEnd();
     }
 
     function switchNewProjectNestedSubTab(btn) {
@@ -5581,7 +5992,24 @@
         var index = Array.prototype.indexOf.call(wrapper.querySelectorAll('.nested-child-btn'), btn);
         var contents = wrapper.querySelectorAll('.nested-child-content');
         if (contents[index]) { contents[index].classList.add('active'); contents[index].style.display = 'block'; }
+        console.info('[SceneIQ Save Entry Debug] Nested tab switched', {
+            label: (btn.textContent || '').trim(),
+            activeChildId: contents[index] ? contents[index].id : null,
+            parentContentId: (wrapper.closest('.dynamic-sub-tab-content') || {}).id || null
+        });
         updateSaveEntryButtonVisibility();
+
+        var resolvedFeatures = (typeof getActiveTabFeatures === 'function')
+            ? getActiveTabFeatures()
+            : { copy_button: false, transcript_detection: false, transcript_with_structured_data_detection: false };
+        console.info('[SceneIQ Transcript Detection] CHILD TAB CLICKED', {
+            child_tab_name: (btn.textContent || '').trim(),
+            child_index: index,
+            active_root_id: (wrapper.closest('.dynamic-sub-tab-content') || {}).id || null,
+            active_child_id: contents[index] ? contents[index].id : null,
+            feature_flags: resolvedFeatures,
+            transcript_detection_enabled: sceneIQFeatureEnabled(resolvedFeatures.transcript_detection)
+        });
     }
 
     function switchNewProjectSubTab(tabId, btn) {
@@ -5605,7 +6033,28 @@
             }
         }
         if (btn) btn.classList.add('active');
+        console.info('[SceneIQ Save Entry Debug] Main tab switched', {
+            requestedTabId: tabId,
+            targetFound: !!target,
+            targetId: target ? target.id : null,
+            buttonDataTab: btn ? btn.getAttribute('data-tab') : null,
+            buttonSubmitEnabled: btn ? btn.getAttribute('data-submit-enabled') : null,
+            targetClasses: target ? target.className : null
+        });
         updateSaveEntryButtonVisibility();
+
+        // Explicit diagnostic: confirm which root tab was clicked and which features
+        // the application resolves for that tab after the active state has changed.
+        var resolvedFeatures = (typeof getActiveTabFeatures === 'function')
+            ? getActiveTabFeatures()
+            : { copy_button: false, transcript_detection: false, transcript_with_structured_data_detection: false };
+        console.info('[SceneIQ Transcript Detection] ROOT TAB CLICKED', {
+            tab_id: tabId,
+            tab_name: btn ? (btn.textContent || '').trim() : '(button not supplied)',
+            active_content_id: target ? target.id : null,
+            feature_flags: resolvedFeatures,
+            transcript_detection_enabled: sceneIQFeatureEnabled(resolvedFeatures.transcript_detection)
+        });
     }
 
     // ============================================================
@@ -5613,64 +6062,215 @@
     // ============================================================
 
     document.addEventListener('DOMContentLoaded', function() {
+        /*
+         * FIX: If the first visible tab is not enabled in Submit Tabs, automatically
+         * select the first enabled main tab. Previously the page always opened on
+         * the first visible tab (e.g. "Pov Niches") even when only a later tab
+         * (e.g. "Submit Project") was enabled, so Save Entry correctly stayed hidden
+         * and appeared to be missing.
+         *
+         * This does not bypass Submit Tabs. It only navigates to an enabled tab;
+         * disabled tabs still keep Save Entry hidden when selected manually.
+         */
+        var initialTabsBar = document.getElementById('newProjectSubTabs');
+        var initialActiveContent = document.querySelector(
+            '#user_tab_add_entry .dynamic-sub-tab-content.folder-active-content, ' +
+            '#user_tab_add_entry .dynamic-sub-tab-content.active'
+        );
+        var initialActiveId = initialActiveContent && initialActiveContent.id
+            ? initialActiveContent.id.replace('newProjectSubTab_', '')
+            : null;
+        var initialActiveButton = initialTabsBar
+            ? Array.from(initialTabsBar.querySelectorAll('.dynamic-sub-tab-btn')).find(function(button) {
+                return button.getAttribute('data-tab') === initialActiveId;
+            })
+            : null;
+
+        if (initialTabsBar && (!initialActiveButton ||
+            initialActiveButton.getAttribute('data-submit-enabled') !== '1')) {
+            var firstEnabledTabButton = Array.from(
+                initialTabsBar.querySelectorAll('.dynamic-sub-tab-btn')
+            ).find(function(button) {
+                return button.getAttribute('data-submit-enabled') === '1';
+            });
+
+            if (firstEnabledTabButton) {
+                var enabledTabId = firstEnabledTabButton.getAttribute('data-tab');
+                console.info('[SceneIQ Save Entry Debug] Initial tab is not submit-enabled; opening first enabled tab.', {
+                    previousTabId: initialActiveId,
+                    selectedTabId: enabledTabId,
+                    selectedTabName: (firstEnabledTabButton.textContent || '').trim()
+                });
+                switchNewProjectSubTab(enabledTabId, firstEnabledTabButton);
+            }
+        }
+
+        console.info('[SceneIQ Save Entry Debug] DOMContentLoaded initial state', {
+            selectedUserId: selectedUserId,
+            dynamicTabsCount: Array.isArray(userDynamicTabs) ? userDynamicTabs.length : null,
+            dynamicFieldCount: Object.keys(globalDynamicFields || {}).length,
+            tabs: (Array.isArray(userDynamicTabs) ? userDynamicTabs : []).map(function(tab, index) {
+                return {
+                    index: index,
+                    name: tab.tab_name || null,
+                    display_tab: tab.display_tab,
+                    submit_tab: tab.submit_tab,
+                    fieldCount: Array.isArray(tab.dynamic_fields_display) ? tab.dynamic_fields_display.length : 0,
+                    subTabsCount: Array.isArray(tab.sub_tabs) ? tab.sub_tabs.length : 0
+                };
+            }),
+            saveButtonExists: !!document.getElementById('saveEntryButton'),
+            tabsBarExists: !!document.getElementById('newProjectSubTabs')
+        });
         updateSaveEntryButtonVisibility();
+        // Run again after folder navigation has had a chance to initialize/move content.
+        window.setTimeout(function() {
+            updateSaveEntryButtonVisibility();
+        }, 150);
     });
 
+    function parseTypedJsonValue(value) {
+        if (value !== null && typeof value === 'object') return value;
+        var text = String(value == null ? '' : value).trim();
+        if (text === '') return null;
+        try {
+            var parsed = JSON.parse(text);
+            // Some form/browser paths may submit JSON as a JSON-encoded string
+            // (for example, "{\\\"script_json\\\": {...}}"). Unwrap that extra
+            // string layer only when its contents are themselves JSON.
+            if (typeof parsed === 'string') {
+                var inner = parsed.trim();
+                if (inner.charAt(0) === '{' || inner.charAt(0) === '[' || /^"[^"]+"\s*:/s.test(inner)) {
+                    return parseTypedJsonValue(inner);
+                }
+            }
+            return parsed;
+        } catch (firstError) {
+            // Accept pasted JSON property fragments such as:
+            //   "script_json": { ... }
+            // and turn them into a proper object instead of saving a string.
+            if (/^"[^"]+"\s*:/s.test(text)) {
+                try { return JSON.parse('{' + text + '}'); } catch (secondError) {}
+            }
+            throw new Error('Enter valid JSON. Use a complete object/array/value, or a property fragment that can be wrapped in { }. Check quotes, commas, braces and brackets.');
+        }
+    }
+
+    function convertEntryValueByType(value, type) {
+        type = String(type || 'string').toLowerCase();
+        if (typeof value === 'string') {
+            var trimmed = value.trim();
+            var looksLikeJsonContainer = trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[';
+            var looksLikePropertyFragment = /^"[^"]+"\s*:/s.test(trimmed);
+            var looksLikeEncodedJsonString = false;
+            if (trimmed.charAt(0) === '"') {
+                try {
+                    var outerParsed = JSON.parse(trimmed);
+                    if (typeof outerParsed === 'string') {
+                        var innerParsedText = outerParsed.trim();
+                        looksLikeEncodedJsonString = innerParsedText.charAt(0) === '{' ||
+                            innerParsedText.charAt(0) === '[' || /^"[^"]+"\s*:/s.test(innerParsedText);
+                    }
+                } catch (ignoreEncodedJsonError) {}
+            }
+            if (type === 'json' || looksLikeJsonContainer || looksLikePropertyFragment || looksLikeEncodedJsonString) {
+                return parseTypedJsonValue(trimmed);
+            }
+        }
+        if (type === 'json') return parseTypedJsonValue(value);
+        if (type === 'int' || type === 'integer') {
+            if (value === '') return '';
+            if (!/^-?\d+$/.test(String(value).trim())) {
+                throw new Error('Enter a whole number without decimals or other characters.');
+            }
+            var n = Number(value);
+            if (!Number.isSafeInteger(n)) throw new Error('Integer is outside the supported safe range.');
+            return n;
+        }
+        return String(value);
+    }
+
     function submitUserEntry() {
-        var activeContent = document.querySelector('#user_tab_add_entry .dynamic-sub-tab-content.active');
-        if (!activeContent) {
-            showDialog('Error', 'No active form found.');
+        var context = getActiveNewProjectContext();
+        var activeContent = context.rootContent;
+        var activeScope = context.scope;
+        if (!activeContent || !activeScope) {
+            showDialog('Error', 'No active project tab or form found.');
             return;
         }
+
         updateSaveEntryButtonVisibility();
-        var saveButton = document.getElementById('saveEntryButton');
-        if (!saveButton || saveButton.style.display === 'none') {
-            showDialog('Info', 'Saving entries is disabled for the currently displayed tab in Submit Tabs.');
+        var saveButton = activeScope.querySelector('.saveEntryButton');
+        if (!saveButton || saveButton.hidden || saveButton.style.display === 'none') {
+            showDialog('Info', 'Saving entries is disabled for the currently displayed tab in Submit Tabs, or this tab has no form.');
             return;
         }
-        var inputs = activeContent.querySelectorAll('input, textarea, select');
+
+        var activeForm = activeScope.querySelector('form.addEntryForm');
+        if (!activeForm) {
+            showDialog('Error', 'The selected tab does not contain a project form.');
+            return;
+        }
+
+        var inputs = activeScope.querySelectorAll('input, textarea, select');
         var entryData = {};
-        var objectContainers = activeContent.querySelectorAll('[id^="object_"]');
+        var objectContainers = activeScope.querySelectorAll('[id^="object_"]');
         inputs.forEach(function(input) {
             if (input.id && input.id.startsWith('entry_')) {
                 var key = input.id.replace('entry_', '');
-                if (key.includes('_date') || key.includes('_hour_12') || key.includes('_minute_12') || key.includes('_ampm')) {
-                    return;
+                if (key.includes('_date') || key.includes('_hour_12') || key.includes('_minute_12') || key.includes('_ampm')) return;
+                var fieldDefinition = globalDynamicFields[key] || {};
+                var valueType = fieldDefinition.data_type || 'string';
+                try {
+                    entryData[key] = convertEntryValueByType(input.value, valueType);
+                } catch (typeError) {
+                    showDialog('Invalid ' + (fieldDefinition['field-title'] || key), typeError.message);
+                    throw typeError;
                 }
-                    entryData[key] = input.value;
             }
         });
         objectContainers.forEach(function(container) {
             var objectKey = container.id.replace('object_', '').replace('_container', '');
             var subInputs = container.querySelectorAll('input, textarea, select');
-            var objectData = {};
-            objectData['_object'] = true;
+            var objectData = { _object: true };
             subInputs.forEach(function(input) {
                 if (input.id && input.id.startsWith('entry_' + objectKey + '_')) {
                     var subKey = input.id.replace('entry_' + objectKey + '_', '');
-                    if (subKey.includes('_date') || subKey.includes('_hour_12') || subKey.includes('_minute_12') || subKey.includes('_ampm')) {
-                        return;
+                    if (subKey.includes('_date') || subKey.includes('_hour_12') || subKey.includes('_minute_12') || subKey.includes('_ampm')) return;
+                    var parentDefinition = globalDynamicFields[objectKey] || {};
+                    var subDefinition = (parentDefinition.fieldkeyvalue || {})[subKey] || {};
+                    try {
+                        objectData[subKey] = convertEntryValueByType(input.value, subDefinition.data_type || 'string');
+                    } catch (typeError) {
+                        showDialog('Invalid ' + (subDefinition['field-title'] || subKey), typeError.message);
+                        throw typeError;
                     }
-                    objectData[subKey] = input.value;
                 }
             });
-            var hasData = Object.keys(objectData).some(function(k) { return k !== '_object' && objectData[k] !== ''; });
-            if (hasData) {
-                entryData[objectKey] = objectData;
-            }
+            var hasObjectData = Object.keys(objectData).some(function(key) {
+                return key !== '_object' && objectData[key] !== '';
+            });
+            if (hasObjectData) entryData[objectKey] = objectData;
         });
-        var hasData = Object.values(entryData).some(function(v) {
-            if (typeof v === 'object') {
-                return Object.values(v).some(function(sv) { return sv !== '' && sv !== '_object'; });
+
+        var hasData = Object.values(entryData).some(function(value) {
+            if (value && typeof value === 'object') {
+                return Object.keys(value).some(function(key) { return key !== '_object' && value[key] !== ''; });
             }
-            return v !== '';
+            return value !== '';
         });
         if (!hasData) {
             showDialog('Error', 'Please enter at least one field value.');
             return;
         }
-        document.getElementById('entryDataInput').value = JSON.stringify(entryData);
-        document.getElementById('addEntryForm').submit();
+
+        var entryDataInput = activeForm.querySelector('.entryDataInput');
+        if (!entryDataInput) {
+            showDialog('Error', 'The selected form is missing its entry data input.');
+            return;
+        }
+        entryDataInput.value = JSON.stringify(entryData);
+        activeForm.submit();
     }
 
     // Legacy renderer retained for compatibility with account-scoped field editor helpers.
@@ -5823,6 +6423,13 @@
                     '<option value="button" ' + (subElement === 'button' ? 'selected' : '') + '>Button</option>' +
                     '</select>' +
                     '</div>' +
+                    '<div class="form-group">' +
+                    '<label>Saved Data Type</label>' +
+                    '<select id="sub_data_type_' + idx + '" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                    '<option value="string" ' + ((sub.data_type || 'string') === 'string' ? 'selected' : '') + '>String</option>' +
+                    '<option value="int" ' + (sub.data_type === 'int' ? 'selected' : '') + '>Integer</option>' +
+                    '<option value="json" ' + (sub.data_type === 'json' ? 'selected' : '') + '>JSON</option>' +
+                    '</select></div>' +
                     '<div class="form-group" id="sub_default_value_container_' + idx + '">' +
                     '<label>Default Value</label>' +
                     '<div id="sub_default_value_input_container_' + idx + '">' +
@@ -5885,6 +6492,14 @@
             '<option value="button" ' + (elementType === 'button' ? 'selected' : '') + '>Button</option>' +
             '<option value="copy_button_for_each_of" ' + (elementType === 'copy_button_for_each_of' ? 'selected' : '') + '>Copy Button For Each Sentence</option>' +
             '</select>' +
+            '</div>' +
+            '<div class="form-group">' +
+            '<label>Saved Data Type</label>' +
+            '<select id="df_data_type" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<option value="string" ' + ((field.data_type || 'string') === 'string' ? 'selected' : '') + '>String (text)</option>' +
+            '<option value="int" ' + (field.data_type === 'int' ? 'selected' : '') + '>Integer (whole number)</option>' +
+            '<option value="json" ' + (field.data_type === 'json' ? 'selected' : '') + '>JSON (object, array, number, boolean or null)</option>' +
+            '</select><small style="color:#6b7280;">JSON must be valid JSON, for example {"script_json":{"characters_prompt":[]}}. Strings are saved as text; integers as numbers.</small>' +
             '</div>' +
             '<div class="form-group" id="df_default_value_container" style="' + ((elementType === 'button' || elementType === 'copy_button_for_each_of') ? 'display:none;' : 'display:block;') + '">' +
             '<label>Default Value</label>' +
@@ -6072,6 +6687,11 @@
             '<option value="copy_button_for_each_of">Copy Button For Each Sentence</option>' +
             '</select>' +
             '</div>' +
+            '<div class="form-group">' +
+            '<label>Saved Data Type</label>' +
+            '<select id="sub_data_type_' + index + '" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<option value="string" selected>String</option><option value="int">Integer</option><option value="json">JSON</option>' +
+            '</select></div>' +
             '<div class="form-group" id="sub_default_value_container_' + index + '">' +
             '<label>Default Value</label>' +
             '<div id="sub_default_value_input_container_' + index + '">' +
@@ -6271,6 +6891,7 @@
                 'field-name': key,
                 'field_type': 'individual',
                 'element_type': elementType,
+                'data_type': (document.getElementById('df_data_type') || {}).value || 'string',
                 'default_value': defaultValue,
                 'default_values': defaultValues,
                 'button_url': buttonUrl,
@@ -6316,6 +6937,7 @@
                             'field-name': sk,
                             'field_type': 'individual',
                             'element_type': se,
+                            'data_type': (document.getElementById('sub_data_type_' + idx) || {}).value || 'string',
                             'default_value': sDefaultValue,
                             'default_values': sdv,
                             'button_url': sButtonUrl
@@ -6479,6 +7101,10 @@
             '<option value="copy_button_for_each_of">Copy Button For Each Sentence</option>' +
             '</select>' +
             '</div>' +
+            '<div class="form-group"><label>Saved Data Type</label>' +
+            '<select id="df_data_type" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<option value="string" selected>String (text)</option><option value="int">Integer (whole number)</option><option value="json">JSON (object, array, number, boolean or null)</option>' +
+            '</select><small style="color:#6b7280;">Choose JSON for structured values. JSON input must be valid JSON.</small></div>' +
             '<div class="form-group" id="df_default_value_container">' +
             '<label>Default Value</label>' +
             '<div id="df_default_value_input_container">' +
@@ -6574,6 +7200,7 @@
                 'field-name': key,
                 'field_type': 'individual',
                 'element_type': elementType,
+                'data_type': (document.getElementById('df_data_type') || {}).value || 'string',
                 'default_value': defaultValue,
                 'default_values': defaultValues,
                 'button_url': buttonUrl,
@@ -6619,6 +7246,7 @@
                             'field-name': sk,
                             'field_type': 'individual',
                             'element_type': se,
+                            'data_type': (document.getElementById('sub_data_type_' + idx) || {}).value || 'string',
                             'default_value': sDefaultValue,
                             'default_values': sdv,
                             'button_url': sButtonUrl
@@ -6743,111 +7371,80 @@
     // ===== COPY BUTTON VISIBILITY BASED ON TAB FEATURES =====
     // ============================================================
 
-    // Function to update copy button visibility based on active tab
+    // Feature flags must be read from the actual active root/child tab.
+    function sceneIQFeatureEnabled(value) {
+        return value === true || value === 1 || value === '1' ||
+            (typeof value === 'string' && ['true', 'yes', 'on', 'enabled'].indexOf(value.trim().toLowerCase()) !== -1);
+    }
+
     function updateCopyButtonsVisibility() {
         var addEntryTab = document.getElementById('user_tab_add_entry');
         if (!addEntryTab) return;
-        
+
         var activeContent = addEntryTab.querySelector('.dynamic-sub-tab-content.active');
-        if (!activeContent) return;
-        
-        // Find the active tab
-        var activeTabBtn = document.querySelector('#user_tab_add_entry .dynamic-sub-tab-btn.active');
-        var tabId = null;
-        if (activeTabBtn) {
-            tabId = activeTabBtn.getAttribute('data-tab');
-            if (!tabId) {
-                var onclickAttr = activeTabBtn.getAttribute('onclick');
-                if (onclickAttr) {
-                    var match = onclickAttr.match(/switchNewProjectSubTab\('([^']+)'/);
-                    if (match) tabId = match[1];
-                }
+        if (!activeContent) {
+            console.debug('[SceneIQ Transcript Detection] Copy-button visibility skipped: no active root tab.');
+            return;
+        }
+
+        var features = (typeof getActiveTabFeatures === 'function')
+            ? getActiveTabFeatures()
+            : { copy_button: false, transcript_detection: false, transcript_with_structured_data_detection: false };
+
+        var copyButtonEnabled = sceneIQFeatureEnabled(features.copy_button);
+        var transcriptEnabled = sceneIQFeatureEnabled(features.transcript_detection);
+        var isConversionTab = false;
+
+        try {
+            var rootMatch = (activeContent.id || '').match(/^newProjectSubTab_tab_(\d+)$/);
+            var rootTab = rootMatch && window.userDynamicTabs ? window.userDynamicTabs[parseInt(rootMatch[1], 10)] : null;
+            var activeChild = activeContent.querySelector('.nested-child-content.active');
+            if (activeChild && rootTab && Array.isArray(rootTab.sub_tabs)) {
+                var wrapper = activeChild.closest('.nested-project-tabs');
+                var children = wrapper ? Array.prototype.slice.call(wrapper.querySelectorAll('.nested-child-content')) : [];
+                var childIndex = children.indexOf(activeChild);
+                var shownChildren = rootTab.sub_tabs.filter(function(child) {
+                    return !Object.prototype.hasOwnProperty.call(child, 'display_tab') || sceneIQFeatureEnabled(child.display_tab);
+                });
+                if (childIndex >= 0 && shownChildren[childIndex]) rootTab = shownChildren[childIndex];
             }
+            var activeTabButton = addEntryTab.querySelector('#newProjectSubTabs .dynamic-sub-tab-btn.active');
+            var tabText = [
+                rootTab && rootTab.tab_name,
+                activeTabButton && activeTabButton.textContent,
+                activeContent.id,
+                activeContent.textContent
+            ].join(' ').toLowerCase();
+            isConversionTab = /convert.*(transcrib|json)|(transcrib|json).*convert|tojson/.test(tabText);
+        } catch (e) {
+            console.warn('[SceneIQ Transcript Detection] Could not resolve active tab name:', e);
         }
-        
-        var tabIndex = -1;
-        if (tabId) {
-            tabIndex = parseInt(tabId.replace('tab_', ''));
-        }
-        
-        // Check if we're on the all_fields tab
-        var allFieldsTab = document.getElementById('newProjectSubTab_all_fields');
-        if (allFieldsTab && allFieldsTab.classList.contains('active')) {
-            // On all_fields tab, show all copy buttons by default
-            activeContent.querySelectorAll('[id^="field_"]_container .btn-secondary, [id^="object_"]_container .btn-secondary').forEach(function(btn) {
-                if (btn.textContent.includes('Copy')) {
-                    btn.style.display = 'inline-block';
-                }
-            });
-            return;
-        }
-        
-        if (isNaN(tabIndex) || tabIndex < 0 || tabIndex >= userDynamicTabs.length) {
-            // Default: show all copy buttons
-            activeContent.querySelectorAll('[id^="field_"]_container .btn-secondary, [id^="object_"]_container .btn-secondary').forEach(function(btn) {
-                if (btn.textContent.includes('Copy')) {
-                    btn.style.display = 'inline-block';
-                }
-            });
-            return;
-        }
-        
-        var tab = userDynamicTabs[tabIndex];
-        if (!tab) {
-            // Default: show all copy buttons
-            activeContent.querySelectorAll('[id^="field_"]_container .btn-secondary, [id^="object_"]_container .btn-secondary').forEach(function(btn) {
-                if (btn.textContent.includes('Copy')) {
-                    btn.style.display = 'inline-block';
-                }
-            });
-            return;
-        }
-        
-        var additionalFeatures = tab.additional_features || {
-            copy_button: false,
-            transcript_detection: false,
-            transcript_with_structured_data_detection: false
-        };
-        
-        var copyButtonEnabled = additionalFeatures.copy_button === true;
-        
-        // Find all copy buttons in the active content
-        var copyButtons = activeContent.querySelectorAll('.btn-secondary');
-        activeContent.querySelectorAll('.individual-sentence-copy-button').forEach(function(btn) {
-            btn.style.display = 'inline-flex';
-        });
-        copyButtons.forEach(function(btn) {
-            // Individual-sentence rows always keep their own Copy button.
-            // The tab-level copy_button feature controls only general field/object copy buttons.
+
+        // The dedicated transcript-to-JSON workflow should not be cluttered by the
+        // unrelated generic "Copy Data" buttons. Its result has its own Copy JSON button.
+        var allowGenericCopy = copyButtonEnabled && !isConversionTab;
+        // Match containers whose IDs start with field_/object_ and end with _container.
+        // Keep the broad .btn-secondary fallback, but use valid CSS selector syntax.
+        var buttons = activeContent.querySelectorAll(
+            '[id^="field_"][id$="_container"] .btn-secondary, [id^="object_"][id$="_container"] .btn-secondary, .btn-secondary'
+        );
+
+        buttons.forEach(function(btn) {
             if (btn.classList.contains('individual-sentence-copy-button')) {
                 btn.style.display = 'inline-flex';
                 return;
             }
-            // Check if this is a copy button (contains copy-related text)
-            var btnText = btn.textContent || '';
-            if (btnText.includes('Copy') || btnText.includes('📋')) {
-                if (copyButtonEnabled) {
-                    btn.style.display = 'inline-block';
-                } else {
-                    btn.style.display = 'none';
-                }
+            var text = (btn.textContent || '').trim();
+            if (/copy/i.test(text) || text.indexOf('📋') !== -1) {
+                btn.style.display = allowGenericCopy ? 'inline-block' : 'none';
             }
         });
-        
-        // Also handle the copy buttons inside field containers
-        activeContent.querySelectorAll('[id^="field_"]_container .btn-secondary, [id^="object_"]_container .btn-secondary').forEach(function(btn) {
-            if (btn.classList.contains('individual-sentence-copy-button')) {
-                btn.style.display = 'inline-flex';
-                return;
-            }
-            var btnText = btn.textContent || '';
-            if (btnText.includes('Copy') || btnText.includes('📋')) {
-                if (copyButtonEnabled) {
-                    btn.style.display = 'inline-block';
-                } else {
-                    btn.style.display = 'none';
-                }
-            }
+
+        console.debug('[SceneIQ Transcript Detection] Copy-button policy', {
+            copy_button_enabled: copyButtonEnabled,
+            transcript_detection_enabled: transcriptEnabled,
+            conversion_tab_detected: isConversionTab,
+            generic_copy_buttons_visible: allowGenericCopy
         });
     }
 
@@ -6920,12 +7517,19 @@
             transcript_with_structured_data_detection: true
         };
 
+        // Database rows may contain JSON booleans, integers, or legacy string values.
+        // Normalize all common enabled representations instead of requiring === true.
+        function featureIsEnabled(value) {
+            return value === true || value === 1 || value === '1' ||
+                   (typeof value === 'string' && ['true', 'yes', 'on', 'enabled'].indexOf(value.trim().toLowerCase()) !== -1);
+        }
+
         function normalizeFeatures(tab) {
             var f = (tab && tab.additional_features) || {};
             return {
-                copy_button: f.copy_button === true,
-                transcript_detection: f.transcript_detection === true,
-                transcript_with_structured_data_detection: f.transcript_with_structured_data_detection === true
+                copy_button: featureIsEnabled(f.copy_button),
+                transcript_detection: featureIsEnabled(f.transcript_detection),
+                transcript_with_structured_data_detection: featureIsEnabled(f.transcript_with_structured_data_detection)
             };
         }
 
@@ -7004,18 +7608,15 @@
         if (!text || typeof text !== 'string') return false;
         
         try {
-            // Check for characters_visual_prompts AND script
-            var hasPrompts = text.match(/"characters_visual_prompts"\s*:\s*\{/);
+            // Structured conversion JSON is identified by its script property.
             var hasScriptArray = text.match(/"script"\s*:\s*\[/);
             var hasScriptObject = text.match(/"script"\s*:\s*\{/);
-            
-            // Return true if we have prompts AND (script array OR script object)
             var hasValidScript = hasScriptArray !== null || hasScriptObject !== null;
-            
-            if (hasPrompts !== null && hasValidScript) {
+
+            if (hasValidScript) {
                 return true;
             }
-            
+
             // Fallback: try to find the JSON object and validate it
             var jsonStart = text.indexOf('{');
             if (jsonStart !== -1) {
@@ -7034,7 +7635,7 @@
                 if (jsonEnd !== -1) {
                     var jsonStr = text.substring(jsonStart, jsonEnd);
                     var parsed = JSON.parse(jsonStr);
-                    if (parsed.characters_visual_prompts && parsed.script) {
+                    if (parsed && parsed.script) {
                         return true;
                     }
                 }
@@ -7046,49 +7647,160 @@
         }
     }
 
-    // Function to detect transcript in element values - FIXED for structured data
+    // Detect transcripts across rendered dynamic-tab fields, including fields inside
+    // inactive tabs. Inactive tab panels are often display:none, so scanning only the
+    // active child panel misses the conversion field entirely.
     function detectTranscripts() {
         var addEntryTab = document.getElementById('user_tab_add_entry');
-        if (!addEntryTab) return;
+        if (!addEntryTab) {
+            console.debug('[SceneIQ Transcript Detection] Not run: #user_tab_add_entry was not found.');
+            return;
+        }
+
+        function tabDetailsForElement(element) {
+            var rootContent = element.closest('.dynamic-sub-tab-content');
+            var rootIndexMatch = rootContent && (rootContent.id || '').match(/^newProjectSubTab_tab_(\d+)$/);
+            var rootIndex = rootIndexMatch ? parseInt(rootIndexMatch[1], 10) : -1;
+            var rootTab = rootIndex >= 0 && Array.isArray(userDynamicTabs) ? userDynamicTabs[rootIndex] : null;
+            var rootName = rootTab ? (rootTab.tab_name || rootTab.name || '') : '';
+            var childContent = element.closest('.nested-child-content');
+            var childName = '';
+            var tabConfig = rootTab;
+
+            if (childContent && rootTab && Array.isArray(rootTab.sub_tabs)) {
+                var wrapper = childContent.closest('.nested-project-tabs');
+                var contents = wrapper ? Array.prototype.slice.call(wrapper.querySelectorAll('.nested-child-content')) : [];
+                var childIndex = contents.indexOf(childContent);
+                var displayedChildren = rootTab.sub_tabs.filter(function(child) {
+                    return !Object.prototype.hasOwnProperty.call(child, 'display_tab') || !!child.display_tab;
+                });
+                if (childIndex >= 0 && displayedChildren[childIndex]) {
+                    tabConfig = displayedChildren[childIndex];
+                    childName = tabConfig.tab_name || tabConfig.name || '';
+                }
+            }
+
+            var f = (tabConfig && tabConfig.additional_features) || {};
+            // Use the shared top-level normalizer here. The similarly named
+            // featureIsEnabled() inside getActiveTabFeatures() is locally scoped
+            // and cannot be called from this function; doing so previously threw
+            // a ReferenceError and aborted the entire transcript scan.
+            var features = {
+                copy_button: sceneIQFeatureEnabled(f.copy_button),
+                transcript_detection: sceneIQFeatureEnabled(f.transcript_detection),
+                transcript_with_structured_data_detection: sceneIQFeatureEnabled(f.transcript_with_structured_data_detection)
+            };
+            var dedicated = /convert.*(transcrib|json)|(transcrib|json).*convert|to\s*json/i.test(rootName + ' ' + childName);
+            return {
+                root_index: rootIndex,
+                root_name: rootName,
+                child_name: childName || null,
+                root_content_id: rootContent ? rootContent.id : null,
+                features: features,
+                dedicated: dedicated
+            };
+        }
 
         var activeRoot = addEntryTab.querySelector('.dynamic-sub-tab-content.active');
-        if (!activeRoot) return;
+        var activeChild = activeRoot ? activeRoot.querySelector('.nested-child-content.active') : null;
+        var activeRootButton = addEntryTab.querySelector('#newProjectSubTabs .dynamic-sub-tab-btn.active');
+        var activeChildButton = activeChild && activeChild.closest('.nested-project-tabs')
+            ? activeChild.closest('.nested-project-tabs').querySelector('.nested-child-btn.active') : null;
 
-        // Only inspect the active nested child when the selected root has child tabs.
-        // For a non-nested root, inspect the root itself.
-        var activeChild = activeRoot.querySelector('.nested-child-content.active');
-        var scanContainer = activeChild || activeRoot;
-        var elements = Array.prototype.slice.call(scanContainer.querySelectorAll('input, textarea, select'))
-            .filter(function(el) {
-                return !!(el.offsetWidth || el.offsetHeight || el.getClientRects().length);
-            });
+        // Scan all configured tab panels, not only the currently active panel. This
+        // also detects text already present in a hidden conversion field before the
+        // user switches to that tab; hidden controls are not excluded from detection.
+        var allElements = Array.prototype.slice.call(addEntryTab.querySelectorAll(
+            'textarea, input, [contenteditable="true"], [contenteditable=""], [role="textbox"], .ql-editor'
+        ));
+        var elements = allElements.filter(function(el) {
+            var type = (el.getAttribute('type') || '').toLowerCase();
+            if (el.tagName === 'INPUT' && ['hidden', 'button', 'submit', 'reset', 'checkbox', 'radio', 'file', 'image'].indexOf(type) !== -1) return false;
+            // Only fields belonging to a configured dynamic root or child are relevant.
+            return !!el.closest('.dynamic-sub-tab-content');
+        });
 
-        var features = getActiveTabFeatures();
-        var transcriptDetectionEnabled = features.transcript_detection === true;
-        var structuredDetectionEnabled = features.transcript_with_structured_data_detection === true;
-        var copyButtonEnabled = features.copy_button === true;
+        var activeRootName = activeRootButton ? (activeRootButton.textContent || '').trim() : '(no active root button)';
+        var activeChildName = activeChildButton ? (activeChildButton.textContent || '').trim() : null;
+        var activeFeatures = (typeof getActiveTabFeatures === 'function') ? getActiveTabFeatures() : {};
+        var report = {
+            event: 'scan',
+            active_root_id: activeRoot ? activeRoot.id : null,
+            active_root_name: activeRootName,
+            active_child_found: !!activeChild,
+            active_child_name: activeChildName,
+            feature_flags: {
+                transcript_detection: sceneIQFeatureEnabled(activeFeatures.transcript_detection),
+                structured_data_detection: sceneIQFeatureEnabled(activeFeatures.transcript_with_structured_data_detection),
+                copy_button: sceneIQFeatureEnabled(activeFeatures.copy_button)
+            },
+            visible_fields_scanned: elements.length,
+            fields_scanned_across_tabs: true,
+            dedicated_conversion_tab: /convert.*(transcrib|json)|(transcrib|json).*convert|to\s*json/i.test(activeRootName + ' ' + (activeChildName || '')),
+            fields: [],
+            timestamped_fields: [],
+            matches: []
+        };
 
         elements.forEach(function(element, elementIndex) {
-            var value = (typeof element.value === 'string' ? element.value : '') ||
-                        element.textContent || '';
+            var value = typeof element.value === 'string' ? element.value : (element.innerText || element.textContent || '');
             var fieldId = element.id || '';
-            if (!fieldId) return;
+            var fieldKey = element.getAttribute('name') || element.getAttribute('data-field-key') || '';
+            var labelEl = element.labels && element.labels.length ? element.labels[0] : null;
+            var labelText = labelEl ? labelEl.textContent.trim() : '';
+            if (!fieldId) {
+                fieldId = 'sceneiq_transcript_field_' + elementIndex;
+                element.id = fieldId;
+            }
 
-            // renderNewProjectForm() is called repeatedly for All Fields, root tabs,
-            // and nested tabs, so the same field ID can exist several times in the DOM.
-            // A global getElementById() then finds the hidden copy and the button appears
-            // in the wrong tab. Use a unique key for this visible element instance.
-            var elementId = fieldId + '__transcript__' +
-                (activeRoot.id || 'active_root') + '__' + elementIndex;
+            var tabDetails = tabDetailsForElement(element);
+            var transcriptEnabled = !!tabDetails.features.transcript_detection;
+            var structuredEnabled = !!tabDetails.features.transcript_with_structured_data_detection;
+            var copyEnabled = !!tabDetails.features.copy_button;
+            var dedicatedConversionTab = !!tabDetails.dedicated;
+            var normalizedValue = value.replace(/[０-９]/g, function(ch) {
+                return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0);
+            });
+            var timestampMatches = normalizedValue.match(/(?:^|[^\d])\(?\s*\d{1,2}:\d{2}(?:\:\d{2})?\s*\)?/gm) || [];
+            var hasTime = timestampMatches.length > 0;
+            var hasStructuredData = typeof detectStructuredCharacterData === 'function' && detectStructuredCharacterData(value);
+            var shouldShowTranscript = (hasTime && transcriptEnabled) ||
+                (hasStructuredData && structuredEnabled) ||
+                (dedicatedConversionTab && transcriptEnabled && value.trim().length > 0);
+            var elementId = fieldId + '__transcript__' + (tabDetails.root_content_id || 'active_root') + '__' + elementIndex;
 
-            var hasTime = /\b\d{1,2}:\d{2}\b/.test(value);
-            var hasStructuredData = detectStructuredCharacterData(value);
+            var fieldReport = {
+                id: fieldId,
+                name: fieldKey,
+                label: labelText,
+                tab_name: tabDetails.root_name,
+                child_tab_name: tabDetails.child_name,
+                root_content_id: tabDetails.root_content_id,
+                element_type: element.tagName.toLowerCase(),
+                characters: value.length,
+                has_timestamp: hasTime,
+                timestamp_matches: timestampMatches.length,
+                has_structured_data: hasStructuredData,
+                enabled_for_transcript_detection: transcriptEnabled,
+                dedicated_conversion_tab: dedicatedConversionTab,
+                should_show_convert_action: shouldShowTranscript,
+                preview: value.slice(0, 180)
+            };
+            report.fields.push(fieldReport);
+            if (hasTime) {
+                report.timestamped_fields.push({
+                    id: fieldId,
+                    tab_name: tabDetails.root_name,
+                    child_tab_name: tabDetails.child_name,
+                    timestamp_matches: timestampMatches.length,
+                    transcript_detection_enabled: transcriptEnabled,
+                    convert_json_button_expected: transcriptEnabled,
+                    preview: value.slice(0, 180)
+                });
+            }
+
             var existingIndicator = document.getElementById('transcript_indicator_' + elementId);
             var existingResult = document.getElementById('transcript_result_' + elementId);
-
-            var shouldShowTranscript = (hasTime && transcriptDetectionEnabled) ||
-                                       (hasStructuredData && structuredDetectionEnabled);
-            var shouldShowStructured = hasStructuredData && structuredDetectionEnabled;
 
             if (!shouldShowTranscript) {
                 if (existingIndicator) existingIndicator.remove();
@@ -7100,50 +7812,88 @@
 
             window._transcriptData = window._transcriptData || {};
             window._conversionResults = window._conversionResults || {};
-            window._transcriptData[elementId] = { value: value, element: element };
+            window._transcriptData[elementId] = { value: value, element: element, features: tabDetails.features, tabDetails: tabDetails };
             if (typeof detectCharacterData === 'function') detectCharacterData();
 
-            // Always refresh the existing indicator. The old implementation only
-            // created it once, leaving stale/missing buttons after feature changes.
             var indicator = existingIndicator;
             if (!indicator) {
                 indicator = document.createElement('div');
                 indicator.id = 'transcript_indicator_' + elementId;
+                indicator.className = 'sceneiq-transcript-detection-indicator';
                 indicator.style.cssText = 'margin-top:8px;padding:8px 12px;background:#d1fae5;border-radius:8px;border-left:4px solid #00695c;display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px;';
                 var container = element.closest('.form-group') || element.closest('.sub-field-group') || element.parentElement;
                 if (container) container.appendChild(indicator);
                 else if (element.parentNode) element.parentNode.insertBefore(indicator, element.nextSibling);
             }
 
-            var label = shouldShowStructured
-                ? '📝 Transcript with Structured Character Data Detected'
-                : '📝 Transcript Detected';
+            var label = hasStructuredData && structuredEnabled
+                ? '📝 Structured JSON Data Detected'
+                : (hasTime ? '📝 Timestamped Transcript Detected (' + timestampMatches.length + ' timestamp matches)' : '📝 Transcript Text Detected');
             var elementIdArg = "'" + elementId.replace(/\\/g, "\\\\").replace(/'/g, "\\'") + "'";
             var buttonsHtml = '<div style="display:flex;gap:8px;flex-wrap:wrap;">';
 
-            if (shouldShowStructured) {
-                buttonsHtml += '<button type="button" class="btn btn-primary btn-sm" onclick="convertToText(' +
+            if (transcriptEnabled && value.trim().length > 0 && (hasTime || dedicatedConversionTab)) {
+                buttonsHtml += '<button type="button" class="btn btn-success btn-sm sceneiq-convert-json-button" onclick="convertAndDisplayInline(' +
                     elementIdArg +
-                    ')" style="padding:4px 12px;font-size:12px;background:#7c3aed;color:white;">📄 Convert to Text</button>';
-            } else {
-                buttonsHtml += '<button type="button" class="btn btn-success btn-sm" onclick="convertAndDisplayInline(' +
-                    elementIdArg +
-                    ')" style="padding:4px 12px;font-size:12px;">🔄 Convert to JSON</button>';
+                    ')" style="padding:5px 12px;font-size:12px;">🔄 Convert to JSON</button>';
                 buttonsHtml += '<button type="button" class="btn btn-primary btn-sm" onclick="openTranscriptDialog(' +
                     elementIdArg +
-                    ')" style="padding:4px 12px;font-size:12px;">View</button>';
+                    ')" style="padding:5px 12px;font-size:12px;">View Transcript</button>';
+            } else if (hasStructuredData && structuredEnabled) {
+                buttonsHtml += '<button type="button" class="btn btn-primary btn-sm" onclick="convertToText(' +
+                    elementIdArg +
+                    ')" style="padding:5px 12px;font-size:12px;">📄 Convert to Text</button>';
             }
-
-            if (copyButtonEnabled) {
+            if (copyEnabled && !dedicatedConversionTab) {
                 buttonsHtml += '<button type="button" class="btn btn-secondary btn-sm" onclick="copyTranscriptValue(' +
                     elementIdArg +
-                    ')" style="padding:4px 12px;font-size:12px;">📋 Copy</button>';
+                    ')" style="padding:5px 12px;font-size:12px;">📋 Copy Transcript</button>';
             }
             buttonsHtml += '</div>';
-
-            indicator.innerHTML = '<span style="color:#065f46;font-weight:500;">' + label + '</span>' + buttonsHtml;
+            indicator.innerHTML = '<span style="color:#065f46;font-weight:600;">' + label + '</span>' + buttonsHtml;
             indicator.style.display = 'flex';
+
+            report.matches.push({
+                id: fieldId,
+                detection_key: elementId,
+                tab_name: tabDetails.root_name,
+                child_tab_name: tabDetails.child_name,
+                timestamp_matches: timestampMatches.length,
+                label: labelText,
+                preview: value.slice(0, 180)
+            });
         });
+
+        var signature = JSON.stringify({
+            root: report.active_root_id,
+            rootName: report.active_root_name,
+            fields: report.fields.map(function(f) {
+                return [f.id, f.tab_name, f.child_tab_name, f.characters, f.has_timestamp, f.timestamp_matches, f.should_show_convert_action];
+            }),
+            matches: report.matches.map(function(m) { return [m.id, m.timestamp_matches, m.tab_name]; })
+        });
+
+        window._sceneIQTranscriptLastScan = report;
+        if (window._sceneIQLastTranscriptDebugSignature !== signature) {
+            window._sceneIQLastTranscriptDebugSignature = signature;
+            console.groupCollapsed('%c[SceneIQ Transcript Detection] Scan report', 'color:#00695c;font-weight:bold;');
+            console.info('ACTIVE TAB / FEATURE STATUS', {
+                root_tab: report.active_root_name,
+                child_tab: report.active_child_name,
+                active_feature_flags: report.feature_flags,
+                configured_fields_scanned_across_tabs: report.visible_fields_scanned
+            });
+            console.log('Copyable debug report:');
+            console.log(JSON.stringify(report, null, 2));
+            console.table(report.fields);
+            if (report.matches.length) {
+                console.info('TRANSCRIPT ACTIONS ADDED:', report.matches.length, 'matching field(s).');
+                console.table(report.matches);
+            } else {
+                console.warn('NO CONVERSION BUTTONS ADDED. Check fields[].preview, tab_name, enabled_for_transcript_detection, and should_show_convert_action.');
+            }
+            console.groupEnd();
+        }
     }
 
     // Helper function to copy transcript value
@@ -7390,14 +8140,16 @@
 
     // Function to open transcript dialog
     function openTranscriptDialog(elementId) {
-        // Check if transcript detection is enabled for this tab
-        var features = getActiveTabFeatures();
-        if (features.transcript_detection !== true) {
-            showDialog('Info', 'Transcript detection is not enabled for this tab.');
+        // Validate against the tab that owns this transcript field, not whichever
+        // tab happens to be active when the dialog is opened.
+        var data = window._transcriptData && window._transcriptData[elementId];
+        var features = data && data.features ? data.features : getActiveTabFeatures();
+        if (!sceneIQFeatureEnabled(features.transcript_detection)) {
+            console.warn('[SceneIQ Transcript Detection] Convert to JSON blocked: transcript_detection is disabled for the active tab.', features);
+            showDialog('Info', 'Transcript detection is not enabled for this tab. Enable it in the server-side tab configuration and save.');
             return;
         }
         
-        var data = window._transcriptData[elementId];
         if (!data) {
             showDialog('Error', 'Transcript data not found.');
             return;
@@ -7430,7 +8182,7 @@
     function convertToText(elementId) {
         // Check if structured data detection is enabled for this tab
         var features = getActiveTabFeatures();
-        if (features.transcript_with_structured_data_detection !== true) {
+        if (!(features.transcript_with_structured_data_detection === true || features.transcript_with_structured_data_detection === 1)) {
             showDialog('Info', 'Structured data detection is not enabled for this tab.');
             return;
         }
@@ -7507,6 +8259,11 @@
                 }
                 
             } catch (error) {
+                console.error('[SceneIQ Transcript Detection] CONVERSION FAILED', {
+                    element_id: elementId,
+                    message: error && error.message ? error.message : String(error),
+                    stack: error && error.stack ? error.stack : ''
+                });
                 // Reset button
                 var indicatorEl2 = document.getElementById('transcript_indicator_' + elementId);
                 if (indicatorEl2) {
@@ -7541,7 +8298,7 @@
         copyToClipboard(result.text);
     }
 
-    // Find characters mentioned in a text (scene_pov_prompt or dialogue)
+    // Find characters mentioned in a text (scene_Image_generation or dialogue)
     function findMentionedCharacters(text, characterPrompts) {
         var mentioned = [];
         if (!text || !characterPrompts) return mentioned;
@@ -7605,8 +8362,8 @@
             throw new Error('Failed to parse structured JSON data: ' + e.message);
         }
         
-        if (!parsedData || !parsedData.characters_visual_prompts || !parsedData.script) {
-            throw new Error('Invalid structured data: missing characters_visual_prompts or script');
+        if (!parsedData || !parsedData.script) {
+            throw new Error('Invalid structured data: missing script');
         }
         
         var scriptEntries = [];
@@ -7631,17 +8388,17 @@
             throw new Error('No script entries found');
         }
         
-        // Process all entries WITHOUT distributing characters to view_focus_characters
+        // Process all entries WITHOUT distributing characters to characters_reference
         var updatedScriptEntries = [];
-        var charPrompts = parsedData.characters_visual_prompts || {};
+        var charPrompts = {};
         
         for (var idx = 0; idx < scriptEntries.length; idx++) {
             var entry = scriptEntries[idx];
             
-            // Extract view_focus_characters - if it exists, use it, otherwise extract from view_focus
+            // Extract characters_reference - if it exists, use it, otherwise extract from view_focus
             var viewFocusChars = '';
-            if (entry.view_focus_characters) {
-                viewFocusChars = entry.view_focus_characters;
+            if (entry.characters_reference) {
+                viewFocusChars = entry.characters_reference;
             } else if (entry.view_focus) {
                 // Try to extract from view_focus
                 viewFocusChars = entry.view_focus;
@@ -7660,8 +8417,8 @@
                 });
             }
             
-            // Also check for characters in scene_pov_prompt and dialogue
-            var scenePov = entry.scene_pov_prompt || entry.Scene_Pov_promt || '';
+            // Also check for characters in scene_Image_generation and dialogue
+            var scenePov = entry.scene_Image_generation || entry.scene_Image_generation || '';
             var dialogue = entry.dialogue || '';
             var allText = scenePov + ' ' + dialogue;
             
@@ -7676,14 +8433,19 @@
                 }
             });
             
-            // Create updated entry WITHOUT view_focus_characters distribution
+            // Create updated entry WITHOUT characters_reference distribution
             var updatedEntry = {
                 start: entry.start || '',
                 stop: entry.stop || '',
                 duration: entry.duration || '',
-                view_focus_characters: '', // Always empty - no distribution
+                characters_reference: {
+        "reference_required": "",
+        "reference_assets": "repeat the detail here don't just mention by tag but detail must be completely here",
+        "protagonist_stage": "",
+        "appearance_at_this_point": ""
+      }, // Always empty - no distribution
                 dialogue: entry.dialogue || '',
-                Scene_Pov_promt: entry.scene_pov_prompt || entry.Scene_Pov_promt || '',
+                scene_Image_generation: entry.scene_Image_generation || entry.scene_Image_generation || '',
                 // Store character names for details display
                 _characters: allCharNames
             };
@@ -7732,7 +8494,7 @@
                 }
                 
                 textOutput += 'Dialogue: ' + (entry.dialogue || '') + '\n';
-                textOutput += 'Scene Pov Promt: ' + (entry.Scene_Pov_promt || '') + '\n\n';
+                textOutput += 'Scene Pov Promt: ' + (entry.scene_Image_generation || '') + '\n\n';
             }
         }
         
@@ -7746,14 +8508,22 @@
 
     // NEW FUNCTION: Convert and display inline without modal
     function convertAndDisplayInline(elementId) {
-        // Check if transcript detection is enabled for this tab
-        var features = getActiveTabFeatures();
-        if (features.transcript_detection !== true) {
-            showDialog('Info', 'Transcript detection is not enabled for this tab.');
+        // Validate against the feature flags captured for this field during scanning.
+        var data = window._transcriptData && window._transcriptData[elementId];
+        var features = data && data.features ? data.features : getActiveTabFeatures();
+        console.info('[SceneIQ Transcript Detection] CONVERT TO JSON CLICKED', {
+            element_id: elementId,
+            owning_tab: data && data.tabDetails ? data.tabDetails.root_name : null,
+            feature_flags: features,
+            transcript_detection_enabled: sceneIQFeatureEnabled(features.transcript_detection),
+            transcript_payload_available: !!data
+        });
+        if (!sceneIQFeatureEnabled(features.transcript_detection)) {
+            console.warn('[SceneIQ Transcript Detection] Convert to JSON blocked: transcript_detection is disabled for the active tab.', features);
+            showDialog('Info', 'Transcript detection is not enabled for this tab. Enable it in the server-side tab configuration and save.');
             return;
         }
         
-        var data = window._transcriptData[elementId];
         if (!data) {
             showDialog('Error', 'Transcript data not found.');
             return;
@@ -8024,7 +8794,7 @@
         return normalized;
     }
 
-    // Main conversion engine - WITHOUT view_focus_characters and WITHOUT remaining_nonfeatured_characters
+    // Main conversion engine - WITHOUT characters_reference and WITHOUT remaining_nonfeatured_characters
     function processTranscriptConversion(transcriptText, characterData) {
         // ===== Extract character data from JSON array at the beginning if not provided =====
         if (!characterData || Object.keys(characterData).length === 0) {
@@ -8058,7 +8828,7 @@
             throw new Error('No timestamps found in transcript');
         }
         
-        // ===== Build script entries WITHOUT view_focus_characters =====
+        // ===== Build script entries WITHOUT characters_reference =====
         var scriptLines = [];
         
         // Include every timestamp, including the final timestamp. Preserve all trailing text.
@@ -8075,9 +8845,14 @@
                     start: current.time_str,
                     stop: nextMatch ? nextMatch.time_str : 'the end',
                     duration: nextMatch ? (nextMatch.time_seconds - current.time_seconds) + ' seconds' : 'until the end',
-                    view_focus_characters: '',
+                    characters_reference: {
+        "reference_required": "",
+        "reference_assets": "repeat the detail here don't just mention by tag but detail must be completely here",
+        "protagonist_stage": "",
+        "appearance_at_this_point": ""
+      },
                     dialogue: dialogueText,
-                    Scene_Pov_promt: ''
+                    scene_Image_generation: ''
                 };
                 scriptLines.push(scriptEntry);
             }
@@ -8087,27 +8862,10 @@
             throw new Error('No dialogue entries could be parsed');
         }
         
-        // ===== Create the JSON structure with ONLY characters_visual_prompts and script =====
-        var jsonData = {};
-        
-        // Add characters_visual_prompts if character data exists
-        if (characterData && Object.keys(characterData).length > 0) {
-            var charactersVisualPrompts = {};
-            for (var charName in characterData) {
-                var charInfo = characterData[charName];
-                charactersVisualPrompts[charName] = {
-                    relation: charInfo.relation || '',
-                    character_details: charInfo.character_details || '',
-                    character_visual_prompt: charInfo.prompt || ''
-                };
-            }
-            jsonData.characters_visual_prompts = charactersVisualPrompts;
-        } else {
-            jsonData.characters_visual_prompts = {};
-        }
-        
-        // Add script (NO remaining_nonfeatured_characters)
-        jsonData.script = scriptLines;
+        // ===== Create JSON structure containing ONLY the script =====
+        var jsonData = {
+            script: scriptLines
+        };
         
         return {
             script: scriptLines,
@@ -8250,12 +9008,13 @@
     // Extract only the transcript part (remove JSON)
     function extractTranscriptOnly(transcriptText) {
         // Find where the transcript starts - look for the first timestamp
-        var timestampPattern = /\(\d{1,2}:\d{2}\)/;
+        var timestampPattern = /(?:^|[^\d])(\d{1,2}:\d{2})(?!\d)/m;
         var firstTimestamp = timestampPattern.exec(transcriptText);
         
         if (firstTimestamp) {
-            // Start from the first timestamp
-            return transcriptText.substring(firstTimestamp.index);
+            // Start at the timestamp itself (the match may include a leading delimiter).
+            var timestampOffset = firstTimestamp.index + (firstTimestamp[0].length - firstTimestamp[1].length);
+            return transcriptText.substring(timestampOffset);
         }
         
         return transcriptText;
@@ -8313,10 +9072,39 @@
         }, 1800);
     }
 
+    // When copied content is a single parent wrapper such as
+    // { "keynametitlevalue": { ... } }, copy only the inner JSON value.
+    // Leave normal objects, arrays, plain text, and comma-separated records unchanged.
+    function removeSingleJsonParentWrapper(text) {
+        if (typeof text !== 'string') return text;
+        var trimmed = text.trim();
+        if (!trimmed || trimmed.charAt(0) !== '{' || trimmed.charAt(trimmed.length - 1) !== '}') {
+            return text;
+        }
+
+        try {
+            var parsed = JSON.parse(trimmed);
+            if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') return text;
+
+            var keys = Object.keys(parsed);
+            if (keys.length !== 1) return text;
+
+            var innerValue = parsed[keys[0]];
+            // Only unwrap a parent key whose value is itself an object/array.
+            if (innerValue && typeof innerValue === 'object') {
+                return JSON.stringify(innerValue, null, 2);
+            }
+        } catch (e) {
+            // Not a complete JSON object; preserve the original clipboard text.
+        }
+        return text;
+    }
+
     function copyToClipboard(text, button) {
         // Empty strings are valid values too; do not silently skip copying
         // when the current field has intentionally been cleared.
         var textToCopy = typeof text === 'string' ? text : String(text == null ? '' : text);
+        textToCopy = removeSingleJsonParentWrapper(textToCopy);
         if (!button) {
             var active = document.activeElement;
             if (active && active.tagName === 'BUTTON' && /copy/i.test(active.textContent || '')) button = active;
@@ -8346,12 +9134,90 @@
         if (copied) setCopyButtonFeedback(button);
     }
 
+    // Report every configured root and child tab at page load, not just the
+    // currently active tab. This lets us verify the saved feature flags before
+    // testing transcript detection in any particular tab.
+    function logConfiguredTranscriptTabs() {
+        var tabs = (typeof userDynamicTabs !== 'undefined' && Array.isArray(userDynamicTabs))
+            ? userDynamicTabs
+            : (Array.isArray(window.userDynamicTabs) ? window.userDynamicTabs : []);
+
+        function enabled(value) {
+            return value === true || value === 1 || value === '1' ||
+                (typeof value === 'string' && ['true', 'yes', 'on', 'enabled'].indexOf(value.trim().toLowerCase()) !== -1);
+        }
+
+        function featureSummary(tab) {
+            var features = (tab && tab.additional_features) || {};
+            return {
+                transcript_detection: enabled(features.transcript_detection),
+                structured_data_detection: enabled(features.transcript_with_structured_data_detection),
+                copy_button: enabled(features.copy_button)
+            };
+        }
+
+        var rows = [];
+        tabs.forEach(function(root, rootIndex) {
+            var rootName = root.tab_name || root.name || ('Root tab ' + (rootIndex + 1));
+            var rootFeatures = featureSummary(root);
+            rows.push({
+                level: 'root',
+                root_index: rootIndex,
+                child_index: null,
+                tab_name: rootName,
+                visible: !Object.prototype.hasOwnProperty.call(root, 'display_tab') || !!root.display_tab,
+                transcript_detection: rootFeatures.transcript_detection,
+                structured_data_detection: rootFeatures.structured_data_detection,
+                copy_button: rootFeatures.copy_button
+            });
+
+            (Array.isArray(root.sub_tabs) ? root.sub_tabs : []).forEach(function(child, childIndex) {
+                var childFeatures = featureSummary(child);
+                rows.push({
+                    level: 'child',
+                    root_index: rootIndex,
+                    child_index: childIndex,
+                    root_tab_name: rootName,
+                    tab_name: child.tab_name || child.name || ('Child tab ' + (childIndex + 1)),
+                    visible: !Object.prototype.hasOwnProperty.call(child, 'display_tab') || !!child.display_tab,
+                    transcript_detection: childFeatures.transcript_detection,
+                    structured_data_detection: childFeatures.structured_data_detection,
+                    copy_button: childFeatures.copy_button
+                });
+            });
+        });
+
+        var enabledRows = rows.filter(function(row) {
+            return row.transcript_detection || row.structured_data_detection;
+        });
+
+        console.group('[SceneIQ Transcript Detection] CONFIGURED DYNAMIC TABS — PAGE LOAD');
+        console.info('Dynamic root tabs found:', tabs.length);
+        console.info('Total root and child tabs inspected:', rows.length);
+        console.info('Tabs with transcript or structured-data detection enabled:', enabledRows.length);
+
+        if (rows.length) {
+            console.table(rows);
+        } else {
+            console.warn('No dynamic tab configuration was available in userDynamicTabs when the page-load report ran.');
+        }
+
+        if (enabledRows.length) {
+            console.info('ENABLED CONFIGURATION DETAILS:', enabledRows);
+        } else {
+            console.warn('No root or child tab in the loaded userDynamicTabs configuration has transcript detection or structured-data detection enabled. If you checked it in the server configuration, verify it was saved and loaded into this page.');
+        }
+        console.groupEnd();
+
+        return rows;
+    }
+
     // Start transcript detection
     function startTranscriptDetection() {
+        console.info('[SceneIQ Transcript Detection] Engine started. It will report the active tab, feature flags, timestamp detection, and whether conversion buttons were added.');
+        logConfiguredTranscriptTabs();
         detectTranscripts();
-        if (window._transcriptDetectionInterval) {
-            clearInterval(window._transcriptDetectionInterval);
-        }
+        if (window._transcriptDetectionInterval) clearInterval(window._transcriptDetectionInterval);
         window._transcriptDetectionInterval = setInterval(function() {
             detectTranscripts();
         }, 1000);
@@ -8388,6 +9254,13 @@
     document.addEventListener('change', function(event) {
         if (event.target && event.target.matches && event.target.matches('#user_tab_add_entry input, #user_tab_add_entry textarea, #user_tab_add_entry select')) {
             setTimeout(detectTranscripts, 50);
+        }
+    });
+    document.addEventListener('paste', function(event) {
+        if (event.target && event.target.matches && event.target.matches('#user_tab_add_entry input, #user_tab_add_entry textarea')) {
+            // The paste event fires before the browser inserts clipboard text.
+            setTimeout(detectTranscripts, 80);
+            setTimeout(detectTranscripts, 250);
         }
     });
 
@@ -8691,169 +9564,169 @@ body:has(#sceneiqFolderRoot) .folder-nav-root {
 }
 </style>
 <script id="sceneiq-folder-navigation">
-(function(){
-'use strict';
-function initSceneIQFolderNavigation(){
- const header=document.querySelector('.main-header');
- const contentArea=document.querySelector('.content-area');
- const originalTabs=document.querySelector('.user-config-tabs');
- if(!header||!contentArea||!originalTabs||!document.getElementById('user_tab_add_entry')) return;
- if(document.getElementById('sceneiqFolderRoot')) return;
+    (function(){
+    'use strict';
+    function initSceneIQFolderNavigation(){
+    const header=document.querySelector('.main-header');
+    const contentArea=document.querySelector('.content-area');
+    const originalTabs=document.querySelector('.user-config-tabs');
+    if(!header||!contentArea||!originalTabs||!document.getElementById('user_tab_add_entry')) { document.body.classList.remove('sceneiq-folder-pending'); document.body.classList.add('sceneiq-folder-ready'); return; }
+    if(document.getElementById('sceneiqFolderRoot')) return;
 
- const contentIds=['add_entry','pending','completed','aborted','dynamic_tabs','submit_tabs','dynamic_fields'];
- const labels={add_entry:'New Project',pending:'Pending',completed:'Complete',aborted:'Aborted',dynamic_tabs:'Dynamic Tabs',submit_tabs:'Submit Tabs',dynamic_fields:'Dynamic Content'};
- const icons={add_entry:'✦',pending:'◷',completed:'✓',aborted:'×',dynamic_tabs:'▦',submit_tabs:'⇧',dynamic_fields:'▤'};
- const accents={add_entry:['#0f8b80','#e5f7f3'],pending:['#d99416','#fff5dd'],completed:['#169b72','#e4f8ef'],aborted:['#e05252','#fff0f0'],dynamic_tabs:['#6575db','#eef0ff'],submit_tabs:['#9a62c7','#f6edff'],dynamic_fields:['#2686c8','#e9f5ff']};
- const mainHeaderContent=header.innerHTML;
- const scrollBody=document.querySelector('.scroll-body');
- const root=document.createElement('div'); root.id='sceneiqFolderRoot';root.className='folder-nav-root';
- const page=document.createElement('div');page.id='sceneiqFolderPage';page.className='folder-page-content';
- root.appendChild(page);
- contentArea.insertBefore(root,originalTabs);
- const parking=document.createElement('div');parking.id='sceneiqFolderParking';parking.hidden=true;contentArea.appendChild(parking);
- originalTabs.style.display='none';
- contentIds.forEach(id=>{const el=document.getElementById('user_tab_'+id);if(el){el.classList.remove('active');el.style.display='none';parking.appendChild(el);}});
- function clearPage(){
-   contentIds.forEach(id=>{
-     const node=document.getElementById('user_tab_'+id);
-     if(node && node.parentNode!==parking){node.classList.remove('active');node.style.display='none';parking.appendChild(node);}
-   });
-   page.innerHTML='';
- }
- // Ensure only the selected account's own content is presented in this view.
- const flashNodes=scrollBody?Array.from(scrollBody.querySelectorAll('.notification')):[];
- flashNodes.forEach(n=>n.style.display='none');
+    const contentIds=['add_entry','pending','completed','aborted','dynamic_tabs','submit_tabs','dynamic_fields'];
+    const labels={add_entry:'New Project',pending:'Pending',completed:'Complete',aborted:'Aborted',dynamic_tabs:'Dynamic Tabs',submit_tabs:'Submit Tabs',dynamic_fields:'Dynamic Content'};
+    const icons={add_entry:'✦',pending:'◷',completed:'✓',aborted:'×',dynamic_tabs:'▦',submit_tabs:'⇧',dynamic_fields:'▤'};
+    const accents={add_entry:['#0f8b80','#e5f7f3'],pending:['#d99416','#fff5dd'],completed:['#169b72','#e4f8ef'],aborted:['#e05252','#fff0f0'],dynamic_tabs:['#6575db','#eef0ff'],submit_tabs:['#9a62c7','#f6edff'],dynamic_fields:['#2686c8','#e9f5ff']};
+    const mainHeaderContent=header.innerHTML;
+    const scrollBody=document.querySelector('.scroll-body');
+    const root=document.createElement('div'); root.id='sceneiqFolderRoot';root.className='folder-nav-root';
+    const page=document.createElement('div');page.id='sceneiqFolderPage';page.className='folder-page-content';
+    root.appendChild(page);
+    contentArea.insertBefore(root,originalTabs);
+    const parking=document.createElement('div');parking.id='sceneiqFolderParking';parking.hidden=true;contentArea.appendChild(parking);
+    originalTabs.style.display='none';
+    contentIds.forEach(id=>{const el=document.getElementById('user_tab_'+id);if(el){el.classList.remove('active');el.style.display='none';parking.appendChild(el);}});
+    function clearPage(){
+    contentIds.forEach(id=>{
+        const node=document.getElementById('user_tab_'+id);
+        if(node && node.parentNode!==parking){node.classList.remove('active');node.style.display='none';parking.appendChild(node);}
+    });
+    page.innerHTML='';
+    }
+    // Ensure only the selected account's own content is presented in this view.
+    const flashNodes=scrollBody?Array.from(scrollBody.querySelectorAll('.notification')):[];
+    flashNodes.forEach(n=>n.style.display='none');
 
- let stack=[];
- let currentTitle='';
- let currentRender=null;
- function setHeader(title,rootMode){
-   header.classList.toggle('folder-mode',!rootMode);
-   if(rootMode){header.innerHTML=mainHeaderContent;return;}
-   header.innerHTML='<div class="folder-header-left"><button type="button" class="folder-back-btn" aria-label="Go back" title="Go back">‹</button></div><div class="folder-header-title"></div>';
-   header.querySelector('.folder-header-title').textContent=title;
-   header.querySelector('.folder-back-btn').addEventListener('click',goBack);
- }
- function showCards(title,description,cards,rootMode){
-   currentTitle=title;setHeader(title,rootMode);
-   clearPage();
-   const h=document.createElement('h2');h.className='folder-nav-heading';h.textContent=title;page.appendChild(h);
-   if(description){const p=document.createElement('p');p.className='folder-nav-description';p.textContent=description;page.appendChild(p);}
-   const grid=document.createElement('div');grid.className='folder-card-grid';
-   cards.forEach(c=>{
-     const b=document.createElement('button');b.type='button';b.className='folder-card'+(c.wide?' wide':'');
-     b.style.setProperty('--folder-accent',c.accent||'#0f8b80');b.style.setProperty('--folder-tint',c.tint||'#e5f7f3');
-     b.innerHTML='<div class="folder-card-top"><span class="folder-card-icon" aria-hidden="true"></span><span class="folder-card-arrow" aria-hidden="true">↗</span></div><div class="folder-card-copy"><div class="folder-card-title"></div><div class="folder-card-subtitle"></div></div>';
-     b.querySelector('.folder-card-icon').textContent=c.icon||'▰';
-     b.querySelector('.folder-card-title').textContent=c.title;
-     b.querySelector('.folder-card-subtitle').textContent=c.subtitle||'Open';
-     if(c.count!==undefined){const count=document.createElement('span');count.className='folder-card-count';count.textContent=String(c.count);b.querySelector('.folder-card-top').appendChild(count);}
-     b.addEventListener('click',c.open);grid.appendChild(b);
-   });
-   page.appendChild(grid);
- }
- function navigate(render){if(currentRender)stack.push(currentRender);currentRender=render;render();}
- function goBack(){if(!stack.length)return;currentRender=stack.pop();currentRender();}
- function baseCards(){
-   const cards=contentIds.map(id=>{
-     const pair=accents[id];let subtitle='';
-     if(id==='add_entry')subtitle='Start a new project';
-     if(id==='pending')subtitle='Projects awaiting action';
-     if(id==='completed')subtitle='Finished projects';
-     if(id==='aborted')subtitle='Stopped or cancelled projects';
-     if(id==='dynamic_tabs')subtitle='Organise project steps';
-     if(id==='submit_tabs')subtitle='Choose which tab data is submitted';
-     if(id==='dynamic_fields')subtitle='Manage account fields';
-     return {title:labels[id],subtitle,icon:icons[id],accent:pair[0],tint:pair[1],wide:id==='dynamic_fields',open:()=>openTop(id)};
-   });
-   return cards;
- }
- function rootPage(){stack=[];currentRender=rootPage;showCards('Workspace','Choose a folder to continue. Each view opens on its own, with a back path to the previous location.',baseCards(),true);}
- function openTop(id){
-   if(id==='add_entry'){openNewProjectRoot();return;}
-   const render=()=> {
-     const el=document.getElementById('user_tab_'+id);
-     if(!el)return;
-     // Use existing application renderers so dynamic editors and status lists remain functional.
-     if(typeof switchUserConfigTab==='function')switchUserConfigTab(id,null);
-     showContentPage(labels[id],el,()=>{});
-   };
-   navigate(render);
- }
- function showContentPage(title,el,after){
-   setHeader(title,false);clearPage();
-   const shell=document.createElement('div');shell.className='folder-page-content';page.appendChild(shell);
-   contentIds.forEach(id=>{const node=document.getElementById('user_tab_'+id);if(node){node.classList.remove('active');node.style.display='none';}});
-   el.style.display='block';el.classList.add('active');shell.appendChild(el);
-   after&&after();
- }
- function escapeHtml(s){return String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
- function openNewProjectRoot(){
-   const render=()=>{
-     const buttons=Array.from(document.querySelectorAll('#newProjectSubTabs .dynamic-sub-tab-btn'));
-     const cards=[];
-     buttons.forEach((btn,index)=>{
-       if(btn.offsetParent===null && getComputedStyle(btn).display==='none')return;
-       const tabId=btn.getAttribute('data-tab')||'';
-       const title=(btn.textContent||'').trim()||('Project section '+(index+1));
-       cards.push({title,subtitle:'Open this project section',icon:'▰',accent:'#0f8b80',tint:'#e5f7f3',open:()=>openDynamicTab(tabId,title)});
-     });
-     if(!cards.length){
-       const el=document.getElementById('user_tab_add_entry');
-       showContentPage('New Project',el,()=>{});
-       return;
-     }
-     showCards('New Project','Choose a project section. The global header now shows only your current location and the back button.',cards,false);
-   };
-   navigate(render);
- }
- function openDynamicTab(tabId,title){
-   navigate(()=>{
-     const el=document.getElementById('user_tab_add_entry');
-     showContentPage(title,el,()=>{
-       const nav=document.getElementById('newProjectSubTabs');if(nav)nav.style.display='none';
-       document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
-       const target=document.getElementById('newProjectSubTab_'+tabId);
-       if(!target)return;
-       target.classList.add('folder-active-content');target.style.display='block';
-       const nested=target.querySelector('.nested-project-tabs');
-       if(nested){
-         const childButtons=Array.from(nested.querySelectorAll('.nested-child-btn'));
-         const childContents=Array.from(nested.querySelectorAll('.nested-child-content'));
-         if(childButtons.length){
-           const cards=childButtons.map((btn,i)=>({title:(btn.textContent||'').trim()||('Section '+(i+1)),subtitle:'Open this section',icon:'▰',accent:'#6575db',tint:'#eef0ff',open:()=>openNested(target,nested,btn,i,title)}));
-           showCards(title,'Choose a section within '+title+'.',cards,false);
-           return;
-         }
-       }
-       // If no nested navigation exists, display the selected tab content directly.
-       target.style.display='block';
-       const headerTitle=header.querySelector('.folder-header-title');if(headerTitle)headerTitle.textContent=title;
-     });
-   });
- }
- function openNested(parent,nested,btn,index,parentTitle){
-   navigate(()=>{
-     const children=Array.from(nested.querySelectorAll('.nested-child-content'));
-     const child=children[index];
-     const title=(btn.textContent||'').trim()||'Section';
-     const el=document.getElementById('user_tab_add_entry');
-     showContentPage(title,el,()=>{
-       const nav=document.getElementById('newProjectSubTabs');if(nav)nav.style.display='none';
-       document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
-       parent.classList.add('folder-active-content');parent.style.display='block';
-       nested.querySelectorAll('.dynamic-sub-tabs').forEach(n=>n.style.display='none');
-       children.forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
-       if(child){child.classList.add('folder-active-content');child.style.display='block';}
-       const headerTitle=header.querySelector('.folder-header-title');if(headerTitle)headerTitle.textContent=title;
-     });
-   });
- }
- rootPage();
-}
-if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initSceneIQFolderNavigation,{once:true});
-else initSceneIQFolderNavigation();
-})();
+    let stack=[];
+    let currentTitle='';
+    let currentRender=null;
+    function setHeader(title,rootMode){
+    header.classList.toggle('folder-mode',!rootMode);
+    if(rootMode){header.innerHTML=mainHeaderContent;return;}
+    header.innerHTML='<div class="folder-header-left"><button type="button" class="folder-back-btn" aria-label="Go back" title="Go back">‹</button></div><div class="folder-header-title"></div>';
+    header.querySelector('.folder-header-title').textContent=title;
+    header.querySelector('.folder-back-btn').addEventListener('click',goBack);
+    }
+    function showCards(title,description,cards,rootMode){
+    currentTitle=title;setHeader(title,rootMode);
+    clearPage();
+    const h=document.createElement('h2');h.className='folder-nav-heading';h.textContent=title;page.appendChild(h);
+    if(description){const p=document.createElement('p');p.className='folder-nav-description';p.textContent=description;page.appendChild(p);}
+    const grid=document.createElement('div');grid.className='folder-card-grid';
+    cards.forEach(c=>{
+        const b=document.createElement('button');b.type='button';b.className='folder-card'+(c.wide?' wide':'');
+        b.style.setProperty('--folder-accent',c.accent||'#0f8b80');b.style.setProperty('--folder-tint',c.tint||'#e5f7f3');
+        b.innerHTML='<div class="folder-card-top"><span class="folder-card-icon" aria-hidden="true"></span><span class="folder-card-arrow" aria-hidden="true">↗</span></div><div class="folder-card-copy"><div class="folder-card-title"></div><div class="folder-card-subtitle"></div></div>';
+        b.querySelector('.folder-card-icon').textContent=c.icon||'▰';
+        b.querySelector('.folder-card-title').textContent=c.title;
+        b.querySelector('.folder-card-subtitle').textContent=c.subtitle||'Open';
+        if(c.count!==undefined){const count=document.createElement('span');count.className='folder-card-count';count.textContent=String(c.count);b.querySelector('.folder-card-top').appendChild(count);}
+        b.addEventListener('click',c.open);grid.appendChild(b);
+    });
+    page.appendChild(grid);
+    }
+    function navigate(render){if(currentRender)stack.push(currentRender);currentRender=render;render();}
+    function goBack(){if(!stack.length)return;currentRender=stack.pop();currentRender();}
+    function baseCards(){
+    const cards=contentIds.map(id=>{
+        const pair=accents[id];let subtitle='';
+        if(id==='add_entry')subtitle='Start a new project';
+        if(id==='pending')subtitle='Projects awaiting action';
+        if(id==='completed')subtitle='Finished projects';
+        if(id==='aborted')subtitle='Stopped or cancelled projects';
+        if(id==='dynamic_tabs')subtitle='Organise project steps';
+        if(id==='submit_tabs')subtitle='Choose which tab data is submitted';
+        if(id==='dynamic_fields')subtitle='Manage account fields';
+        return {title:labels[id],subtitle,icon:icons[id],accent:pair[0],tint:pair[1],wide:id==='dynamic_fields',open:()=>openTop(id)};
+    });
+    return cards;
+    }
+    function rootPage(){stack=[];currentRender=rootPage;showCards('Workspace','Choose a folder to continue. Each view opens on its own, with a back path to the previous location.',baseCards(),true);document.body.classList.remove('sceneiq-folder-pending');document.body.classList.add('sceneiq-folder-ready');}
+    function openTop(id){
+    if(id==='add_entry'){openNewProjectRoot();return;}
+    const render=()=> {
+        const el=document.getElementById('user_tab_'+id);
+        if(!el)return;
+        // Use existing application renderers so dynamic editors and status lists remain functional.
+        if(typeof switchUserConfigTab==='function')switchUserConfigTab(id,null);
+        showContentPage(labels[id],el,()=>{});
+    };
+    navigate(render);
+    }
+    function showContentPage(title,el,after){
+    setHeader(title,false);clearPage();
+    const shell=document.createElement('div');shell.className='folder-page-content';page.appendChild(shell);
+    contentIds.forEach(id=>{const node=document.getElementById('user_tab_'+id);if(node){node.classList.remove('active');node.style.display='none';}});
+    el.style.display='block';el.classList.add('active');shell.appendChild(el);
+    after&&after();
+    }
+    function escapeHtml(s){return String(s).replace(/[&<>"']/g,ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));}
+    function openNewProjectRoot(){
+    const render=()=>{
+        const buttons=Array.from(document.querySelectorAll('#newProjectSubTabs .dynamic-sub-tab-btn'));
+        const cards=[];
+        buttons.forEach((btn,index)=>{
+        if(btn.offsetParent===null && getComputedStyle(btn).display==='none')return;
+        const tabId=btn.getAttribute('data-tab')||'';
+        const title=(btn.textContent||'').trim()||('Project section '+(index+1));
+        cards.push({title,subtitle:'Open this project section',icon:'▰',accent:'#0f8b80',tint:'#e5f7f3',open:()=>openDynamicTab(tabId,title)});
+        });
+        if(!cards.length){
+        const el=document.getElementById('user_tab_add_entry');
+        showContentPage('New Project',el,()=>{});
+        return;
+        }
+        showCards('New Project','Choose a project section. The global header now shows only your current location and the back button.',cards,false);
+    };
+    navigate(render);
+    }
+    function openDynamicTab(tabId,title){
+    navigate(()=>{
+        const el=document.getElementById('user_tab_add_entry');
+        showContentPage(title,el,()=>{
+        const nav=document.getElementById('newProjectSubTabs');if(nav)nav.style.display='none';
+        document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
+        const target=document.getElementById('newProjectSubTab_'+tabId);
+        if(!target)return;
+        target.classList.add('folder-active-content');target.style.display='block';
+        const nested=target.querySelector('.nested-project-tabs');
+        if(nested){
+            const childButtons=Array.from(nested.querySelectorAll('.nested-child-btn'));
+            const childContents=Array.from(nested.querySelectorAll('.nested-child-content'));
+            if(childButtons.length){
+            const cards=childButtons.map((btn,i)=>({title:(btn.textContent||'').trim()||('Section '+(i+1)),subtitle:'Open this section',icon:'▰',accent:'#6575db',tint:'#eef0ff',open:()=>openNested(target,nested,btn,i,title)}));
+            showCards(title,'Choose a section within '+title+'.',cards,false);
+            return;
+            }
+        }
+        // If no nested navigation exists, display the selected tab content directly.
+        target.style.display='block';
+        const headerTitle=header.querySelector('.folder-header-title');if(headerTitle)headerTitle.textContent=title;
+        });
+    });
+    }
+    function openNested(parent,nested,btn,index,parentTitle){
+    navigate(()=>{
+        const children=Array.from(nested.querySelectorAll('.nested-child-content'));
+        const child=children[index];
+        const title=(btn.textContent||'').trim()||'Section';
+        const el=document.getElementById('user_tab_add_entry');
+        showContentPage(title,el,()=>{
+        const nav=document.getElementById('newProjectSubTabs');if(nav)nav.style.display='none';
+        document.querySelectorAll('#user_tab_add_entry .dynamic-sub-tab-content').forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
+        parent.classList.add('folder-active-content');parent.style.display='block';
+        nested.querySelectorAll('.dynamic-sub-tabs').forEach(n=>n.style.display='none');
+        children.forEach(n=>{n.classList.remove('folder-active-content');n.style.display='none';});
+        if(child){child.classList.add('folder-active-content');child.style.display='block';}
+        const headerTitle=header.querySelector('.folder-header-title');if(headerTitle)headerTitle.textContent=title;
+        });
+    });
+    }
+    rootPage();
+    }
+    if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initSceneIQFolderNavigation,{once:true});
+    else initSceneIQFolderNavigation();
+    })();
 </script>
 
 </body>
