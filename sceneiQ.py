@@ -3575,13 +3575,13 @@ def generate_google_flow_images():
         print(f"❌ [FALLBACK] {image_name} not found in any variant within {timeout_seconds} seconds")
         return None, None
 
-    def wait_for_image_indefinitely(image_name, confidence=0.8, region=None):
-        print(f"🔍 [FALLBACK] Waiting indefinitely for {image_name}...")
+    def wait_for_image_indefinitely(image_name, confidence=0.8, region=None, timeout_seconds=300):
+        print(f"🔍 [FALLBACK] Waiting for {image_name} (timeout: {timeout_seconds}s)...")
         start_time = time.time()
         last_status_time = 0
         last_variant_count = -1
         warning_shown = False
-        while True:
+        while time.time() - start_time < timeout_seconds:
             check_for_termination()
             variants = get_image_variants(image_name)
             if len(variants) != last_variant_count:
@@ -3621,6 +3621,9 @@ def generate_google_flow_images():
                     pass
                 last_status_time = current_time
             time.sleep(0.3)
+        elapsed = int(time.time() - start_time)
+        print(f"⏰ [FALLBACK] Timed out waiting for {image_name} after {elapsed}s.")
+        return None
 
     def find_image_at_location(image_name, target_x, target_y, tolerance=20, confidence=0.7):
         variants = get_image_variants(image_name)
@@ -3862,7 +3865,7 @@ def generate_google_flow_images():
         except Exception:
             pass
         update_operation_status("Waiting for new project button...")
-        location = wait_for_image_indefinitely("new_project.png", confidence=0.8)
+        location = wait_for_image_indefinitely("new_project.png", confidence=0.8, timeout_seconds=timeout_seconds)
         if location:
             print(f"✅ [GF] Found new_project.png, clicking...")
             pyautogui.moveTo(location.x, location.y, duration=0.1)
@@ -3884,7 +3887,7 @@ def generate_google_flow_images():
         except Exception:
             pass
         update_operation_status("Waiting for page to load (gfmedia)...")
-        location = wait_for_image_indefinitely("gfmedia.png", confidence=0.8)
+        location = wait_for_image_indefinitely("gfmedia.png", confidence=0.8, timeout_seconds=timeout_seconds)
         if location:
             print(f"✅ [GF] Found gfmedia.png - page loaded successfully!")
             try:
@@ -4057,7 +4060,7 @@ def generate_google_flow_images():
 
     def confirm_sendgf_and_wait_for_generating(hwnd, entry_name, entry_json=None,
                                                send_x=None, send_y=None,
-                                               max_confirm_seconds=60, check_interval=0.4):
+                                               max_confirm_seconds=30, check_interval=0.4):
         """
         CONFIRMATION RULE:
         - First try gfpromptsent.png and its numbered variants.
@@ -4272,7 +4275,8 @@ def generate_google_flow_images():
         render_seen_time = time.time()
         last_status_time = render_seen_time
 
-        while True:
+        monitor_start = time.time()
+        while time.time() - monitor_start < max_wait_seconds:
             check_for_termination()
             enforce_window_focus(hwnd)
             if check_for_tryagain_and_abort():
@@ -4304,6 +4308,9 @@ def generate_google_flow_images():
                 update_operation_status("Google Flow image generation in progress... ")
                 last_status_time = current_time
             time.sleep(check_interval)
+
+        print(f"⏰ [GF-FASTPATH] Timed out monitoring rendering for {entry_name} after {max_wait_seconds}s.")
+        return False
 
     def wait_for_generation_complete_gf(hwnd, entry_name, max_wait_seconds=300, check_interval=0.5):
         print(f"⏳ [GF] Waiting for generation to complete...")
@@ -4546,8 +4553,28 @@ def generate_google_flow_images():
                                     print(f"⏳ [DOWNLOAD] Found temp download: {file_name}")
                             if download_detected:
                                 break
+                # A completed background download takes priority. Once a new
+                # image file is detected, stop checking the on-screen upscaling
+                # indicator and proceed to file-stability/rename handling.
                 if download_detected and downloaded_file_path:
                     break
+
+                # Visual fallback/progress signal: if this indicator remains
+                # visible, Flow is still upscaling/processing the image. Keep
+                # monitoring the background Downloads folder until a file is
+                # actually detected or the same download timeout expires.
+                try:
+                    upscaling_location = find_image("upscalinggfimage.png", confidence=0.7)
+                    if upscaling_location:
+                        print(
+                            f"⏳ [DOWNLOAD] upscalinggfimage.png is visible at "
+                            f"({upscaling_location.x}, {upscaling_location.y}); "
+                            "download/upscaling still appears in progress. "
+                            "Continuing background file monitoring."
+                        )
+                except Exception as visual_error:
+                    print(f"⚠️ [DOWNLOAD] Visual upscaling check failed: {visual_error}")
+
                 if elapsed % 10 == 0 and elapsed > 0:
                     print(f"⏳ [DOWNLOAD] Still waiting for download... ({elapsed}s elapsed)")
                     try:
@@ -5002,7 +5029,7 @@ def generate_google_flow_images():
             confirm_result = confirm_sendgf_and_wait_for_generating(
                 hwnd, entry_name, entry_json,
                 send_x, send_y,
-                max_confirm_seconds=60, check_interval=0.4
+                max_confirm_seconds=30, check_interval=0.4
             )
             if confirm_result == "confirmed":
                 print(f"✅ [SEND-LOOP] Confirmed: prompt truly sent")
@@ -5132,47 +5159,114 @@ def generate_google_flow_images():
             print(f"🪟 [MAIN] Browser ready (HWND: {hwnd})")
             update_operation_status("Browser initialized for Google Flow operation")
 
-            print(f"🔍 [MAIN] Loading Google Flow URL...")
-            try:
-                hud.print("Opening Google Flow...", "navigating")
-            except Exception:
-                pass
-            update_operation_status("Loading Google Flow...")
-            fast_paste_url(hwnd, GOOGLE_FLOW_URL)
-            time.sleep(3)
-            hwnd = ensure_window_ready_and_focused()
+            # Detect the current Google Flow page BEFORE navigating. Check the
+            # furthest-progressed page first so a restart resumes where it is:
+            # prompt input -> media/add-media workspace -> New project home.
+            def detect_current_flow_page():
+                check_for_termination()
+                enforce_window_focus(hwnd)
 
-            print(f"🔍 [MAIN] Waiting for new_project.png...")
-            try:
-                hud.print("Looking for the new project option...", "waiting")
-            except Exception:
-                pass
-            success = wait_for_new_project_and_click(hwnd)
-            if not success:
-                print(f"❌ [MAIN] Failed to find/click new_project.png")
+                prompt_location = find_image("whatdoyouwantocreate.png", confidence=0.8)
+                if prompt_location:
+                    print(
+                        "✅ [RESUME] Prompt input is already visible. "
+                        "Skipping URL navigation and workspace setup."
+                    )
+                    return "prompt"
+
+                media_location = find_image("gfmedia.png", confidence=0.8)
+                if media_location:
+                    print(
+                        "✅ [RESUME] Google Flow media/add-media workspace is already visible. "
+                        "Skipping URL navigation and New project."
+                    )
+                    return "media"
+
+                new_project_location = find_image("new_project.png", confidence=0.8)
+                if new_project_location:
+                    print(
+                        "✅ [RESUME] New project home is already visible. "
+                        "Skipping URL navigation and proceeding to click New project."
+                    )
+                    return "new_project"
+
+                return None
+
+            current_page = detect_current_flow_page()
+
+            # Navigate to the URL only when none of the known workflow pages
+            # is currently visible (for example, a newly launched blank browser).
+            if current_page is None:
+                print(
+                    "🌐 [RESUME] No known Google Flow page detected. "
+                    "Opening GOOGLE_FLOW_URL because the app may be newly launched."
+                )
                 try:
-                    hud.print("Could not start a new project.", "error")
+                    hud.print("Opening Google Flow...", "navigating")
                 except Exception:
                     pass
-                update_operation_status("Failed to find new project button", is_error=True)
-                return
+                update_operation_status("No recognized Google Flow page; loading Google Flow URL...")
+                fast_paste_url(hwnd, GOOGLE_FLOW_URL)
+                time.sleep(3)
+                hwnd = ensure_window_ready_and_focused()
+                current_page = detect_current_flow_page()
 
-            print(f"🔍 [MAIN] Waiting for gfmedia.png to confirm page load...")
-            try:
-                hud.print("Waiting for the workspace to load...", "waiting")
-            except Exception:
-                pass
-            success = wait_for_gfmedia_and_confirm(hwnd)
-            if not success:
-                print(f"❌ [MAIN] Failed to confirm page load (gfmedia.png)")
+            # If the URL opened but the page is still loading, wait for the
+            # New project screen. The helper clicks it when it becomes visible.
+            if current_page is None:
+                print(
+                    "🔍 [RESUME] No known workflow page visible after navigation. "
+                    "Waiting for New project."
+                )
                 try:
-                    hud.print("The workspace did not finish loading.", "error")
+                    hud.print("Looking for the new project option...", "waiting")
                 except Exception:
                     pass
-                update_operation_status("Failed to confirm page load", is_error=True)
-                return
+                success = wait_for_new_project_and_click(hwnd)
+                if not success:
+                    print("❌ [MAIN] Failed to find/click new_project.png")
+                    try:
+                        hud.print("Could not start a new project.", "error")
+                    except Exception:
+                        pass
+                    update_operation_status("Failed to find new project button", is_error=True)
+                    return
+                current_page = "new_project_clicked"
 
-            print(f"✅ [MAIN] Google Flow page loaded successfully")
+            elif current_page == "new_project":
+                # We are already on the home screen, so click it without reloading.
+                print("🖱️ [RESUME] Clicking the already-visible New project button.")
+                success = wait_for_new_project_and_click(hwnd)
+                if not success:
+                    print("❌ [MAIN] Failed to click the visible New project button")
+                    update_operation_status("Failed to click new project button", is_error=True)
+                    return
+                current_page = "new_project_clicked"
+
+            # Only wait for the media workspace if we just clicked New project.
+            # If the media workspace or prompt input was already visible at
+            # startup/restart, continue directly to processing scene entries.
+            if current_page == "new_project_clicked":
+                print("🔍 [MAIN] Waiting for gfmedia.png after clicking New project...")
+                try:
+                    hud.print("Waiting for the workspace to load...", "waiting")
+                except Exception:
+                    pass
+                success = wait_for_gfmedia_and_confirm(hwnd)
+                if not success:
+                    print("❌ [MAIN] Failed to confirm page load (gfmedia.png)")
+                    try:
+                        hud.print("The workspace did not finish loading.", "error")
+                    except Exception:
+                        pass
+                    update_operation_status("Failed to confirm page load", is_error=True)
+                    return
+            elif current_page == "media":
+                print("⏭️ [RESUME] Media workspace already open; continuing to scene processing.")
+            elif current_page == "prompt":
+                print("⏭️ [RESUME] Prompt input already visible; continuing directly to scene processing.")
+
+            print("✅ [MAIN] Google Flow is at a usable workflow stage; starting scene processing.")
             try:
                 hud.print("Everything is ready. Starting now...", "success")
             except Exception:
@@ -6190,8 +6284,16 @@ def main():
     produce_video_from_images_entries()
   
 if __name__ == "__main__":
-   #generate_google_flow_images()
-   produce_video_from_images_entries()
+    print("🚀 Starting Google Flow image generation...", flush=True)
+
+    try:
+        generate_google_flow_images()
+    except BaseException as e:
+        import traceback
+        print(f"❌ Fatal error: {e!r}", flush=True)
+        traceback.print_exc()
+        input("Press Enter to close...")
+
 
    
 
