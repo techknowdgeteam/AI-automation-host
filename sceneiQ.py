@@ -6063,7 +6063,7 @@ def video_producer():
         if not caption:
             return frame_image
         width, height = frame_image.size
-        font_size = max(24, min(64, int(width / 24)))
+        font_size = max(24, min(64, int(width / 35)))
         font = load_font(font_size)
         draw = ImageDraw.Draw(frame_image)
         display_text = caption.upper()
