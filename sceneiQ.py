@@ -5571,7 +5571,7 @@ def generate_google_flow_images():
             pass
         time.sleep(3)
 
-def video_producer_():
+def video_producer():
     """
     Assemble entry_N images into a narrated video with animated captions.
     Caption animation:
@@ -5623,52 +5623,125 @@ def video_producer_():
         print(f"❌ Error reading READY_SCRIPT: {exc}")
         return None
 
-    if isinstance(ready_data, list):
-        queued_projects = ready_data
-    elif isinstance(ready_data, dict) and isinstance(ready_data.get("projects"), list):
-        queued_projects = ready_data["projects"]
-    elif isinstance(ready_data, dict) and isinstance(ready_data.get("project_name"), dict):
-        queued_projects = [ready_data]  # legacy single-project format
-    else:
-        print("❌ READY_SCRIPT must contain a project list or a {'projects': [...]} object")
+    # Discover project records regardless of root shape or wrapper names.
+    # This mirrors generate_google_flow_images() and supports root lists,
+    # {"value": {...}}, {"projects": [...]}, and deeper arbitrary nesting.
+    def _normalise_key(key):
+        return re.sub(r"[^a-z0-9]", "", str(key).lower())
+
+    def _walk_json(node, path=()):
+        yield path, node
+        if isinstance(node, dict):
+            for key, value in node.items():
+                yield from _walk_json(value, path + (key,))
+        elif isinstance(node, list):
+            for index, value in enumerate(node):
+                yield from _walk_json(value, path + (index,))
+
+    def _find_field(node, aliases, require_value=True):
+        wanted = {_normalise_key(alias) for alias in aliases}
+        for _, current in _walk_json(node):
+            if not isinstance(current, dict):
+                continue
+            for key, value in current.items():
+                if _normalise_key(key) in wanted and (
+                    not require_value or value not in (None, "", [], {})
+                ):
+                    return value
         return None
 
-    unique_projects = []
-    seen_titles = set()
-    for candidate in queued_projects:
-        if not isinstance(candidate, dict):
-            continue
-        candidate_info = candidate.get("project_name", {})
-        candidate_title = (
-            candidate_info.get("project_title")
-            if isinstance(candidate_info, dict)
-            else None
-        ) or candidate.get("project_title")
-        if not candidate_title or not str(candidate_title).strip():
-            print("⚠️ [READY-SCRIPT] Skipping project without a title")
-            continue
-        title_key = normalize_project_title(candidate_title).casefold()
-        if title_key in seen_titles:
-            print(f"⏭️ [READY-SCRIPT] Duplicate project title skipped: {candidate_title}")
-            continue
-        seen_titles.add(title_key)
-        unique_projects.append((candidate, str(candidate_title).strip()))
+    def _find_project_title(node):
+        # Prefer explicit title fields; project_name may itself be a wrapper.
+        value = _find_field(node, ("project_title", "projectTitle", "project_name", "projectName"))
+        if isinstance(value, dict):
+            value = _find_field(value, ("project_title", "projectTitle", "title", "name"))
+        if isinstance(value, (str, int, float)) and str(value).strip():
+            return str(value).strip()
+        return None
+
+    def _find_script_data(node):
+        candidates = []
+        for path, current in _walk_json(node):
+            if not path or not isinstance(path[-1], str) or _normalise_key(path[-1]) != "script":
+                continue
+            if isinstance(current, list):
+                score = 0
+                for item in current:
+                    if isinstance(item, dict):
+                        keys = {_normalise_key(k) for k in item}
+                        if keys.intersection({
+                            "sceneimagegeneration", "sceneimageprompt",
+                            "imagegenerationprompt", "imageprompt",
+                            "charactersreference", "characterreference",
+                            "scenepovprompt", "shotnumber", "dialogue",
+                            "narration", "voiceover", "spoken_text"
+                        }):
+                            score += 10
+                        if "entries" in keys:
+                            score += 2
+                candidates.append((score, len(current), current))
+            elif isinstance(current, dict):
+                nested = _find_field(current, ("script",))
+                if isinstance(nested, list):
+                    candidates.append((1, len(nested), nested))
+                else:
+                    candidates.append((0, len(current), current))
+        if candidates:
+            candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            return candidates[0][2]
+        return None
+
+    def _collect_project_records(node):
+        records = []
+        visited = set()
+
+        def visit(current):
+            if isinstance(current, list):
+                for child in current:
+                    visit(child)
+                return
+            if not isinstance(current, dict) or id(current) in visited:
+                return
+            visited.add(id(current))
+            title = _find_project_title(current)
+            script = _find_script_data(current)
+            if title and isinstance(script, (dict, list)) and bool(script):
+                records.append((current, title, script))
+                return
+            # Continue through arbitrary wrappers and nested root records.
+            for child in current.values():
+                if isinstance(child, (dict, list)):
+                    visit(child)
+
+        visit(node)
+        # A wrapper may expose the same project more than once. Deduplicate by
+        # normalized title while preserving the first occurrence.
+        unique = []
+        seen = set()
+        for record, title, script in records:
+            key = normalize_project_title(title).casefold()
+            if key not in seen:
+                seen.add(key)
+                unique.append((record, title, script))
+            else:
+                print(f"⏭️ [READY-SCRIPT] Duplicate project title skipped: {title}")
+        return unique
+
+    unique_projects = _collect_project_records(ready_data)
+    if not unique_projects:
+        print("❌ READY_SCRIPT contains no discoverable project title with a valid script.")
+        return None
 
     panel_data = None
     project_title = None
-    for candidate, candidate_title in unique_projects:
+    selected_script_data = None
+    for candidate, candidate_title, candidate_script_data in unique_projects:
         normalized_candidate_title = normalize_project_title(candidate_title)
         candidate_folder = os.path.join(IMAGES_PATH, normalized_candidate_title)
         candidate_edited_folder = os.path.join(candidate_folder, "edited")
         expected_video = os.path.join(candidate_edited_folder, f"{normalized_candidate_title}.mp4")
         if os.path.isfile(expected_video) and os.path.getsize(expected_video) > 0:
             print(f"⏭️ [READY-SCRIPT] Video already exists; skipping '{candidate_title}': {expected_video}")
-            continue
-        candidate_script = candidate.get("project_name", {})
-        candidate_script_json = candidate_script.get("script_json", {}) if isinstance(candidate_script, dict) else {}
-        candidate_script_data = candidate_script_json.get("script") if isinstance(candidate_script_json, dict) else None
-        if not isinstance(candidate_script_data, (dict, list)):
-            print(f"⚠️ [READY-SCRIPT] Skipping '{candidate_title}': script_json.script is missing or invalid")
             continue
         candidate_images_folder = os.path.join(candidate_folder, "images")
         possible_folders = [candidate_images_folder, candidate_folder]
@@ -5684,6 +5757,7 @@ def video_producer_():
             continue
         panel_data = candidate
         project_title = candidate_title
+        selected_script_data = candidate_script_data
         print(f"🎯 [READY-SCRIPT] Selected next unfinished project: '{project_title}'")
         break
 
@@ -5745,9 +5819,11 @@ def video_producer_():
         Caption text is taken from a narration/dialogue field if one exists.
         No separate JSON file is required.
         """
-        project = data.get("project_name", {})
-        script_json = project.get("script_json", {}) if isinstance(project, dict) else {}
-        script_data = script_json.get("script", {}) if isinstance(script_json, dict) else {}
+        # Use the same structure-independent script discovery as the Google
+        # Flow generator; do not assume project_name/script_json wrapper keys.
+        script_data = selected_script_data
+        if not isinstance(script_data, (dict, list)):
+            script_data = _find_script_data(data)
         if not isinstance(script_data, (dict, list)):
             print(
                 "⚠️ [CAPTIONS] project_name.script_json.script exists but is not "
@@ -5878,7 +5954,7 @@ def video_producer_():
         return result
     entries = get_entries(panel_data)
     if not entries:
-        print("❌ No scene entries found in project_name.script_json.script (new and legacy formats were checked).")
+        print("❌ No scene entries found in the discovered project script (new and legacy formats were checked).")
         return None
     def get_sorted_images(folder_path):
         items = []
@@ -5914,23 +5990,28 @@ def video_producer_():
         print(f"🎵 Found audio: {os.path.basename(audio_file_path)}")
     else:
         print("⚠️ No matching audio found; video will be silent")
+    # Force the finished video and every scene image to a fixed 16:9 frame.
     video_width, video_height = 1920, 1080
-    for item in image_files:
-        try:
-            with Image.open(item["path"]) as im:
-                video_width, video_height = im.size
-            break
-        except Exception:
-            continue
-    video_width = max(2, int(video_width) - int(video_width) % 2)
-    video_height = max(2, int(video_height) - int(video_height) % 2)
-    print(f"📐 Output size: {video_width}x{video_height}")
+    print(f"📐 Output size (forced 16:9): {video_width}x{video_height}")
+
     def fit_image(image, width, height):
+        # Fill the 16:9 frame by center-cropping excess edges, then resize.
+        # This prevents letterboxing and ensures every normalized image is 16:9.
         image = image.convert("RGB")
-        image.thumbnail((width, height), Image.Resampling.LANCZOS)
-        canvas = Image.new("RGB", (width, height), (0, 0, 0))
-        canvas.paste(image, ((width - image.width) // 2, (height - image.height) // 2))
-        return canvas
+        source_width, source_height = image.size
+        target_ratio = width / height
+        source_ratio = source_width / source_height
+
+        if source_ratio > target_ratio:
+            crop_width = int(source_height * target_ratio)
+            left = max(0, (source_width - crop_width) // 2)
+            image = image.crop((left, 0, left + crop_width, source_height))
+        elif source_ratio < target_ratio:
+            crop_height = int(source_width / target_ratio)
+            top = max(0, (source_height - crop_height) // 2)
+            image = image.crop((0, top, source_width, top + crop_height))
+
+        return image.resize((width, height), Image.Resampling.LANCZOS)
     def load_font(size):
         candidates = [
             r"C:\Windows\Fonts\arialbd.ttf",
@@ -6165,7 +6246,6 @@ def video_producer_():
     output_filename = f"{normalized_project_title}.mp4"
     output_path = os.path.join(edited_folder, output_filename)
     try:
-        print(f"🎞️ Building {len(prepared)} animated scene clips...")
         print("🎬 Transitions enabled: alternating crossfade, directional wipe, and slide")
         print("🖥️ Keep-awake request: preventing Windows sleep and display timeout during rendering")
         # Prevent Windows from sleeping or turning off the display during the
@@ -6191,20 +6271,9 @@ def video_producer_():
         transition_types = ("crossfade", "wipe_left", "slide_left", "wipe_right", "crossfade", "slide_right")
         clips = []
         scene_start = 0.0
-        # Show each next scene's image and caption 1 second before its narration
-        # segment begins. The audio track and total video duration remain unchanged:
-        # the first visual scene is shortened by 1 second and the final scene is
-        # extended by 1 second; intermediate scenes keep their original duration.
-        early_display_seconds = 1.0
+        # Each scene uses its full assigned duration. The next scene begins
+        # exactly when the current scene's duration ends; no early time shift.
         visual_durations = [float(item["duration"]) for item in prepared]
-        if len(visual_durations) > 1:
-            # Keep very short first scenes valid while preserving total duration.
-            actual_early_shift = min(
-                early_display_seconds,
-                max(0.0, visual_durations[0] - 0.05),
-            )
-            visual_durations[0] -= actual_early_shift
-            visual_durations[-1] += actual_early_shift
         for scene_index, item in enumerate(prepared):
             base_image = item["image"]
             duration = float(visual_durations[scene_index])
@@ -6300,7 +6369,6 @@ def video_producer_():
                 backup_path = os.path.join(edited_folder, backup_filename)
             os.replace(output_path, backup_path)
             print(f"📦 Preserved previous output as: {backup_path}")
-        print(f"💾 Writing: {output_path}")
         print(f"   Duration: {total_duration:.2f}s | FPS: 24 | Size: {video_width}x{video_height}")
         print("📊 Rendering progress will be shown in this console. No extra window will open.")
         render_started = time.monotonic()
@@ -6384,890 +6452,6 @@ def video_producer_():
         "caption_animation": "typewriter_pop",
     }
 
-    # Continue through READY_SCRIPT in the same invocation. The next call
-    # re-scans the queue, skips this newly-created output, and selects the next
-    # unfinished project. Return the current result if no further project is
-    # eligible; otherwise return the last successful project's result.
-    print("🔎 [READY-SCRIPT] Looking for the next unfinished project...")
-    next_result = video_producer()
-    return next_result if isinstance(next_result, dict) else completed_result
-
-def video_producer():
-    """
-    Assemble entry_N images into a narrated video with animated captions.
-    Caption animation:
-      - Typewriter reveal: characters appear progressively.
-      - Word emphasis: the word currently being revealed is highlighted.
-      - Gentle pop-in: the caption line scales in slightly at the start.
-      - Captions are rendered frame-by-frame over the image, not burned into
-        the source image files.
-    Keeps the original project lookup, script_json timing, audio matching,
-    image normalization, and memory-conscious sequential clip assembly.
-    Requires: PANEL_PATH, IMAGES_PATH, plus Pillow and MoviePy.
-    """
-    import os
-    import re
-    import json
-    import shutil
-    import traceback
-    import time
-    from PIL import Image, ImageDraw, ImageFont
-    import numpy as np
-    # Import from MoviePy's public package namespace. MoviePy 2.x removed
-    # the old \\\\\\\\`moviepy.editor\\\\\\\\` module, so do not fall back to that path.
-    try:
-        from moviepy import VideoClip, AudioFileClip, concatenate_videoclips
-    except ImportError as exc:
-        print(
-            "❌ MoviePy imports failed. Install/upgrade MoviePy with: "
-            "python -m pip install --upgrade moviepy"
-        )
-        print(f"   Import details: {exc}")
-        return None
-    # READY_SCRIPT is the queue. Deduplicate by normalized project title,
-    # then process the first project whose final video does not already exist.
-    # Existing completed videos are skipped; no project is overwritten.
-    if not os.path.exists(READY_SCRIPT):
-        print(f"❌ READY_SCRIPT missing: {READY_SCRIPT}")
-        return None
-    def normalize_project_title(name):
-        normalized = re.sub(r"[^a-zA-Z0-9\s_]", "", str(name or ""))
-        normalized = re.sub(r"\s+", "_", normalized)
-        normalized = re.sub(r"_+", "_", normalized).strip("_")
-        return normalized or "unnamed_project"
-    try:
-        with open(READY_SCRIPT, "r", encoding="utf-8") as file:
-            ready_data = json.load(file)
-    except Exception as exc:
-        print(f"❌ Error reading READY_SCRIPT: {exc}")
-        return None
-    def _walk_nodes(node):
-        """Yield dictionaries recursively, without assuming wrapper/key names."""
-        if isinstance(node, dict):
-            yield node
-            for value in node.values():
-                if isinstance(value, (dict, list)):
-                    yield from _walk_nodes(value)
-        elif isinstance(node, list):
-            for value in node:
-                if isinstance(value, (dict, list)):
-                    yield from _walk_nodes(value)
-
-    def _find_field(node, names):
-        """Find the first non-empty value for any case-insensitive key name."""
-        wanted = {str(name).casefold() for name in names}
-        for item in _walk_nodes(node):
-            for key, value in item.items():
-                if str(key).casefold() in wanted and value is not None:
-                    if isinstance(value, str) and not value.strip():
-                        continue
-                    return value
-        return None
-
-    def _find_script_data(node):
-        """Find script_json.script at any nesting depth, ignoring other prompts."""
-        for item in _walk_nodes(node):
-            for key, value in item.items():
-                if str(key).casefold() == "script_json" and isinstance(value, dict):
-                    for script_key, script_value in value.items():
-                        if str(script_key).casefold() == "script" and isinstance(script_value, (dict, list)):
-                            return script_value
-        # Also support a script_json wrapper whose key casing differs or where
-        # script_json is nested inside another named wrapper.
-        return None
-
-    def _is_project_record(node):
-        if not isinstance(node, dict):
-            return False
-        title = _find_field(node, ("project_title", "project_name"))
-        script_data = _find_script_data(node)
-        return title is not None and isinstance(script_data, (dict, list))
-
-    def _discover_project_records(node):
-        """
-        Locate project records without relying on wrapper names. Prefer the
-        current dictionary when it has its own project metadata; otherwise
-        descend through wrappers such as value, data, or arbitrary key names.
-        """
-        if isinstance(node, dict):
-            direct_keys = {str(key).casefold() for key in node}
-            has_direct_project_marker = bool(
-                direct_keys.intersection(
-                    {"project_title", "engine", "engine_type", "script_json"}
-                )
-            )
-            if _is_project_record(node) and has_direct_project_marker:
-                return [node]
-            discovered = []
-            for value in node.values():
-                if isinstance(value, (dict, list)):
-                    discovered.extend(_discover_project_records(value))
-            if discovered:
-                return discovered
-            if _is_project_record(node):
-                return [node]
-        elif isinstance(node, list):
-            discovered = []
-            for value in node:
-                if isinstance(value, (dict, list)):
-                    discovered.extend(_discover_project_records(value))
-            return discovered
-        return []
-
-    queued_projects = _discover_project_records(ready_data)
-    if not queued_projects and isinstance(ready_data, dict):
-        # Fallback for unusual single-record structures where the script or
-        # title fields are present but incomplete; the normal validation below
-        # will produce a useful skip message.
-        if _find_field(ready_data, ("project_title", "project_name")) is not None:
-            queued_projects = [ready_data]
-
-    if not queued_projects:
-        print("❌ [READY-SCRIPT] No project records found. Each record must contain a project title and script_json.script somewhere inside it.")
-        return None
-
-    unique_projects = []
-    seen_titles = set()
-    for candidate in queued_projects:
-        candidate_title = _find_field(candidate, ("project_title", "project_name"))
-        if isinstance(candidate_title, dict):
-            candidate_title = _find_field(candidate_title, ("project_title", "title", "name"))
-        if not candidate_title or not str(candidate_title).strip():
-            print("⚠️ [READY-SCRIPT] Skipping project without a title")
-            continue
-        title_key = normalize_project_title(candidate_title).casefold()
-        if title_key in seen_titles:
-            print(f"⏭️ [READY-SCRIPT] Duplicate project title skipped: {candidate_title}")
-            continue
-        seen_titles.add(title_key)
-        engine_type = _find_field(candidate, ("engine_type", "engine"))
-        unique_projects.append((candidate, str(candidate_title).strip(), engine_type))
-
-    panel_data = None
-    project_title = None
-    for candidate, candidate_title, candidate_engine_type in unique_projects:
-        normalized_candidate_title = normalize_project_title(candidate_title)
-        candidate_folder = os.path.join(IMAGES_PATH, normalized_candidate_title)
-        candidate_edited_folder = os.path.join(candidate_folder, "edited")
-        expected_video = os.path.join(candidate_edited_folder, f"{normalized_candidate_title}.mp4")
-        if os.path.isfile(expected_video) and os.path.getsize(expected_video) > 0:
-            print(f"⏭️ [READY-SCRIPT] Video already exists; skipping '{candidate_title}': {expected_video}")
-            continue
-        candidate_script_data = _find_script_data(candidate)
-        if not isinstance(candidate_script_data, (dict, list)):
-            print(f"⚠️ [READY-SCRIPT] Skipping '{candidate_title}': script_json.script is missing or invalid")
-            continue
-        print(f"🧩 [READY-SCRIPT] Engine: {candidate_engine_type or 'not specified'}")
-        print(f"🧩 [READY-SCRIPT] Engine: {candidate_engine_type or 'not specified'}")
-        candidate_images_folder = os.path.join(candidate_folder, "images")
-        possible_folders = [candidate_images_folder, candidate_folder]
-        if not any(
-            os.path.isdir(folder) and any(
-                re.match(r"entry[_-]?\d+", name, re.IGNORECASE)
-                and os.path.splitext(name)[1].lower() in (".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")
-                for name in os.listdir(folder)
-            )
-            for folder in possible_folders
-        ):
-            print(f"⏭️ [READY-SCRIPT] No entry images found yet; skipping '{candidate_title}'")
-            continue
-        panel_data = candidate
-        project_title = candidate_title
-        print(f"🎯 [READY-SCRIPT] Selected next unfinished project: '{project_title}'")
-        break
-    if panel_data is None or not project_title:
-        print("✅ [READY-SCRIPT] No unfinished projects remain (or no eligible project has images and script data).")
-        return None
-    normalized_project_title = normalize_project_title(project_title)
-    project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
-    possible_image_folders = [
-        os.path.join(project_folder, "images"),
-        project_folder,
-    ]
-    source_folder = None
-    for folder_path in possible_image_folders:
-        if not os.path.isdir(folder_path):
-            continue
-        try:
-            found = [
-                name for name in os.listdir(folder_path)
-                if name.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"))
-                and re.match(r"entry[_-]?\d+", name, re.IGNORECASE)
-            ]
-            if found:
-                source_folder = folder_path
-                print(f"✅ Found {len(found)} images in: {folder_path}")
-                break
-        except OSError as exc:
-            print(f"⚠️ Could not inspect {folder_path}: {exc}")
-    if not source_folder:
-        print("❌ No entry images found")
-        return None
-    edited_folder = os.path.join(project_folder, "edited")
-    temp_folder = os.path.join(project_folder, "temp_captions")
-    os.makedirs(edited_folder, exist_ok=True)
-    os.makedirs(temp_folder, exist_ok=True)
-    def parse_timestamp_to_seconds(value):
-        if value is None:
-            return 0.0
-        value = str(value).strip()
-        try:
-            parts = value.split(":")
-            if len(parts) == 2:
-                return float(int(parts[0]) * 60 + float(parts[1]))
-            if len(parts) == 3:
-                return float(int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2]))
-        except (ValueError, TypeError):
-            pass
-        return 0.0
-    def get_entries(data):
-        """
-        Find script_json.script dynamically at any nesting depth, regardless
-        of wrapper names or project-record structure. Supports both:
-          1. New scene-by-scene script lists containing fields such as
-             characters_reference and scene_Image_generation.
-          2. Older nested batches containing an "entries" list and
-             scene_pov_prompt.
-        Caption text is taken from a narration/dialogue field if one exists.
-        No separate JSON file is required.
-        """
-        project = data.get("project_name", {})
-        script_json = project.get("script_json", {}) if isinstance(project, dict) else {}
-        script_data = script_json.get("script", {}) if isinstance(script_json, dict) else {}
-        if not isinstance(script_data, (dict, list)):
-            print(
-                "⚠️ [CAPTIONS] project_name.script_json.script exists but is not "
-                f"a dictionary/list (found {type(script_data).__name__})."
-            )
-            return []
-        collected = []
-        seen_ids = set()
-        # These fields identify a scene object without requiring the legacy
-        # scene_pov_prompt field to exist.
-        scene_markers = {
-            "scene_pov_prompt",
-            "scene_Image_generation",
-            "characters_reference",
-            "shot_number",
-            "dialogue",
-            "narration",
-            "voiceover",
-            "voice_over",
-            "spoken_text",
-        }
-        def is_scene_entry(item):
-            return isinstance(item, dict) and bool(scene_markers.intersection(item.keys()))
-        def add_entry(item):
-            if not isinstance(item, dict):
-                return
-            # Deduplicate the same dictionary if encountered through a wrapper.
-            identity = id(item)
-            if identity in seen_ids:
-                return
-            seen_ids.add(identity)
-            collected.append(dict(item))
-        def walk(node):
-            if isinstance(node, list):
-                for child in node:
-                    if is_scene_entry(child):
-                        add_entry(child)
-                    elif isinstance(child, (dict, list)):
-                        walk(child)
-                return
-            if not isinstance(node, dict):
-                return
-            # Legacy batch format: {"entries": [scene, scene, ...]}.
-            entries_list = node.get("entries")
-            if isinstance(entries_list, list):
-                for child in entries_list:
-                    if isinstance(child, dict):
-                        add_entry(child)
-            # New direct scene object, e.g. an item in script: [...].
-            if is_scene_entry(node):
-                add_entry(node)
-                return
-            # Recurse through nested script containers while avoiding a second
-            # pass through an entries list already collected above.
-            for key, value in node.items():
-                if key == "entries":
-                    continue
-                if isinstance(value, (dict, list)):
-                    walk(value)
-        walk(script_data)
-        def first_text(entry, keys):
-            for key in keys:
-                value = entry.get(key)
-                if isinstance(value, str) and value.strip():
-                    return value.strip()
-                if isinstance(value, (int, float)) and not isinstance(value, bool):
-                    return str(value)
-            return ""
-        caption_keys = (
-            "dialogue",
-            "narration",
-            "voiceover",
-            "voice_over",
-            "voice_over_script",
-            "spoken_text",
-            "caption",
-            "subtitle",
-            "text",
-        )
-        result = []
-        running_cursor = 0.0
-        for index, entry in enumerate(collected):
-            # A scene can qualify in the new format without scene_pov_prompt.
-            # Ignore obvious non-scene metadata dictionaries.
-            if not is_scene_entry(entry):
-                continue
-            raw_start = entry.get("start", entry.get("start_time", entry.get("scene_start")))
-            raw_stop = entry.get("stop", entry.get("end", entry.get("stop_time", entry.get("scene_end"))))
-            start = parse_timestamp_to_seconds(raw_start) if raw_start is not None else running_cursor
-            stop = parse_timestamp_to_seconds(raw_stop) if raw_stop is not None else None
-            raw_duration = entry.get("duration", entry.get("duration_seconds", entry.get("scene_duration")))
-            try:
-                explicit_duration = float(raw_duration) if raw_duration is not None else None
-            except (ValueError, TypeError):
-                explicit_duration = None
-            if stop is not None and stop > start:
-                duration = stop - start
-            elif explicit_duration is not None and explicit_duration > 0:
-                duration = explicit_duration
-                stop = start + duration
-            else:
-                # A reasonable fallback when the scene has no timing metadata.
-                duration = 5.0
-                stop = start + duration
-            if duration <= 0:
-                duration = 5.0
-                stop = start + duration
-            item = dict(entry)
-            item["start_seconds"] = start
-            item["stop_seconds"] = stop
-            item["duration_seconds"] = duration
-            item["dialogue"] = first_text(entry, caption_keys)
-            result.append(item)
-            running_cursor = max(running_cursor, stop)
-        # Preserve explicit timing order where present; for entries without
-        # timestamps, the walk order is retained through running_cursor.
-        result.sort(key=lambda item: item.get("start_seconds", 0.0))
-        print(f"📚 [CAPTIONS] Read {len(result)} scene entries from panel.json")
-        if result:
-            caption_count = sum(bool(item.get("dialogue")) for item in result)
-            print(f"📝 [CAPTIONS] {caption_count}/{len(result)} scenes contain caption/narration text")
-            if caption_count == 0:
-                print(
-                    "⚠️ [CAPTIONS] Scene entries were found, but none contains dialogue/narration "
-                    "text. Animated captions need a text field such as dialogue, narration, "
-                    "voiceover, spoken_text, caption, or subtitle."
-                )
-        return result
-    entries = get_entries(panel_data)
-    if not entries:
-        print("❌ No scene entries found in script_json.script at any nesting depth (new and legacy formats were checked).")
-        return None
-    def get_sorted_images(folder_path):
-        items = []
-        for filename in os.listdir(folder_path):
-            match = re.match(r"entry[_-]?(\d+)", filename, re.IGNORECASE)
-            if not match or os.path.splitext(filename)[1].lower() not in {
-                ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"
-            }:
-                continue
-            items.append({
-                "number": int(match.group(1)),
-                "filename": filename,
-                "path": os.path.join(folder_path, filename),
-            })
-        return sorted(items, key=lambda item: item["number"])
-    image_files = get_sorted_images(source_folder)
-    if not image_files:
-        print("❌ No usable entry images found")
-        return None
-    def find_audio_file(title):
-        downloads = os.path.join(os.path.expanduser("~"), "Downloads")
-        if not os.path.isdir(downloads):
-            return None
-        audio_exts = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".flac", ".wma")
-        matches = [
-            os.path.join(downloads, name)
-            for name in os.listdir(downloads)
-            if name.lower().endswith(audio_exts) and title.lower() in name.lower()
-        ]
-        return max(matches, key=os.path.getmtime) if matches else None
-    audio_file_path = find_audio_file(project_title)
-    if audio_file_path:
-        print(f"🎵 Found audio: {os.path.basename(audio_file_path)}")
-    else:
-        print("⚠️ No matching audio found; video will be silent")
-    video_width, video_height = 1920, 1080
-    for item in image_files:
-        try:
-            with Image.open(item["path"]) as im:
-                video_width, video_height = im.size
-            break
-        except Exception:
-            continue
-    video_width = max(2, int(video_width) - int(video_width) % 2)
-    video_height = max(2, int(video_height) - int(video_height) % 2)
-    print(f"📐 Output size: {video_width}x{video_height}")
-    def fit_image(image, width, height):
-        image = image.convert("RGB")
-        image.thumbnail((width, height), Image.Resampling.LANCZOS)
-        canvas = Image.new("RGB", (width, height), (0, 0, 0))
-        canvas.paste(image, ((width - image.width) // 2, (height - image.height) // 2))
-        return canvas
-    def load_font(size):
-        candidates = [
-            r"C:\Window&#x73;**\F**ont&#x73;**\a**rialbd.ttf",
-            r"C:\Window&#x73;**\F**ont&#x73;**\a**rial.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
-        for font_path in candidates:
-            try:
-                return ImageFont.truetype(font_path, size)
-            except Exception:
-                continue
-        return ImageFont.load_default()
-    def wrap_words(draw, text, font, max_width):
-        words = text.split()
-        lines, current = [], ""
-        for word in words:
-            candidate = f"{current} {word}".strip()
-            if draw.textbbox((0, 0), candidate, font=font, stroke_width=2)[2] <= max_width:
-                current = candidate
-            else:
-                if current:
-                    lines.append(current)
-                # Keep exceptionally long words from running off-screen.
-                chunk = ""
-                for char in word:
-                    test = chunk + char
-                    if draw.textbbox((0, 0), test, font=font, stroke_width=2)[2] <= max_width:
-                        chunk = test
-                    else:
-                        if chunk:
-                            lines.append(chunk)
-                        chunk = char
-                current = chunk
-        if current:
-            lines.append(current)
-        return lines
-    def draw_animated_caption(frame_image, caption, local_time, duration):
-        """
-        Render text directly over the image: no caption panel/background.
-        The typewriter starts at a fixed left edge and reveals characters to
-        the right. Text uses a tiny black outline plus a soft black shadow.
-        """
-        caption = re.sub(r"\s+", " ", str(caption or "").strip())
-        # A comma at the very end of a scene caption is a scene-boundary
-        # punctuation artifact; remove only that trailing comma. Commas
-        # inside the sentence remain unchanged.
-        caption = re.sub(r",\s*$", "", caption).rstrip()
-        if not caption:
-            return frame_image
-        width, height = frame_image.size
-        font_size = max(24, min(64, int(width / 24)))
-        font = load_font(font_size)
-        draw = ImageDraw.Draw(frame_image)
-        display_text = caption.upper()
-        max_text_width = int(width * 0.84)
-        full_lines = wrap_words(draw, display_text, font, max_text_width)
-        # Finish typing by 72% of the scene, then hold the complete caption
-        # on screen. This gives every final character time to display before
-        # the next scene replaces it.
-        safe_duration = max(0.001, float(duration))
-        elapsed = max(0.0, float(local_time))
-        typing_duration = max(0.001, safe_duration * 0.72)
-        progress = min(1.0, elapsed / typing_duration)
-        visible_count = min(
-            len(display_text),
-            max(0, int(progress * len(display_text))),
-        )
-        if progress >= 1.0:
-            visible_count = len(display_text)
-        if visible_count <= 0:
-            return frame_image
-        visible_lines = []
-        remaining = visible_count
-        for full_line in full_lines:
-            if remaining <= 0:
-                break
-            take = min(len(full_line), remaining)
-            visible_lines.append(full_line[:take])
-            remaining -= take
-            # Account for the spaces removed by word wrapping.
-            if take == len(full_line) and remaining > 0:
-                remaining = max(0, remaining - 1)
-        line_gap = max(6, int(font_size * 0.20))
-        metrics = []
-        for line in visible_lines[-3:]:
-            bbox = draw.textbbox((0, 0), line or " ", font=font, stroke_width=1)
-            metrics.append((line, bbox[2] - bbox[0], bbox[3] - bbox[1]))
-        if not metrics:
-            return frame_image
-        total_height = sum(row[2] for row in metrics) + line_gap * (len(metrics) - 1)
-        bottom_margin = int(height * 0.075)
-        y = max(4, height - bottom_margin - total_height)
-        # Anchor all lines to the left edge of the FULL caption block. This
-        # anchor does not move as characters appear, so the typewriter grows
-        # only to the right rather than expanding from the center.
-        full_block_width = max(
-            (
-                draw.textbbox((0, 0), line, font=font, stroke_width=1)[2]
-                for line in full_lines[-3:]
-            ),
-            default=1,
-        )
-        x_left = max(10, (width - min(max_text_width, full_block_width)) // 2)
-        for line, line_width, line_height in metrics:
-            if line:
-                # Small soft shadow, then a thin black edge and bright text.
-                shadow_offset = max(2, font_size // 28)
-                draw.text(
-                    (x_left + shadow_offset, y + shadow_offset),
-                    line,
-                    font=font,
-                    fill=(0, 0, 0),
-                    stroke_width=2,
-                    stroke_fill=(0, 0, 0),
-                )
-                draw.text(
-                    (x_left, y),
-                    line,
-                    font=font,
-                    fill=(255, 255, 255),
-                    stroke_width=1,
-                    stroke_fill=(0, 0, 0),
-                )
-            y += line_height + line_gap
-        return frame_image
-    def apply_image_motion(image, local_time, duration, scene_index):
-        """Apply a subtle Ken Burns-style zoom/pan without changing caption layout."""
-        width, height = image.size
-        safe_duration = max(0.001, float(duration))
-        progress = min(1.0, max(0.0, float(local_time) / safe_duration))
-        # Alternate gentle zoom directions and pan directions from scene to scene.
-        zoom = 1.0 + 0.045 * progress
-        crop_width = max(2, int(width / zoom))
-        crop_height = max(2, int(height / zoom))
-        max_x = max(0, width - crop_width)
-        max_y = max(0, height - crop_height)
-        # Ease the motion so it starts and ends smoothly.
-        eased = progress * progress * (3.0 - 2.0 * progress)
-        direction = 1 if scene_index % 2 == 0 else -1
-        x = int((max_x * eased) if direction > 0 else (max_x * (1.0 - eased)))
-        y = int((max_y * eased) if (scene_index // 2) % 2 == 0 else (max_y * (1.0 - eased)))
-        cropped = image.crop((x, y, x + crop_width, y + crop_height))
-        return cropped.resize((width, height), Image.Resampling.LANCZOS)
-    count = min(len(entries), len(image_files))
-    if len(entries) != len(image_files):
-        print(f"⚠️ Entry/image count differs: {len(entries)} entries, {len(image_files)} images; processing {count} pairs")
-    prepared = []
-    for index in range(count):
-        entry = entries[index]
-        image_info = image_files[index]
-        duration = max(0.1, float(entry.get("duration_seconds", 5.0)))
-        try:
-            with Image.open(image_info["path"]) as source:
-                base_image = fit_image(source, video_width, video_height)
-            prepared.append({
-                "number": image_info["number"],
-                "image": base_image,
-                "duration": duration,
-                "caption": entry.get("dialogue", ""),
-                "filename": image_info["filename"],
-            })
-            print(f"🎬 [{index + 1}/{count}] {image_info['filename']} — {duration:.1f}s")
-        except Exception as exc:
-            print(f"⚠️ Skipping unreadable image {image_info['path']}: {exc}")
-    if not prepared:
-        print("❌ No images could be processed")
-        return None
-    audio_duration = None
-    audio_probe = None
-    if audio_file_path:
-        try:
-            audio_probe = AudioFileClip(audio_file_path)
-            audio_duration = float(audio_probe.duration)
-            print(f"🎵 Audio duration: {audio_duration:.2f}s")
-        except Exception as exc:
-            print(f"⚠️ Could not read audio duration: {exc}")
-        finally:
-            if audio_probe is not None:
-                try:
-                    audio_probe.close()
-                except Exception:
-                    pass
-    total_duration = sum(item["duration"] for item in prepared)
-    if audio_duration and audio_duration > 0 and prepared:
-        # Keep the final image visible through the exact end of the narration.
-        # Earlier scenes keep their durations when they fit within the audio.
-        previous_duration = sum(float(item["duration"]) for item in prepared[:-1])
-        original_last_duration = max(0.1, float(prepared[-1]["duration"]))
-        last_available = float(audio_duration) - previous_duration
-        if last_available > 0:
-            # Extend OR shorten only the final image so the video ends with audio.
-            prepared[-1]["duration"] = last_available
-            total_duration = float(audio_duration)
-            change = last_available - original_last_duration
-            if change > 0.01:
-                print(f"🔄 Extended final image by {change:.2f}s to reach audio end")
-            elif change < -0.01:
-                print(f"✂️ Adjusted final image by {change:.2f}s so it ends with audio")
-            else:
-                print("🎯 Final image timing already matches the audio end")
-        else:
-            # If all preceding scenes alone exceed the audio, preserve the final
-            # image and proportionally fit the preceding scenes into the remaining
-            # time rather than cutting off the final image entirely.
-            last_duration = min(original_last_duration, max(0.1, float(audio_duration) * 0.15))
-            available_for_previous = max(0.0, float(audio_duration) - last_duration)
-            if previous_duration > 0 and available_for_previous > 0:
-                scale = available_for_previous / previous_duration
-                for item in prepared[:-1]:
-                    item["duration"] = max(0.01, float(item["duration"]) * scale)
-            elif available_for_previous <= 0:
-                prepared = prepared[-1:]
-                last_duration = float(audio_duration)
-            prepared[-1]["duration"] = last_duration
-            total_duration = sum(float(item["duration"]) for item in prepared)
-            # Remove tiny floating-point discrepancies so the last frame lands
-            # on the audio endpoint.
-            if prepared:
-                prepared[-1]["duration"] = max(
-                    0.01, float(audio_duration) - sum(float(item["duration"]) for item in prepared[:-1])
-                )
-                total_duration = float(audio_duration)
-            print("⚠️ Scene timings exceeded the audio; fitted earlier scenes so the final image remains until audio ends")
-    # Existing outputs are preserved. If the target project filename already
-    # exists, it will be renamed to \\<project>_old_N.mp4 before the new render
-    # is written, where N is one greater than the highest existing old number.
-    clips = []
-    final_clip = None
-    audio_clip = None
-    output_filename = f"{normalized_project_title}.mp4"
-    output_path = os.path.join(edited_folder, output_filename)
-    try:
-        print(f"🎞️ Building {len(prepared)} animated scene clips...")
-        print("🎬 Transitions enabled: alternating crossfade, directional wipe, and slide")
-        print("🖥️ Keep-awake request: preventing Windows sleep and display timeout during rendering")
-        # Prevent Windows from sleeping or turning off the display during the
-        # render. This is reverted in the finally block below.
-        keep_awake_enabled = False
-        try:
-            if os.name == "nt":
-                import ctypes
-                ES_CONTINUOUS = 0x80000000
-                ES_SYSTEM_REQUIRED = 0x00000001
-                ES_DISPLAY_REQUIRED = 0x00000002
-                result = ctypes.windll.kernel32.SetThreadExecutionState(
-                    ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
-                )
-                keep_awake_enabled = bool(result)
-                print("✅ Windows keep-awake request active" if keep_awake_enabled
-                      else "⚠️ Windows keep-awake request could not be confirmed")
-            else:
-                print("ℹ️ Keep-awake control is Windows-specific; continuing normally")
-        except Exception as awake_exc:
-            print(f"⚠️ Could not enable keep-awake: {awake_exc}")
-        transition_duration = 0.45  # seconds per image change
-        transition_types = ("crossfade", "wipe_left", "slide_left", "wipe_right", "crossfade", "slide_right")
-        clips = []
-        scene_start = 0.0
-        # Show each next scene's image and caption 1 second before its narration
-        # segment begins. The audio track and total video duration remain unchanged:
-        # the first visual scene is shortened by 1 second and the final scene is
-        # extended by 1 second; intermediate scenes keep their original duration.
-        early_display_seconds = 1.0
-        visual_durations = [float(item["duration"]) for item in prepared]
-        if len(visual_durations) > 1:
-            # Keep very short first scenes valid while preserving total duration.
-            actual_early_shift = min(
-                early_display_seconds,
-                max(0.0, visual_durations[0] - 0.05),
-            )
-            visual_durations[0] -= actual_early_shift
-            visual_durations[-1] += actual_early_shift
-        for scene_index, item in enumerate(prepared):
-            base_image = item["image"]
-            duration = float(visual_durations[scene_index])
-            caption_duration = float(item["duration"])
-            caption = item["caption"]
-            previous_image = prepared[scene_index - 1]["image"] if scene_index > 0 else None
-            transition_type = transition_types[(scene_index - 1) % len(transition_types)] if scene_index > 0 else "none"
-            active_transition = min(transition_duration, duration * 0.45) if previous_image is not None else 0.0
-            def make_frame(
-                t,
-                base=base_image,
-                text=caption,
-                clip_duration=duration,
-                previous=previous_image,
-                effect=transition_type,
-                trans_duration=active_transition,
-                motion_scene_index=scene_index,
-            ):
-                t = max(0.0, float(t))
-                animated_current = apply_image_motion(base, t, clip_duration, motion_scene_index)
-                current = animated_current.copy()
-                # Mix the previous scene into the beginning of this scene.
-                # Transitions are deterministic so repeated renders are stable.
-                if previous is not None and trans_duration > 0 and t < trans_duration:
-                    progress = min(1.0, max(0.0, t / trans_duration))
-                    old = previous
-                    w, h = current.size
-                    if effect == "crossfade":
-                        current = Image.blend(old, current, progress)
-                    elif effect in ("wipe_left", "wipe_right"):
-                        current = old.copy()
-                        reveal = int(w * progress)
-                        if effect == "wipe_left":
-                            if reveal > 0:
-                                current.paste(animated_current.crop((0, 0, reveal, h)), (0, 0))
-                        else:
-                            if reveal > 0:
-                                current.paste(animated_current.crop((w - reveal, 0, w, h)), (w - reveal, 0))
-                    else:  # slide_left / slide_right
-                        current = Image.new("RGB", (w, h), (0, 0, 0))
-                        offset = int(w * progress)
-                        if effect == "slide_left":
-                            current.paste(old.crop((offset, 0, w, h)), (0, 0))
-                            current.paste(animated_current.crop((0, 0, offset, h)), (w - offset, 0))
-                        else:
-                            current.paste(old.crop((0, 0, w - offset, h)), (offset, 0))
-                            current.paste(animated_current.crop((w - offset, 0, w, h)), (0, 0))
-                rendered = draw_animated_caption(current, text, t, clip_duration)
-                return np.asarray(rendered, dtype=np.uint8)
-            clip = VideoClip(frame_function=make_frame, duration=duration)
-            clips.append(clip)
-            print(
-                f"🎞️ Clip {scene_index + 1}/{len(prepared)} ready: "
-                f"{item.get('filename', 'entry')} | {duration:.2f}s | "
-                f"transition={transition_type}"
-            )
-        final_clip = concatenate_videoclips(clips, method="chain")
-        if audio_file_path and os.path.exists(audio_file_path):
-            audio_clip = AudioFileClip(audio_file_path)
-            if audio_duration and audio_duration > total_duration:
-                try:
-                    audio_clip = audio_clip.subclipped(0, total_duration)
-                except AttributeError:
-                    audio_clip = audio_clip.subclip(0, total_duration)
-            elif audio_duration and audio_duration < total_duration:
-                try:
-                    final_clip = final_clip.subclipped(0, audio_duration)
-                except AttributeError:
-                    final_clip = final_clip.subclip(0, audio_duration)
-                total_duration = audio_duration
-            if hasattr(final_clip, "with_audio"):
-                final_clip = final_clip.with_audio(audio_clip)
-            else:
-                final_clip = final_clip.set_audio(audio_clip)
-        # Preserve the previous project output instead of deleting it.
-        # Continue numbering after the highest existing \\<project>_old_N.mp4.
-        if os.path.isfile(output_path):
-            old_pattern = re.compile(
-                rf"^{re.escape(normalized_project_title)}_old_(\d+)\.mp4$",
-                re.IGNORECASE,
-            )
-            existing_numbers = []
-            for existing_name in os.listdir(edited_folder):
-                match = old_pattern.match(existing_name)
-                if match:
-                    existing_numbers.append(int(match.group(1)))
-            next_old_number = max(existing_numbers, default=0) + 1
-            backup_filename = f"{normalized_project_title}_old_{next_old_number}.mp4"
-            backup_path = os.path.join(edited_folder, backup_filename)
-            while os.path.exists(backup_path):
-                next_old_number += 1
-                backup_filename = f"{normalized_project_title}_old_{next_old_number}.mp4"
-                backup_path = os.path.join(edited_folder, backup_filename)
-            os.replace(output_path, backup_path)
-            print(f"📦 Preserved previous output as: {backup_path}")
-        print(f"💾 Writing: {output_path}")
-        print(f"   Duration: {total_duration:.2f}s | FPS: 24 | Size: {video_width}x{video_height}")
-        print("📊 Rendering progress will be shown in this console. No extra window will open.")
-        render_started = time.monotonic()
-        try:
-            final_clip.write_videofile(
-                output_path,
-                fps=24,
-                codec="libx264",
-                audio_codec="aac" if audio_file_path else None,
-                preset="ultrafast",
-                threads=max(2, min(8, os.cpu_count() or 2)),
-                logger="bar",
-            )
-        finally:
-            if keep_awake_enabled and os.name == "nt":
-                try:
-                    import ctypes
-                    ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
-                    print("🖥️ Windows sleep/display prevention released")
-                except Exception as awake_restore_exc:
-                    print(f"⚠️ Could not restore Windows power state: {awake_restore_exc}")
-        elapsed_minutes = (time.monotonic() - render_started) / 60.0
-        print(f"⏱️ Render elapsed time: {elapsed_minutes:.2f} minutes")
-        if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError("FFmpeg finished without creating a valid output file")
-        print(f"✅ Video saved: {output_path}")
-        print(f"📊 Size: {os.path.getsize(output_path) / (1024 * 1024):.2f} MB")
-    except Exception as exc:
-        print(f"❌ Video assembly failed: {exc}")
-        traceback.print_exc()
-        return None
-    finally:
-        # Safety net: release the Windows keep-awake request even if clip
-        # construction or encoding failed before the normal release point.
-        if locals().get("keep_awake_enabled", False) and os.name == "nt":
-            try:
-                import ctypes
-                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)
-                keep_awake_enabled = False
-            except Exception:
-                pass
-        seen = set()
-        for resource in [final_clip, audio_clip, *clips]:
-            if resource is None or id(resource) in seen:
-                continue
-            seen.add(id(resource))
-            try:
-                resource.close()
-            except Exception:
-                pass
-    # Clean temporary folder left by older versions, if present.
-    try:
-        if os.path.isdir(temp_folder):
-            shutil.rmtree(temp_folder)
-    except Exception as exc:
-        print(f"⚠️ Could not clean temporary folder: {exc}")
-    print("\n" + "=" * 60)
-    print("📊 SUMMARY")
-    print("=" * 60)
-    print(f"   Project: {project_title}")
-    print(f"   Entries found: {len(entries)}")
-    print(f"   Images processed: {len(prepared)}")
-    print(f"   Final duration: {total_duration:.2f}s")
-    print("   Captions: animated typewriter reveal, pop-in, yellow current-word underline")
-    print(f"   Audio: {'✅ Added' if audio_file_path else '❌ None'}")
-    if audio_file_path:
-        print(f"   Audio file: {os.path.basename(audio_file_path)}")
-    print(f"   Output: {output_path}")
-    print("=" * 60)
-    print("✅ Complete!")
-    completed_result = {
-        "project_title": project_title,
-        "entries_count": len(entries),
-        "images_processed": len(prepared),
-        "total_duration": total_duration,
-        "audio_added": bool(audio_file_path),
-        "audio_file": os.path.basename(audio_file_path) if audio_file_path else None,
-        "output_folder": edited_folder,
-        "output_file": output_filename,
-        "output_path": output_path,
-        "caption_animation": "typewriter_pop",
-    }
     # Continue through READY_SCRIPT in the same invocation. The next call
     # re-scans the queue, skips this newly-created output, and selects the next
     # unfinished project. Return the current result if no further project is
@@ -7284,8 +6468,8 @@ def main():
     video_producer()
   
 if __name__ == "__main__":
-   generate_google_flow_images()
-   #video_producer()
+   #generate_google_flow_images()
+   video_producer()
 
    
 
