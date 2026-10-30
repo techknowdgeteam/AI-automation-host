@@ -3071,8 +3071,13 @@ def generate_google_flow_images():
     - If engine is not Google Flow, function exits immediately
     - Always runs when the selected image engine is Google Flow; no currently_running gate
     - On start sets currently_running to "generate_google_flow_images()"
-    - On completion, verifies all scene images exist, appends the completed project
-      snapshot to READY_SCRIPT, then removes project_name from PANEL_PATH
+    - Recognizes only entry_N scene images and the canonical Thumbnail.png;
+      deletes unrelated image files from the project image folder
+    - Resumes by generating only missing entry_N images, without resetting
+      valid later entries when a numbering gap is found
+    - Generates Thumbnail.png only after every scene entry image is verified
+    - On completion, verifies every scene image plus Thumbnail.png, appends the
+      completed project snapshot to READY_SCRIPT, then removes project_name from PANEL_PATH
     - On any error/abort keeps currently_running as "generate_google_flow_images()"
     - Ctrl+R restarts the workflow from its entry point without resuming a scene phase
     - Restart page detection checks whatdoyouwantocreate FIRST, then new_project,
@@ -3091,7 +3096,7 @@ def generate_google_flow_images():
     - Restart does not reuse saved scene-phase checkpoints
     - Checks for exit_editinggfimage.png regularly throughout every workflow stage
     - Requires imagerenderingprogress.png and positions the cursor below it before preparing a download
-    - Restores the image-hover cursor position before each download retry
+    - Restores the image-hover cursor position before each download retry\n    - While locked, continuously checks the verified web-download confirmation modal\n    - Rechecks rendering while waiting for moregf and returns to render-wait if it reappears\n    - Blocks Windows mouse-wheel scrolling while the image-position lock is active
     """
     import os
     import json
@@ -3100,6 +3105,8 @@ def generate_google_flow_images():
     import subprocess
     import traceback
     import threading
+    import ctypes
+    from ctypes import wintypes
 
     try:
         import pyautogui
@@ -3135,6 +3142,16 @@ def generate_google_flow_images():
     image_render_lock_active = False
     image_render_lock_position = None
 
+    # A Windows low-level mouse hook blocks physical wheel scrolling while the
+    # image-position lock is active. It is installed only for the locked phase.
+    scroll_hook_thread = None
+    scroll_hook_thread_id = None
+    scroll_hook_stop_event = threading.Event()
+    scroll_hook_ready_event = threading.Event()
+    scroll_hook_callback_ref = None
+    scroll_hook_handle = None
+    scroll_key_hook_handles = []
+
     class _WorkflowRestart(BaseException):
         """Unwind the current workflow and let the supervisor restart it."""
         pass
@@ -3142,6 +3159,142 @@ def generate_google_flow_images():
     class _ManualStop(BaseException):
         """Raised only when the user presses Alt+/ ."""
         pass
+
+    def set_image_scroll_lock(enabled):
+        """
+        Block mouse-wheel and horizontal-wheel input at the Windows OS level
+        while the image cursor anchor is locked. This prevents accidental
+        scrolling rather than trying to chase a moving page position.
+        """
+        nonlocal scroll_hook_thread, scroll_hook_thread_id
+        nonlocal scroll_hook_callback_ref, scroll_hook_handle
+
+        if enabled:
+            if scroll_hook_thread and scroll_hook_thread.is_alive():
+                return True
+
+            scroll_hook_stop_event.clear()
+            scroll_hook_ready_event.clear()
+
+            def _hook_worker():
+                nonlocal scroll_hook_thread_id, scroll_hook_callback_ref, scroll_hook_handle
+                WH_MOUSE_LL = 14
+                WM_MOUSEWHEEL = 0x020A
+                WM_MOUSEHWHEEL = 0x020E
+                WM_QUIT = 0x0012
+                user32 = ctypes.windll.user32
+                kernel32 = ctypes.windll.kernel32
+                scroll_hook_thread_id = kernel32.GetCurrentThreadId()
+
+                LRESULT = ctypes.c_ssize_t
+                HOOKPROC = ctypes.WINFUNCTYPE(
+                    LRESULT, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM
+                )
+
+                def _low_level_mouse_proc(n_code, w_param, l_param):
+                    if n_code >= 0 and image_render_lock_active:
+                        if int(w_param) in (WM_MOUSEWHEEL, WM_MOUSEHWHEEL):
+                            # Swallow wheel input while the lock is active.
+                            return 1
+                    return user32.CallNextHookEx(
+                        scroll_hook_handle, n_code, w_param, l_param
+                    )
+
+                scroll_hook_callback_ref = HOOKPROC(_low_level_mouse_proc)
+                module_handle = kernel32.GetModuleHandleW(None)
+                scroll_hook_handle = user32.SetWindowsHookExW(
+                    WH_MOUSE_LL, scroll_hook_callback_ref, module_handle, 0
+                )
+                if not scroll_hook_handle:
+                    print("⚠️ [SCROLL-LOCK] Windows mouse-wheel hook could not be installed.")
+                    scroll_hook_ready_event.set()
+                    return
+
+                scroll_hook_ready_event.set()
+                message = wintypes.MSG()
+                try:
+                    while not scroll_hook_stop_event.is_set():
+                        result = user32.GetMessageW(ctypes.byref(message), None, 0, 0)
+                        if result <= 0:
+                            break
+                        user32.TranslateMessage(ctypes.byref(message))
+                        user32.DispatchMessageW(ctypes.byref(message))
+                finally:
+                    try:
+                        user32.UnhookWindowsHookEx(scroll_hook_handle)
+                    except Exception:
+                        pass
+                    scroll_hook_handle = None
+
+            scroll_hook_thread = threading.Thread(
+                target=_hook_worker,
+                name="GoogleFlowScrollLock",
+                daemon=True
+            )
+            scroll_hook_thread.start()
+            scroll_hook_ready_event.wait(timeout=2.0)
+            # Also block common browser scrolling keys while the cursor is
+            # pinned. These hooks are removed as soon as More is clicked.
+            try:
+                for key_name in ("page up", "page down", "home", "end", "up", "down", "space"):
+                    try:
+                        scroll_key_hook_handles.append(keyboard.block_key(key_name))
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            if scroll_hook_handle:
+                print(
+                    "🔒 [SCROLL-LOCK] OS-level mouse-wheel scrolling and common "
+                    "page-scrolling keys are blocked."
+                )
+                return True
+            print(
+                "⚠️ [SCROLL-LOCK] Wheel blocking is unavailable; common scrolling "
+                "keys and cursor-position checks remain active."
+            )
+            return False
+
+        for hook_handle in list(scroll_key_hook_handles):
+            try:
+                keyboard.unhook(hook_handle)
+            except Exception:
+                pass
+        scroll_key_hook_handles.clear()
+
+        if scroll_hook_thread and scroll_hook_thread.is_alive():
+            scroll_hook_stop_event.set()
+            try:
+                if scroll_hook_thread_id:
+                    ctypes.windll.user32.PostThreadMessageW(
+                        scroll_hook_thread_id, 0x0012, 0, 0
+                    )
+            except Exception:
+                pass
+            scroll_hook_thread.join(timeout=1.0)
+        scroll_hook_thread = None
+        scroll_hook_thread_id = None
+        scroll_hook_callback_ref = None
+        scroll_hook_handle = None
+        return True
+
+    def restore_locked_cursor():
+        """Force the pointer back to its saved anchor and keep wheel lock enabled."""
+        if not image_render_lock_active or image_render_lock_position is None:
+            return
+        target_x, target_y = image_render_lock_position
+        try:
+            current_x, current_y = pyautogui.position()
+            if abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3:
+                print(
+                    f"🛡️ [GF-LOCK] Cursor drifted to ({current_x}, {current_y}); "
+                    f"forcing it back to ({target_x}, {target_y})."
+                )
+                pyautogui.moveTo(target_x, target_y, duration=0.1)
+        except Exception as cursor_error:
+            print(f"⚠️ [GF-LOCK] Cursor check failed; restoring anchor: {cursor_error}")
+            pyautogui.moveTo(target_x, target_y, duration=0.1)
 
     def _bounded_timeout(value):
         try:
@@ -3387,27 +3540,46 @@ def generate_google_flow_images():
         """
         import copy
 
-        # Confirm every expected scene has a corresponding completed image.
-        image_extensions = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff")
-        missing = []
-        for number in range(1, expected_entries + 1):
-            expected_stem = f"entry_{number}"
-            found = False
-            if os.path.isdir(images_folder):
-                for filename in os.listdir(images_folder):
-                    stem, ext = os.path.splitext(filename)
-                    if stem.lower() == expected_stem.lower() and ext.lower() in image_extensions:
-                        full_path = os.path.join(images_folder, filename)
-                        if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
-                            found = True
-                            break
-            if not found:
-                missing.append(expected_stem)
+        # Verify the exact scene-image naming convention and the required
+        # video-level thumbnail before the project can be marked complete.
+        image_extensions = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"}
+        found_entries = set()
+        if os.path.isdir(images_folder):
+            for filename in os.listdir(images_folder):
+                match = re.fullmatch(
+                    r"entry_(\d+)\.(png|jpg|jpeg|gif|webp|bmp|tiff)",
+                    filename,
+                    re.IGNORECASE
+                )
+                if not match:
+                    continue
+                number = int(match.group(1))
+                full_path = os.path.join(images_folder, filename)
+                try:
+                    if (
+                        1 <= number <= expected_entries
+                        and os.path.isfile(full_path)
+                        and os.path.getsize(full_path) > 0
+                        and os.path.splitext(filename)[1].lower() in image_extensions
+                    ):
+                        found_entries.add(number)
+                except OSError:
+                    pass
+
+        missing = [
+            f"entry_{number}"
+            for number in range(1, expected_entries + 1)
+            if number not in found_entries
+        ]
+
+        thumbnail_path = os.path.join(images_folder, "Thumbnail.png")
+        if not os.path.isfile(thumbnail_path) or os.path.getsize(thumbnail_path) <= 0:
+            missing.append("Thumbnail.png")
 
         if missing:
-            print("❌ [READY-SCRIPT] Transfer cancelled; missing image(s): " + ", ".join(missing))
+            print("❌ [READY-SCRIPT] Transfer cancelled; missing required image(s): " + ", ".join(missing))
             update_operation_status(
-                "Project was not transferred because one or more scene images are missing",
+                "Project was not transferred because one or more scene images or Thumbnail.png are missing",
                 is_error=True
             )
             return False
@@ -4504,6 +4676,7 @@ def generate_google_flow_images():
         if image_render_lock_position is not None:
             target_x, target_y = image_render_lock_position
             image_render_lock_active = True
+            set_image_scroll_lock(True)
             current_x, current_y = pyautogui.position()
             if abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3:
                 print(
@@ -4526,6 +4699,7 @@ def generate_google_flow_images():
                     int(search_location.y + offset_px)
                 )
                 image_render_lock_active = True
+                set_image_scroll_lock(True)
                 pyautogui.moveTo(*image_render_lock_position, duration=0.2)
                 return search_location
             _sleep(0.4)
@@ -4846,6 +5020,7 @@ def generate_google_flow_images():
             int(rendering_location.y + 100)
         )
         image_render_lock_active = True
+        set_image_scroll_lock(True)
         target_x, target_y = image_render_lock_position
         print(
             "🔒 [GF-LOCK] First match recorded at "
@@ -4868,21 +5043,13 @@ def generate_google_flow_images():
         while True:
             check_for_termination()
 
-            # Force the cursor back if the user/UI moved it. This is a
-            # coordinate correction only; it does not inspect other programs.
-            try:
-                current_x, current_y = pyautogui.position()
-                if (abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3):
-                    print(
-                        f"🛡️ [GF-LOCK] Cursor drifted to ({current_x}, {current_y}); "
-                        f"forcing it back to ({target_x}, {target_y})."
-                    )
-                    pyautogui.moveTo(target_x, target_y, duration=0.1)
-            except Exception as cursor_error:
-                print(f"⚠️ [GF-LOCK] Could not verify cursor position: {cursor_error}")
-                pyautogui.moveTo(target_x, target_y, duration=0.1)
+            # The download-confirmation modal is the only additional UI
+            # exception allowed during the rendering lock. Its existing
+            # two-image verification remains mandatory.
+            _service_modal_and_restore_locked_cursor()
+            restore_locked_cursor()
 
-            # This is the ONLY image/template lookup while rendering is active.
+            # Search the rendering indicator only after modal servicing.
             rendering_location = find_image("imagerenderingprogress.png", confidence=0.7)
             if not rendering_location:
                 elapsed = int(time.monotonic() - render_started)
@@ -5075,7 +5242,10 @@ def generate_google_flow_images():
         return False, "timeout"
 
     # --- DOWNLOAD HELPERS (same as original) ---
-    def check_and_rename_download(entry_name, images_folder, timeout_seconds=40, check_interval=0.3):
+    def check_and_rename_download(
+        entry_name, images_folder, timeout_seconds=40, check_interval=0.3,
+        force_png=False
+    ):
         timeout_seconds = _bounded_timeout(timeout_seconds)
         print(f"📊 [DOWNLOAD] Monitoring for download for {entry_name}...")
         try:
@@ -5205,17 +5375,46 @@ def generate_google_flow_images():
         try:
             file_name = os.path.basename(downloaded_file_path)
             file_ext = os.path.splitext(file_name)[1].lower()
-            new_filename = f"{entry_name}{file_ext}"
+            new_filename = f"{entry_name}.png" if force_png else f"{entry_name}{file_ext}"
             target_path = os.path.join(images_folder, new_filename)
             if not os.path.exists(images_folder):
                 os.makedirs(images_folder, exist_ok=True)
             if not os.path.exists(downloaded_file_path):
                 print(f"❌ [DOWNLOAD] File no longer exists: {downloaded_file_path}")
                 return False, None
+
             try:
                 _sleep(0.5)
-                os.rename(downloaded_file_path, target_path)
-                print(f"✅ [DOWNLOAD] File renamed to: {new_filename}")
+                if force_png:
+                    # Do not just rename a JPG/WebP file to .png. Convert the
+                    # downloaded image so Thumbnail.png is a genuine PNG file.
+                    from PIL import Image
+                    with Image.open(downloaded_file_path) as source_image:
+                        converted = source_image.convert(
+                            "RGBA" if "A" in source_image.getbands() else "RGB"
+                        )
+                        converted.save(target_path, format="PNG", optimize=True)
+                    try:
+                        os.remove(downloaded_file_path)
+                    except OSError:
+                        pass
+                    print(f"✅ [DOWNLOAD] Thumbnail converted and saved as: {new_filename}")
+                else:
+                    # Replace only the same expected entry filename if a retry
+                    # is correcting a previously invalid/partial download.
+                    if os.path.exists(target_path):
+                        os.remove(target_path)
+                    try:
+                        os.replace(downloaded_file_path, target_path)
+                    except OSError:
+                        import shutil
+                        shutil.copy2(downloaded_file_path, target_path)
+                        try:
+                            os.remove(downloaded_file_path)
+                        except OSError:
+                            pass
+                    print(f"✅ [DOWNLOAD] File saved as: {new_filename}")
+
                 print(f"📁 [DOWNLOAD] Moved to: {target_path}")
                 try:
                     hud.print("Saved successfully.", "success")
@@ -5224,24 +5423,14 @@ def generate_google_flow_images():
                 update_operation_status(f"Downloaded and saved: {new_filename}")
                 return True, target_path
             except Exception as e:
-                print(f"⚠️ [DOWNLOAD] Error moving file: {e}")
-                import shutil
-                try:
-                    shutil.copy2(downloaded_file_path, target_path)
-                    try:
-                        os.remove(downloaded_file_path)
-                    except Exception:
-                        pass
-                    print(f"✅ [DOWNLOAD] File copied and renamed: {new_filename}")
-                    return True, target_path
-                except Exception as e2:
-                    print(f"❌ [DOWNLOAD] Failed to save file: {e2}")
-                    return False, None
+                print(f"❌ [DOWNLOAD] Failed to save/convert downloaded image: {e}")
+                traceback.print_exc()
+                return False, None
         except Exception as e:
             print(f"❌ [DOWNLOAD] Error processing downloaded file: {e}")
             return False, None
 
-    def download_google_flow_image(hwnd, entry_name, images_folder):
+    def download_google_flow_image(hwnd, entry_name, images_folder, force_png=False):
         print(f"📥 [GF-DOWNLOAD] Starting Google Flow download procedure for {entry_name}...")
 
         # Rendering completion leaves the cursor locked at the original
@@ -5284,17 +5473,57 @@ def generate_google_flow_images():
             while not moregf_found:
                 check_for_termination()
 
-                # Enforce the exact saved cursor location before each More lookup.
-                target_x, target_y = image_render_lock_position
-                current_x, current_y = pyautogui.position()
-                if abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3:
-                    print(
-                        f"🛡️ [GF-DOWNLOAD-LOCK] Cursor moved to ({current_x}, {current_y}); "
-                        f"forcing it back to ({target_x}, {target_y})."
-                    )
-                    pyautogui.moveTo(target_x, target_y, duration=0.1)
+                # The confirmation modal may appear at any time. Handle it
+                # using its existing two-image verification, then restore anchor.
+                _service_modal_and_restore_locked_cursor()
+                restore_locked_cursor()
 
-                # The ONLY permitted lookup after rendering has disappeared.
+                # If rendering has resumed while waiting for More, re-anchor
+                # below the new progress match and return to indefinite rendering wait.
+                rendering_again = find_image("imagerenderingprogress.png", confidence=0.7)
+                if rendering_again:
+                    image_render_lock_position = (
+                        int(rendering_again.x),
+                        int(rendering_again.y + 100)
+                    )
+                    target_x, target_y = image_render_lock_position
+                    image_render_lock_active = True
+                    set_image_scroll_lock(True)
+                    pyautogui.moveTo(target_x, target_y, duration=0.1)
+                    print(
+                        "🔁 [GF-DOWNLOAD-LOCK] Rendering indicator reappeared; "
+                        f"re-anchored at ({target_x}, {target_y}) and waiting again."
+                    )
+                    render_again_started = time.monotonic()
+                    last_render_again_log = render_again_started
+
+                    while True:
+                        check_for_termination()
+                        _service_modal_and_restore_locked_cursor()
+                        restore_locked_cursor()
+                        still_rendering = find_image(
+                            "imagerenderingprogress.png", confidence=0.7
+                        )
+                        if not still_rendering:
+                            elapsed_again = int(time.monotonic() - render_again_started)
+                            print(
+                                "✅ [GF-DOWNLOAD-LOCK] Rendering indicator disappeared "
+                                f"again after {elapsed_again}s; resuming More search."
+                            )
+                            break
+                        now_again = time.monotonic()
+                        if now_again - last_render_again_log >= 10:
+                            elapsed_again = int(now_again - render_again_started)
+                            print(
+                                f"⏳ [GF-DOWNLOAD-LOCK] Rendering resumed "
+                                f"({elapsed_again}s); waiting without timeout."
+                            )
+                            last_render_again_log = now_again
+                        _sleep(0.4)
+                    restore_locked_cursor()
+                    continue
+
+                # Search More only after confirming rendering is not active.
                 moregf_location = find_image("moregf.png", confidence=0.7)
                 if moregf_location:
                     print(
@@ -5305,6 +5534,7 @@ def generate_google_flow_images():
                     if clicked:
                         moregf_found = True
                         image_render_lock_active = False
+                        set_image_scroll_lock(False)
                         print(
                             "🔓 [GF-DOWNLOAD] More control found and clicked; "
                             "cursor-position lock released."
@@ -5365,7 +5595,11 @@ def generate_google_flow_images():
                 print(f"🔄 [GF-DOWNLOAD] Download attempt {download_attempts}/{max_download_attempts}")
                 timeout_seconds = 30 if download_attempts == 1 else 20
                 download_success, file_path = check_and_rename_download(
-                    entry_name, images_folder, timeout_seconds=timeout_seconds, check_interval=0.3
+                    entry_name,
+                    images_folder,
+                    timeout_seconds=timeout_seconds,
+                    check_interval=0.3,
+                    force_png=force_png
                 )
                 if download_success:
                     print(f"✅ [GF-DOWNLOAD] Download successful on attempt {download_attempts}")
@@ -5425,6 +5659,8 @@ def generate_google_flow_images():
 
         finally:
             download_ui_sequence_active = False
+            if not image_render_lock_active:
+                set_image_scroll_lock(False)
     def handle_webdownloadconfirmationmodal():
         """
         Handles webdownloadconfirmationmodal.png using a mandatory 2-step
@@ -5580,49 +5816,315 @@ def generate_google_flow_images():
         )
         return True
 
-    def validate_entry_order(images_folder):
-        if not os.path.exists(images_folder):
-            os.makedirs(images_folder, exist_ok=True)
-            return True, 0
-        image_files = []
-        for file in os.listdir(images_folder):
-            if file.endswith(('.png', '.jpg', '.jpeg', '.gif', '.webp')):
-                image_files.append(file)
-        if not image_files:
-            print(f"📁 [VALIDATE] No image files found in {images_folder}")
-            return True, 0
-        entry_numbers = []
-        for filename in image_files:
-            match = re.search(r'entry[_\-]?(\d+)\.(png|jpg|jpeg|gif|webp)$', filename, re.IGNORECASE)
-            if match:
-                entry_numbers.append(int(match.group(1)))
-        if not entry_numbers:
-            print(f"⚠️ [VALIDATE] No valid entry files found, starting from 0")
-            return True, 0
-        entry_numbers.sort()
-        print(f"📊 [VALIDATE] Found entry numbers: {entry_numbers}")
-        expected_next = 1
-        for num in entry_numbers:
-            if num != expected_next:
-                print(f"❌ [VALIDATE] Gap detected: Expected entry {expected_next}, found entry {num}")
-                print(f"🗑️ [VALIDATE] Deleting all image files and starting over...")
+    def _service_modal_and_restore_locked_cursor():
+        """
+        Poll the download-confirmation modal during the locked phase. If it is
+        visible, the existing handler verifies both modal images and clicks it.
+        Always restore the saved image anchor immediately afterward.
+        """
+        if not image_render_lock_active or image_render_lock_position is None:
+            return False
+        handled = False
+        try:
+            handled = handle_webdownloadconfirmationmodal()
+        except (_WorkflowRestart, _ManualStop):
+            set_image_scroll_lock(False)
+            raise
+        except Exception as modal_error:
+            print(f"⚠️ [MODAL-LOCK] Modal check failed safely: {modal_error}")
+        finally:
+            restore_locked_cursor()
+        return handled
+
+    IMAGE_FILE_EXTENSIONS = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff"
+    }
+    ENTRY_IMAGE_PATTERN = re.compile(
+        r"^entry_(\d+)\.(png|jpg|jpeg|gif|webp|bmp|tiff)$",
+        re.IGNORECASE
+    )
+    THUMBNAIL_FILENAME = "Thumbnail.png"
+
+    def _cleanup_project_image_folder(images_folder, expected_entries):
+        """
+        Keep only entry_N image files within the expected range and Thumbnail.png.
+        Delete every other image file, including numbered variants and unrelated
+        images. For duplicate formats of the same entry, keep the newest valid
+        file and delete the others.
+        """
+        os.makedirs(images_folder, exist_ok=True)
+        valid_entries = {}
+        thumbnail_candidates = []
+
+        try:
+            filenames = os.listdir(images_folder)
+        except OSError as scan_error:
+            print(f"❌ [IMAGE-CLEANUP] Could not scan {images_folder}: {scan_error}")
+            return False
+
+        for filename in filenames:
+            full_path = os.path.join(images_folder, filename)
+            if not os.path.isfile(full_path):
+                continue
+
+            extension = os.path.splitext(filename)[1].lower()
+            stem = os.path.splitext(filename)[0]
+
+            # The one permitted video-level thumbnail is a PNG named Thumbnail.
+            if stem.lower() == "thumbnail" and extension == ".png":
                 try:
-                    hud.print("Starting fresh to keep the sequence correct...", "warning")
-                except Exception:
-                    pass
-                update_operation_status("Gap detected - resetting all entries")
-                for file in image_files:
-                    file_path = os.path.join(images_folder, file)
+                    if os.path.getsize(full_path) > 0:
+                        thumbnail_candidates.append(full_path)
+                    else:
+                        os.remove(full_path)
+                        print(f"🗑️ [IMAGE-CLEANUP] Deleted empty thumbnail: {filename}")
+                except OSError as cleanup_error:
+                    print(f"⚠️ [IMAGE-CLEANUP] Could not inspect {filename}: {cleanup_error}")
+                continue
+
+            match = ENTRY_IMAGE_PATTERN.fullmatch(filename)
+            if match:
+                number = int(match.group(1))
+                try:
+                    valid_file = os.path.getsize(full_path) > 0
+                except OSError:
+                    valid_file = False
+
+                if 1 <= number <= expected_entries and valid_file:
                     try:
-                        os.remove(file_path)
-                        print(f"🗑️ [VALIDATE] Deleted: {file}")
-                    except Exception as e:
-                        print(f"⚠️ [VALIDATE] Could not delete {file}: {e}")
-                return True, 0
-            expected_next += 1
-        next_entry = len(entry_numbers)
-        print(f"✅ [VALIDATE] Entries are in order, next entry: {next_entry + 1}")
-        return True, next_entry
+                        modified = os.path.getmtime(full_path)
+                    except OSError:
+                        modified = 0
+                    valid_entries.setdefault(number, []).append((modified, full_path))
+                    continue
+
+            # Delete unrelated images and entry files outside the current script's
+            # valid numbering range. Non-image support files are left untouched.
+            if extension in IMAGE_FILE_EXTENSIONS:
+                try:
+                    os.remove(full_path)
+                    print(f"🗑️ [IMAGE-CLEANUP] Deleted unrecognized image: {filename}")
+                except OSError as cleanup_error:
+                    print(f"⚠️ [IMAGE-CLEANUP] Could not delete {filename}: {cleanup_error}")
+
+        # Resolve duplicate entry formats, keeping the newest non-empty image.
+        for number, candidates in valid_entries.items():
+            candidates.sort(key=lambda item: item[0], reverse=True)
+            for _, duplicate_path in candidates[1:]:
+                try:
+                    os.remove(duplicate_path)
+                    print(
+                        f"🗑️ [IMAGE-CLEANUP] Deleted duplicate for entry_{number}: "
+                        f"{os.path.basename(duplicate_path)}"
+                    )
+                except OSError as cleanup_error:
+                    print(f"⚠️ [IMAGE-CLEANUP] Could not delete duplicate {duplicate_path}: {cleanup_error}")
+
+        # Keep exactly one canonical Thumbnail.png. Prefer the newest valid PNG.
+        if thumbnail_candidates:
+            thumbnail_candidates.sort(
+                key=lambda path: os.path.getmtime(path) if os.path.exists(path) else 0,
+                reverse=True
+            )
+            keep_thumbnail = thumbnail_candidates[0]
+            canonical_thumbnail = os.path.join(images_folder, THUMBNAIL_FILENAME)
+            if os.path.abspath(keep_thumbnail) != os.path.abspath(canonical_thumbnail):
+                try:
+                    if os.path.exists(canonical_thumbnail):
+                        os.remove(canonical_thumbnail)
+                    os.replace(keep_thumbnail, canonical_thumbnail)
+                    keep_thumbnail = canonical_thumbnail
+                except OSError as rename_error:
+                    print(f"⚠️ [IMAGE-CLEANUP] Could not normalize thumbnail filename: {rename_error}")
+
+            for duplicate_path in thumbnail_candidates[1:]:
+                if os.path.abspath(duplicate_path) == os.path.abspath(keep_thumbnail):
+                    continue
+                try:
+                    if os.path.exists(duplicate_path):
+                        os.remove(duplicate_path)
+                        print(
+                            "🗑️ [IMAGE-CLEANUP] Deleted duplicate thumbnail: "
+                            f"{os.path.basename(duplicate_path)}"
+                        )
+                except OSError as cleanup_error:
+                    print(f"⚠️ [IMAGE-CLEANUP] Could not delete duplicate thumbnail: {cleanup_error}")
+
+        print(
+            f"🧹 [IMAGE-CLEANUP] Accepted scene images: "
+            f"{sorted(valid_entries.keys())}; thumbnail: "
+            f"{'present' if os.path.isfile(os.path.join(images_folder, THUMBNAIL_FILENAME)) else 'missing'}"
+        )
+        return True
+
+    def _find_entry_image(images_folder, entry_number):
+        """Return one non-empty file that exactly matches entry_N.ext."""
+        if not os.path.isdir(images_folder):
+            return None
+        try:
+            for filename in os.listdir(images_folder):
+                match = ENTRY_IMAGE_PATTERN.fullmatch(filename)
+                if match and int(match.group(1)) == int(entry_number):
+                    full_path = os.path.join(images_folder, filename)
+                    if os.path.isfile(full_path) and os.path.getsize(full_path) > 0:
+                        return full_path
+        except OSError as scan_error:
+            print(f"⚠️ [VALIDATE] Could not inspect entry_{entry_number}: {scan_error}")
+        return None
+
+    def _thumbnail_exists(images_folder):
+        thumbnail_path = os.path.join(images_folder, THUMBNAIL_FILENAME)
+        try:
+            if not os.path.isfile(thumbnail_path) or os.path.getsize(thumbnail_path) <= 0:
+                return False
+            from PIL import Image
+            with Image.open(thumbnail_path) as thumbnail_image:
+                if thumbnail_image.format != "PNG":
+                    raise ValueError("Thumbnail file is not a genuine PNG image")
+                thumbnail_image.verify()
+            return True
+        except Exception as thumbnail_error:
+            if os.path.exists(thumbnail_path):
+                try:
+                    os.remove(thumbnail_path)
+                    print(
+                        f"🗑️ [THUMBNAIL] Removed invalid Thumbnail.png: "
+                        f"{thumbnail_error}"
+                    )
+                except OSError as remove_error:
+                    print(
+                        f"⚠️ [THUMBNAIL] Invalid thumbnail could not be removed: "
+                        f"{remove_error}"
+                    )
+            return False
+
+    def validate_entry_order(images_folder, expected_entries):
+        """
+        Do not reset valid files when a gap exists. Return the exact missing
+        entry numbers so only those images are regenerated.
+        """
+        if not _cleanup_project_image_folder(images_folder, expected_entries):
+            return False, []
+        missing_numbers = [
+            number
+            for number in range(1, expected_entries + 1)
+            if _find_entry_image(images_folder, number) is None
+        ]
+        existing_numbers = [
+            number
+            for number in range(1, expected_entries + 1)
+            if number not in missing_numbers
+        ]
+        print(f"📊 [VALIDATE] Existing valid entries: {existing_numbers}")
+        print(f"📊 [VALIDATE] Missing entries to generate: {missing_numbers}")
+        return True, missing_numbers
+
+    def process_prompt_job_gf(
+        hwnd, job_name, prompt_text, images_folder,
+        success_message, force_png=False
+    ):
+        """Submit one prompt, verify it was sent, wait for render, and download."""
+        if not isinstance(prompt_text, str) or not prompt_text.strip():
+            print(f"⚠️ [PROMPT-JOB] Empty prompt for {job_name}")
+            return False
+
+        print(f"\n{'='*50}")
+        print(f"📝 [PROMPT-JOB] Generating: {job_name}")
+        print(f"{'='*50}")
+        update_operation_status(f"Preparing image generation for {job_name}...")
+        try:
+            hud.print(f"Preparing {job_name}...", "processing")
+        except Exception:
+            pass
+
+        # A restart always begins again at prompt submission. No saved scene
+        # or thumbnail phase is trusted as proof of a completed image.
+        send_attempt = 0
+        send_confirmed = False
+
+        while not send_confirmed:
+            send_attempt += 1
+            print(f"\\n🔁 [SEND-LOOP] Send attempt #{send_attempt} for {job_name}")
+            update_operation_status(
+                f"Submitting {job_name} prompt (attempt {send_attempt})..."
+            )
+            check_and_click_exit_editing()
+            send_coords = paste_prompt_and_click_send(hwnd, prompt_text, job_name)
+            if send_coords is None:
+                print(f"❌ [SEND-LOOP] Could not paste & click send for {job_name}")
+                return False
+
+            send_x, send_y = send_coords
+            confirm_result = confirm_sendgf_and_wait_for_generating(
+                hwnd,
+                job_name,
+                prompt_text,
+                send_x,
+                send_y,
+                max_confirm_seconds=STAGE_TIMEOUT_SECONDS,
+                check_interval=0.4
+            )
+
+            if confirm_result == "confirmed":
+                print(f"✅ [SEND-LOOP] Prompt confirmed for {job_name}")
+                send_confirmed = True
+            elif confirm_result in ("needs_restart", "timeout"):
+                abort_operation(
+                    f"Prompt confirmation was not detected for {job_name} within 40 seconds"
+                )
+            elif confirm_result == "poor_network":
+                print(f"❌ [SEND-LOOP] Poor network detected while submitting {job_name}")
+                return False
+            elif confirm_result == "aborted":
+                print(f"🛑 [SEND-LOOP] Submission aborted for {job_name}")
+                return False
+            else:
+                abort_operation(
+                    f"Unexpected send-confirmation result for {job_name}: {confirm_result}"
+                )
+
+        print(f"⏳ [PROMPT-JOB] Waiting for Google Flow to render {job_name}...")
+        generation_complete, status = wait_for_generation_complete_gf(
+            hwnd, job_name, max_wait_seconds=STAGE_TIMEOUT_SECONDS
+        )
+        if not generation_complete:
+            print(f"❌ [PROMPT-JOB] Generation did not complete for {job_name}: {status}")
+            update_operation_status(
+                f"Generation failed for {job_name}: {status}",
+                is_error=True
+            )
+            if status == "poor_network":
+                return False
+            abort_operation(f"Generation failed for {job_name}: {status}")
+            return False
+
+        print(f"📥 [PROMPT-JOB] Downloading completed image for {job_name}...")
+        download_success = download_google_flow_image(
+            hwnd, job_name, images_folder, force_png=force_png
+        )
+        if not download_success:
+            print(f"❌ [PROMPT-JOB] Download failed for {job_name}; the job will not be skipped")
+            update_operation_status(
+                f"Download failed for {job_name}",
+                is_abort=True
+            )
+            abort_operation(f"Download failed for {job_name}")
+            return False
+
+        if force_png:
+            expected_path = os.path.join(images_folder, THUMBNAIL_FILENAME)
+            if not os.path.isfile(expected_path) or os.path.getsize(expected_path) <= 0:
+                abort_operation(
+                    f"{job_name} download did not produce a valid {THUMBNAIL_FILENAME}"
+                )
+
+        print(f"🎉 [PROMPT-JOB] {success_message}")
+        try:
+            hud.print(f"{success_message}", "success")
+        except Exception:
+            pass
+        update_operation_status(f"{job_name} complete", is_success=True)
+        return True
 
     def process_single_entry_gf(hwnd, entry_index, entry_data, images_folder):
         entry_name = f"entry_{entry_index + 1}"
@@ -5631,101 +6133,32 @@ def generate_google_flow_images():
             print(f"⚠️ [SCENE] No data found for {entry_name}")
             return False
 
-        print(f"\n{'='*50}")
-        print(f"📝 [SCENE] Working on scene {entry_index + 1} of {total_entries}")
-        print(f"{'='*50}")
-        update_operation_status(f"Working on scene {entry_index + 1} of {total_entries}...")
+        return process_prompt_job_gf(
+            hwnd=hwnd,
+            job_name=entry_name,
+            prompt_text=entry_json,
+            images_folder=images_folder,
+            success_message=f"Scene {entry_index + 1} image is ready and downloaded",
+            force_png=False
+        )
+
+    def process_thumbnail_gf(hwnd, thumbnail_prompt, images_folder):
+        """Generate the single project-level thumbnail after all scene images."""
+        print("\n🖼️ [THUMBNAIL] All scene images are verified. Preparing the YouTube thumbnail.")
+        update_operation_status("All scene images are complete; generating Thumbnail.png...")
         try:
-            hud.print(f"Working on scene {entry_index + 1} of {total_entries}...", "processing")
+            hud.print("Generating the YouTube thumbnail...", "processing")
         except Exception:
             pass
 
-        # A restart is a fresh workflow attempt, never a continuation of a
-        # saved phase such as submitted/rendering/ready/downloading. Submit the
-        # scene prompt again and follow the complete send -> render -> download
-        # sequence from its beginning.
-        print(
-            f"🔄 [RESTART-SEMANTICS] Scene {entry_index + 1} will run from its "
-            "prompt submission stage; saved phase checkpoints are ignored."
+        return process_prompt_job_gf(
+            hwnd=hwnd,
+            job_name="Thumbnail",
+            prompt_text=thumbnail_prompt.strip(),
+            images_folder=images_folder,
+            success_message="YouTube thumbnail generated and saved as Thumbnail.png",
+            force_png=True
         )
-        send_attempt = 0
-        send_confirmed = False
-        while not send_confirmed:
-            send_attempt += 1
-            print(f"\n🔁 [SEND-LOOP] Send attempt #{send_attempt} for {entry_name}")
-            update_operation_status(f"Preparing to send scene {entry_index + 1} (attempt {send_attempt})...")
-            check_and_click_exit_editing()
-            send_coords = paste_prompt_and_click_send(hwnd, entry_json, entry_name)
-            if send_coords is None:
-                print(f"❌ [SEND-LOOP] Could not paste & click send for {entry_name} — aborting")
-                return False
-            send_x, send_y = send_coords
-            print(f"🔎 [SEND-LOOP] Entering send-confirmation phase (attempt #{send_attempt})...")
-            confirm_result = confirm_sendgf_and_wait_for_generating(
-                hwnd, entry_name, entry_json,
-                send_x, send_y,
-                max_confirm_seconds=STAGE_TIMEOUT_SECONDS, check_interval=0.4
-            )
-            if confirm_result == "confirmed":
-                print(f"✅ [SEND-LOOP] Confirmed: prompt truly sent")
-                send_confirmed = True
-                break
-            elif confirm_result in ("needs_restart", "timeout"):
-                print(
-                    f"🔁 [SEND-LOOP] Prompt confirmation failed for {entry_name}; "
-                    f"requesting a full function restart instead of retrying inside this scene."
-                )
-                abort_operation(
-                    f"Prompt confirmation was not detected for {entry_name} within 40 seconds"
-                )
-            elif confirm_result == "poor_network":
-                print(f"❌ [SEND-LOOP] Poor network detected during send confirmation — aborting")
-                return False
-            elif confirm_result == "aborted":
-                print(f"🛑 [SEND-LOOP] Send confirmation aborted by user")
-                return False
-            else:
-                abort_operation(
-                    f"Unexpected send-confirmation result for {entry_name}: {confirm_result}"
-                )
-
-        print(f"⏳ [SCENE] Step 4: Waiting for the image to be created...")
-        generation_complete, status = wait_for_generation_complete_gf(
-            hwnd, entry_name, max_wait_seconds=STAGE_TIMEOUT_SECONDS
-        )
-
-        if not generation_complete:
-            print(f"❌ [SCENE] Image creation did not complete: {status}")
-            try:
-                hud.print("The image could not be created in time.", "error")
-            except Exception:
-                pass
-            update_operation_status(f"Generation failed for scene {entry_index + 1}: {status}", is_error=True)
-            if status == "poor_network":
-                print(f"❌ [SCENE] Poor network detected — operation aborted")
-                return False
-            abort_operation(f"Generation failed for scene {entry_index + 1}: {status}")
-            return False
-
-        print(f"📥 [SCENE] Step 5: Downloading the generated image...")
-        download_success = download_google_flow_image(hwnd, entry_name, images_folder)
-        if not download_success:
-            print(f"❌ [SCENE] Download failed for {entry_name} — aborting entire operation (never skip)")
-            try:
-                hud.print("The download did not finish — stopping here.", "error")
-            except Exception:
-                pass
-            update_operation_status(f"Download failed for {entry_name} — aborting", is_abort=True)
-            abort_operation(f"Download failed for {entry_name}")
-            return False
-
-        print(f"🎉 [SCENE] Scene {entry_index + 1} image is ready and downloaded!")
-        try:
-            hud.print(f"Scene {entry_index + 1} is ready.", "success")
-        except Exception:
-            pass
-        update_operation_status(f"Scene {entry_index + 1} complete", is_success=True)
-        return True
 
     def main_google_flow_workflow():
         try:
@@ -5750,27 +6183,53 @@ def generate_google_flow_images():
             except Exception:
                 pass
 
-            valid, start_index = validate_entry_order(images_folder)
+            valid, missing_entries = validate_entry_order(images_folder, total_entries)
             if not valid:
-                print(f"❌ [MAIN] Entry validation failed")
+                print("❌ [MAIN] Project image-folder validation failed")
                 return
-            if start_index >= total_entries:
-                print(f"✅ [MAIN] All {total_entries} entries already processed!")
-                try:
-                    hud.print("All images are already complete.", "success")
-                except Exception:
-                    pass
-                transferred = _transfer_completed_project_to_ready_script(images_folder, total_entries)
+
+            # The thumbnail prompt is a project-level field in the JSON, outside
+            # the timed script entries. It is only submitted after every entry_N
+            # image has been verified.
+            latest_panel = _load_panel()
+            thumbnail_value = _find_field(latest_panel, ("Thumbnail",))
+            thumbnail_prompt = (
+                thumbnail_value.strip()
+                if isinstance(thumbnail_value, str)
+                else ""
+            )
+            thumbnail_already_exists = _thumbnail_exists(images_folder)
+            print(f"📊 [MAIN] Missing scene entries: {missing_entries}")
+            print(
+                f"🖼️ [MAIN] Thumbnail status: "
+                f"{'already generated' if thumbnail_already_exists else 'not generated yet'}"
+            )
+
+            if not missing_entries and thumbnail_already_exists:
+                print(
+                    f"✅ [MAIN] All {total_entries} scene images and Thumbnail.png "
+                    "already exist. Verifying project transfer."
+                )
+                transferred = _transfer_completed_project_to_ready_script(
+                    images_folder, total_entries
+                )
                 if transferred:
                     _set_currently_running(
                         "generate_google_flow_images_successful",
                         status="completed",
-                        operation_status=f"✅ All {total_entries} entries verified and transferred to ready_script.json"
+                        operation_status=(
+                            f"✅ All {total_entries} scene images and Thumbnail.png "
+                            "verified and transferred to ready_script.json"
+                        )
                     )
                     print("🏁 [GF] Completed project appended to ready_script.json")
                 return
 
-            print(f"📊 [MAIN] Starting from entry {start_index + 1}")
+            work_items = len(missing_entries) + (0 if thumbnail_already_exists else 1)
+            print(
+                f"📊 [MAIN] Work remaining: {len(missing_entries)} missing scene image(s), "
+                f"{0 if thumbnail_already_exists else 1} thumbnail."
+            )
 
             hwnd = ensure_window_ready_and_focused()
             print(f"🪟 [MAIN] Browser ready (HWND: {hwnd})")
@@ -5873,107 +6332,188 @@ def generate_google_flow_images():
                 update_operation_status(error_message, is_error=True)
                 return
 
-            print("✅ [MAIN] Google Flow prompt workspace is ready; beginning scene processing from the start of this workflow attempt.")
+            print(
+                "✅ [MAIN] Google Flow prompt workspace is ready; "
+                "processing missing scene entries first and the thumbnail last."
+            )
             try:
                 hud.print("Everything is ready. Starting now...", "success")
             except Exception:
                 pass
 
-            for i in range(start_index, total_entries):
-                check_for_termination()
-                entry = all_entries[i]
-                if i > start_index:
-                    download_confirmation_handled = handle_webdownloadconfirmationmodal()
+            processed_job_this_attempt = False
 
-                    # Only after the download-confirmation modal has been
-                    # positively handled, check for generatinggf_image.png.
-                    # If it is visible, click it before starting the next prompt.
-                    if download_confirmation_handled:
-                        check_for_termination()
-                        enforce_window_focus(hwnd)
-                        print(
-                            "🔍 [NEXT-PROMPT] Download confirmation was handled. "
-                            "Checking for generatinggf_image.png before the next prompt..."
-                        )
-                        generating_image_location = find_image(
-                            "generatinggf_image.png",
-                            confidence=0.7
-                        )
-
-                        if generating_image_location:
-                            print(
-                                "✅ [NEXT-PROMPT] Found generatinggf_image.png at "
-                                f"({generating_image_location.x}, "
-                                f"{generating_image_location.y}). "
-                                "Clicking the RIGHT EDGE of the matched image."
-                            )
-
-                            # IMPORTANT: Do not click the match centre. Use the
-                            # existing image-bounds helper to click at 95% of the
-                            # matched template's width and its vertical midpoint.
-                            right_edge_clicked = click_right_edge_of_image(
-                                "generatinggf_image.png",
-                                confidence=0.7
-                            )
-
-                            if right_edge_clicked:
-                                _sleep(0.5)
-                                move_mouse_to_center_of_screen()
-                                update_operation_status(
-                                    "Clicked right edge of generatinggf_image.png "
-                                    "after download confirmation"
-                                )
-                                print(
-                                    "✅ [NEXT-PROMPT] Right edge of "
-                                    "generatinggf_image.png clicked. "
-                                    "Proceeding to the next prompt operation."
-                                )
-                            else:
-                                print(
-                                    "⚠️ [NEXT-PROMPT] generatinggf_image.png was "
-                                    "detected, but its image bounds could not be "
-                                    "located for a right-edge click. No centre click "
-                                    "will be attempted; proceeding to the next prompt."
-                                )
-                        else:
-                            print(
-                                "ℹ️ [NEXT-PROMPT] generatinggf_image.png was not found. "
-                                "No click needed — proceeding to the next prompt operation."
-                            )
-
-                success = process_single_entry_gf(hwnd, i, entry, images_folder)
-                if success:
-                    _sleep(2)
-                else:
-                    print(f"❌ [MAIN] Scene {i+1} failed — aborting entire operation (never skip)")
-                    try:
-                        hud.print("Stopping — the current scene did not finish.", "error")
-                    except Exception:
-                        pass
-                    update_operation_status(f"Entry {i+1} failed — aborting operation (never skip)", is_abort=True)
-                    abort_operation(f"Entry {i+1} failed — aborting operation")
+            def _prepare_for_next_prompt_if_needed():
+                nonlocal processed_job_this_attempt
+                if not processed_job_this_attempt:
+                    return
+                download_confirmation_handled = handle_webdownloadconfirmationmodal()
+                if not download_confirmation_handled:
                     return
 
-            print(f"\n{'='*50}")
-            print(f"🎉 [MAIN] All entries processed and downloaded!")
-            print(f"{'='*50}")
+                check_for_termination()
+                enforce_window_focus(hwnd)
+                print(
+                    "🔍 [NEXT-PROMPT] Download confirmation handled. "
+                    "Checking for generatinggf_image.png before the next prompt..."
+                )
+                generating_image_location = find_image(
+                    "generatinggf_image.png",
+                    confidence=0.7
+                )
+                if generating_image_location:
+                    print(
+                        "✅ [NEXT-PROMPT] generatinggf_image.png detected at "
+                        f"({generating_image_location.x}, {generating_image_location.y}); "
+                        "clicking its right edge."
+                    )
+                    if click_right_edge_of_image("generatinggf_image.png", confidence=0.7):
+                        _sleep(0.5)
+                        move_mouse_to_center_of_screen()
+                        update_operation_status(
+                            "Handled generatinggf_image.png after the previous download"
+                        )
+                    else:
+                        print(
+                            "⚠️ [NEXT-PROMPT] Could not click the right edge; "
+                            "no centre click will be attempted."
+                        )
+                else:
+                    print("ℹ️ [NEXT-PROMPT] generatinggf_image.png not present.")
+
+            # Walk the complete expected range, not just a contiguous suffix.
+            # A valid entry_5 is preserved even when entry_3 is missing.
+            for i in range(total_entries):
+                check_for_termination()
+                entry_name = f"entry_{i + 1}"
+                existing_image = _find_entry_image(images_folder, i + 1)
+                if existing_image:
+                    print(
+                        f"⏭️ [MAIN] {entry_name} already exists and is valid; "
+                        "skipping generation for this entry only."
+                    )
+                    continue
+
+                _prepare_for_next_prompt_if_needed()
+                entry = all_entries[i]
+                success = process_single_entry_gf(hwnd, i, entry, images_folder)
+                if success:
+                    processed_job_this_attempt = True
+                    _sleep(2)
+                    if _find_entry_image(images_folder, i + 1) is None:
+                        abort_operation(
+                            f"{entry_name} generation returned success but the file is missing"
+                        )
+                else:
+                    print(
+                        f"❌ [MAIN] {entry_name} failed — aborting the entire operation "
+                        "(the entry will not be skipped)."
+                    )
+                    try:
+                        hud.print(f"Stopping — {entry_name} did not finish.", "error")
+                    except Exception:
+                        pass
+                    update_operation_status(
+                        f"{entry_name} failed — aborting operation (never skip)",
+                        is_abort=True
+                    )
+                    abort_operation(f"{entry_name} failed — aborting operation")
+
+            # Final scene-image audit before the thumbnail is allowed to start.
+            _cleanup_project_image_folder(images_folder, total_entries)
+            missing_after_generation = [
+                number
+                for number in range(1, total_entries + 1)
+                if _find_entry_image(images_folder, number) is None
+            ]
+            if missing_after_generation:
+                abort_operation(
+                    "Scene image audit found missing entries: "
+                    + ", ".join(f"entry_{number}" for number in missing_after_generation)
+                )
+
+            print(
+                f"✅ [MAIN] All {total_entries} scene images are present. "
+                "The thumbnail phase may now begin."
+            )
+
+            # The thumbnail is deliberately generated LAST, and only when the
+            # canonical Thumbnail.png is absent or invalid.
+            if not _thumbnail_exists(images_folder):
+                if not thumbnail_prompt:
+                    print(
+                        "❌ [THUMBNAIL] All scene images are complete, but panel.json "
+                        "has no non-empty 'Thumbnail' prompt. Add the prompt before "
+                        "the thumbnail can be generated."
+                    )
+                    update_operation_status(
+                        "Thumbnail prompt is missing or empty; add text to the JSON Thumbnail field",
+                        is_error=True
+                    )
+                    return
+
+                _prepare_for_next_prompt_if_needed()
+                thumbnail_success = process_thumbnail_gf(
+                    hwnd, thumbnail_prompt, images_folder
+                )
+                if not thumbnail_success:
+                    abort_operation("YouTube thumbnail generation failed")
+                processed_job_this_attempt = True
+                _sleep(2)
+            else:
+                print(
+                    "⏭️ [THUMBNAIL] Thumbnail.png already exists and is valid; "
+                    "skipping thumbnail generation."
+                )
+
+            # Strict final folder cleanup and verification before transfer.
+            if not _cleanup_project_image_folder(images_folder, total_entries):
+                abort_operation("Could not validate the final project image folder")
+
+            missing_after_all = [
+                f"entry_{number}"
+                for number in range(1, total_entries + 1)
+                if _find_entry_image(images_folder, number) is None
+            ]
+            if not _thumbnail_exists(images_folder):
+                missing_after_all.append(THUMBNAIL_FILENAME)
+
+            if missing_after_all:
+                abort_operation(
+                    "Final image audit failed; missing: " + ", ".join(missing_after_all)
+                )
+
+            print(f"\n{'='*60}")
+            print(
+                f"🎉 [MAIN] All {total_entries} entry images and "
+                f"{THUMBNAIL_FILENAME} are generated and verified!"
+            )
+            print(f"{'='*60}")
             try:
-                hud.print("All images are ready.", "success")
+                hud.print("All scene images and the thumbnail are ready.", "success")
             except Exception:
                 pass
 
-            transferred = _transfer_completed_project_to_ready_script(images_folder, total_entries)
+            transferred = _transfer_completed_project_to_ready_script(
+                images_folder, total_entries
+            )
             if transferred:
                 _set_currently_running(
                     "generate_google_flow_images_successful",
                     status="completed",
-                    operation_status=f"✅ All {total_entries} entries processed and transferred to ready_script.json"
+                    operation_status=(
+                        f"✅ All {total_entries} entry images plus {THUMBNAIL_FILENAME} "
+                        "verified and transferred to ready_script.json"
+                    )
                 )
                 print("🏁 [GF] Completed project appended to ready_script.json")
             else:
-                print("⚠️ [GF] Images may be generated, but project transfer did not complete.")
+                print(
+                    "⚠️ [GF] Images are present, but project transfer did not complete."
+                )
 
         except (_WorkflowRestart, _ManualStop):
+            set_image_scroll_lock(False)
             raise
         except KeyboardInterrupt as exc:
             raise _ManualStop(str(exc))
@@ -6149,9 +6689,8 @@ def generate_google_flow_images():
                 pass
             print("🛑 [SUPERVISOR] Google Flow function stopped by the user.")
 
-
 def video_producer():
-
+    
     """
 
     Assemble entry_N images into a narrated video with animated captions.
@@ -6188,15 +6727,17 @@ def video_producer():
 
     import time
 
+    import random
+
+    from functools import lru_cache
+
     from PIL import Image, ImageDraw, ImageFont
 
     import numpy as np
 
-
-
     # Import from MoviePy's public package namespace. MoviePy 2.x removed
 
-    # the old \\\\\\\\\\\\\\\\\\\`moviepy.editor\\\\\\\\\\\\\\\\\\\` module, so do not fall back to that path.
+    # the old \\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\`moviepy.editor\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\\` module, so do not fall back to that path.
 
     try:
 
@@ -6216,8 +6757,6 @@ def video_producer():
 
         return None
 
-
-
     # READY_SCRIPT is the queue. Deduplicate by normalized project title,
 
     # then process the first project whose final video does not already exist.
@@ -6229,8 +6768,6 @@ def video_producer():
         print(f"❌ READY_SCRIPT missing: {READY_SCRIPT}")
 
         return None
-
-
 
     def normalize_project_title(name):
 
@@ -6254,21 +6791,15 @@ def video_producer():
 
         return None
 
-
-
     # Discover project records regardless of root shape or wrapper names.
 
     # This mirrors generate_google_flow_images() and supports root lists,
 
     # {"value": {...}}, {"projects": [...]}, and deeper arbitrary nesting.
 
-
-
     def _normalise_key(key):
 
         return re.sub(r"[^a-z0-9]", "", str(key).lower())
-
-
 
     def _walk_json(node, path=()):
 
@@ -6285,8 +6816,6 @@ def video_producer():
             for index, value in enumerate(node):
 
                 yield from _walk_json(value, path + (index,))
-
-
 
     def _find_field(node, aliases, require_value=True):
 
@@ -6310,11 +6839,7 @@ def video_producer():
 
         return None
 
-
-
     def _find_project_title(node):
-
-
 
         # Prefer explicit title fields; project_name may itself be a wrapper.
 
@@ -6329,8 +6854,6 @@ def video_producer():
             return str(value).strip()
 
         return None
-
-
 
     def _find_script_data(node):
 
@@ -6394,15 +6917,11 @@ def video_producer():
 
         return None
 
-
-
     def _collect_project_records(node):
 
         records = []
 
         visited = set()
-
-
 
         def visit(current):
 
@@ -6430,8 +6949,6 @@ def video_producer():
 
                 return
 
-
-
             # Continue through arbitrary wrappers and nested root records.
 
             for child in current.values():
@@ -6441,8 +6958,6 @@ def video_producer():
                     visit(child)
 
         visit(node)
-
-
 
         # A wrapper may expose the same project more than once. Deduplicate by
 
@@ -6538,6 +7053,30 @@ def video_producer():
 
         return None
 
+    def _setting_is_yes(value):
+
+        return str(value if value is not None else "").strip().casefold() == "yes"
+
+    include_transitions = _setting_is_yes(
+
+        _find_field(panel_data, ("include_transitions", "includeTransitions"))
+
+    )
+
+    include_captions = _setting_is_yes(
+
+        _find_field(panel_data, ("include_captions", "includeCaptions"))
+
+    )
+
+    print(
+
+        f"⚙️ [VIDEO-OPTIONS] Transitions: {'ON' if include_transitions else 'OFF'} | "
+
+        f"Captions: {'ON' if include_captions else 'OFF'}"
+
+    )
+
     normalized_project_title = normalize_project_title(project_title)
 
     project_folder = os.path.join(IMAGES_PATH, normalized_project_title)
@@ -6594,9 +7133,9 @@ def video_producer():
 
     os.makedirs(edited_folder, exist_ok=True)
 
-    os.makedirs(temp_folder, exist_ok=True)
+    if include_captions:
 
-
+        os.makedirs(temp_folder, exist_ok=True)
 
     def parse_timestamp_to_seconds(value):
 
@@ -6624,8 +7163,6 @@ def video_producer():
 
         return 0.0
 
-
-
     def get_entries(data):
 
         """
@@ -6651,8 +7188,6 @@ def video_producer():
         No separate JSON file is required.
 
         """
-
-
 
         # Use the same structure-independent script discovery as the Google
 
@@ -6680,8 +7215,6 @@ def video_producer():
 
         seen_ids = set()
 
-
-
         # These fields identify a scene object without requiring the legacy
 
         # scene_pov_prompt field to exist.
@@ -6708,21 +7241,15 @@ def video_producer():
 
         }
 
-
-
         def is_scene_entry(item):
 
             return isinstance(item, dict) and bool(scene_markers.intersection(item.keys()))
-
-
 
         def add_entry(item):
 
             if not isinstance(item, dict):
 
                 return
-
-
 
             # Deduplicate the same dictionary if encountered through a wrapper.
 
@@ -6735,8 +7262,6 @@ def video_producer():
             seen_ids.add(identity)
 
             collected.append(dict(item))
-
-
 
         def walk(node):
 
@@ -6758,8 +7283,6 @@ def video_producer():
 
                 return
 
-
-
             # Legacy batch format: {"entries": [scene, scene, ...]}.
 
             entries_list = node.get("entries")
@@ -6772,8 +7295,6 @@ def video_producer():
 
                         add_entry(child)
 
-
-
             # New direct scene object, e.g. an item in script: [...].
 
             if is_scene_entry(node):
@@ -6781,8 +7302,6 @@ def video_producer():
                 add_entry(node)
 
                 return
-
-
 
             # Recurse through nested script containers while avoiding a second
 
@@ -6799,8 +7318,6 @@ def video_producer():
                     walk(value)
 
         walk(script_data)
-
-
 
         def first_text(entry, keys):
 
@@ -6846,8 +7363,6 @@ def video_producer():
 
         for index, entry in enumerate(collected):
 
-
-
             # A scene can qualify in the new format without scene_pov_prompt.
 
             # Ignore obvious non-scene metadata dictionaries.
@@ -6886,8 +7401,6 @@ def video_producer():
 
             else:
 
-
-
                 # A reasonable fallback when the scene has no timing metadata.
 
                 duration = 5.0
@@ -6908,13 +7421,11 @@ def video_producer():
 
             item["duration_seconds"] = duration
 
-            item["dialogue"] = first_text(entry, caption_keys)
+            item["dialogue"] = first_text(entry, caption_keys) if include_captions else ""
 
             result.append(item)
 
             running_cursor = max(running_cursor, stop)
-
-
 
         # Preserve explicit timing order where present; for entries without
 
@@ -6922,25 +7433,31 @@ def video_producer():
 
         result.sort(key=lambda item: item.get("start_seconds", 0.0))
 
-        print(f"📚 [CAPTIONS] Read {len(result)} scene entries from panel.json")
+        if include_captions:
 
-        if result:
+            print(f"📚 [CAPTIONS] Read {len(result)} scene entries from panel.json")
 
-            caption_count = sum(bool(item.get("dialogue")) for item in result)
+            if result:
 
-            print(f"📝 [CAPTIONS] {caption_count}/{len(result)} scenes contain caption/narration text")
+                caption_count = sum(bool(item.get("dialogue")) for item in result)
 
-            if caption_count == 0:
+                print(f"📝 [CAPTIONS] {caption_count}/{len(result)} scenes contain caption/narration text")
 
-                print(
+                if caption_count == 0:
 
-                    "⚠️ [CAPTIONS] Scene entries were found, but none contains dialogue/narration "
+                    print(
 
-                    "text. Animated captions need a text field such as dialogue, narration, "
+                        "⚠️ [CAPTIONS] Scene entries were found, but none contains dialogue/narration "
 
-                    "voiceover, spoken_text, caption, or subtitle."
+                        "text. Animated captions need a text field such as dialogue, narration, "
 
-                )
+                        "voiceover, spoken_text, caption, or subtitle."
+
+                    )
+
+        else:
+
+            print(f"📚 [VIDEO] Read {len(result)} scene entries; caption extraction is disabled")
 
         return result
 
@@ -6951,8 +7468,6 @@ def video_producer():
         print("❌ No scene entries found in the discovered project script (new and legacy formats were checked).")
 
         return None
-
-
 
     def get_sorted_images(folder_path):
 
@@ -6990,8 +7505,6 @@ def video_producer():
 
         return None
 
-
-
     def find_audio_file(title):
 
         downloads = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -7024,91 +7537,431 @@ def video_producer():
 
         print("⚠️ No matching audio found; video will be silent")
 
+    if include_captions:
 
+        # Speech recognition: captions are generated from the actual audio, not
 
+        # from dialogue/narration text or scene-duration estimates.
 
-    # Speech recognition: captions are generated from the actual audio, not
-    # from dialogue/narration text or scene-duration estimates.
-    audio_words = []
-    if audio_file_path and os.path.isfile(audio_file_path):
-        try:
-            from faster_whisper import WhisperModel
+        audio_words = []
 
-            whisper_model_name = os.environ.get("WHISPER_MODEL", "small")
-            whisper_device = os.environ.get("WHISPER_DEVICE", "cpu")
-            whisper_compute_type = os.environ.get(
-                "WHISPER_COMPUTE_TYPE",
-                "int8" if whisper_device.lower() == "cpu" else "float16"
-            )
+        if audio_file_path and os.path.isfile(audio_file_path):
 
-            print(
-                f"🗣️ [ASR] Loading Faster-Whisper model '{whisper_model_name}' "
-                f"({whisper_device}/{whisper_compute_type})..."
-            )
-            whisper_model = WhisperModel(
-                whisper_model_name,
-                device=whisper_device,
-                compute_type=whisper_compute_type,
-                cpu_threads=max(2, min(8, os.cpu_count() or 2)),
-            )
+            try:
 
-            segments, transcription_info = whisper_model.transcribe(
-                audio_file_path,
-                beam_size=5,
-                word_timestamps=True,
-                vad_filter=True,
-                condition_on_previous_text=True,
-            )
+                from faster_whisper import WhisperModel
 
-            detected_language = getattr(transcription_info, "language", "unknown")
-            print(f"🗣️ [ASR] Detected language: {detected_language}")
+                whisper_model_name = os.environ.get("WHISPER_MODEL", "small")
 
-            for segment in segments:
-                segment_words = getattr(segment, "words", None) or []
-                for word_info in segment_words:
-                    spoken_word = str(getattr(word_info, "word", "") or "").strip()
-                    word_start = getattr(word_info, "start", None)
-                    word_end = getattr(word_info, "end", None)
+                whisper_device = os.environ.get("WHISPER_DEVICE", "cpu")
 
-                    if not spoken_word or word_start is None or word_end is None:
-                        continue
+                whisper_compute_type = os.environ.get(
 
-                    word_start = max(0.0, float(word_start))
-                    word_end = max(word_start + 0.015, float(word_end))
-                    audio_words.append({
-                        "word": spoken_word,
-                        "start": word_start,
-                        "end": word_end,
-                    })
+                    "WHISPER_COMPUTE_TYPE",
 
-            if not audio_words:
-                raise RuntimeError(
-                    "Speech recognition returned no word timestamps. "
-                    "Check that the audio contains clear speech."
+                    "int8" if whisper_device.lower() == "cpu" else "float16"
+
                 )
 
-            print(
-                f"✅ [ASR] Recognized {len(audio_words)} words from the audio file."
-            )
-            print(
-                "📝 [ASR] Transcript: "
-                + " ".join(item["word"] for item in audio_words)
-            )
-            del whisper_model
+                print(
 
-        except ImportError as exc:
-            print(
-                "❌ faster-whisper is not installed. Install it with: "
-                "python -m pip install --upgrade faster-whisper"
-            )
-            print(f"   Import details: {exc}")
-            return None
-        except Exception as exc:
-            print(f"❌ [ASR] Speech recognition failed: {exc}")
-            traceback.print_exc()
-            return None
+                    f"🗣️ [ASR] Loading Faster-Whisper model '{whisper_model_name}' "
+
+                    f"({whisper_device}/{whisper_compute_type})..."
+
+                )
+
+                whisper_model = WhisperModel(
+
+                    whisper_model_name,
+
+                    device=whisper_device,
+
+                    compute_type=whisper_compute_type,
+
+                    cpu_threads=max(2, min(8, os.cpu_count() or 2)),
+
+                )
+
+                segments, transcription_info = whisper_model.transcribe(
+
+                    audio_file_path,
+
+                    beam_size=5,
+
+                    word_timestamps=True,
+
+                    vad_filter=True,
+
+                    condition_on_previous_text=True,
+
+                )
+
+                detected_language = getattr(transcription_info, "language", "unknown")
+
+                print(f"🗣️ [ASR] Detected language: {detected_language}")
+
+                for segment in segments:
+
+                    segment_words = getattr(segment, "words", None) or []
+
+                    for word_info in segment_words:
+
+                        spoken_word = str(getattr(word_info, "word", "") or "").strip()
+
+                        word_start = getattr(word_info, "start", None)
+
+                        word_end = getattr(word_info, "end", None)
+
+                        if not spoken_word or word_start is None or word_end is None:
+
+                            continue
+
+                        word_start = max(0.0, float(word_start))
+
+                        word_end = max(word_start + 0.015, float(word_end))
+
+                        audio_words.append({
+
+                            "word": spoken_word,
+
+                            "start": word_start,
+
+                            "end": word_end,
+
+                        })
+
+                if not audio_words:
+
+                    raise RuntimeError(
+
+                        "Speech recognition returned no word timestamps. "
+
+                        "Check that the audio contains clear speech."
+
+                    )
+
+                print(
+
+                    f"✅ [ASR] Recognized {len(audio_words)} words from the audio file."
+
+                )
+
+                print(
+
+                    "📝 [ASR] Transcript: "
+
+                    + " ".join(item["word"] for item in audio_words)
+
+                )
+
+                del whisper_model
+
+            except ImportError as exc:
+
+                print(
+
+                    "❌ faster-whisper is not installed. Install it with: "
+
+                    "python -m pip install --upgrade faster-whisper"
+
+                )
+
+                print(f"   Import details: {exc}")
+
+                return None
+
+            except Exception as exc:
+
+                print(f"❌ [ASR] Speech recognition failed: {exc}")
+
+                traceback.print_exc()
+
+                return None
+
+        else:
+
+            print("⚠️ [ASR] No audio file found; speech-synchronized captions cannot be created.")
+
     else:
-        print("⚠️ [ASR] No audio file found; speech-synchronized captions cannot be created.")
+
+        audio_words = []
+
+        print("⏭️ [CAPTIONS] Disabled by project settings; skipping Faster-Whisper and all caption processing")
+
+    def discover_transparent_subscribe_stickers():
+
+        """Return only image files that contain a real transparent background."""
+
+        sticker_folder = globals().get("SUBSCRIBE_STICKERS")
+
+        if not sticker_folder:
+
+            print("⚠️ [SUBSCRIBE-STICKERS] Global SUBSCRIBE_STICKERS path is not defined")
+
+            return []
+
+        if not os.path.isdir(sticker_folder):
+
+            print(f"⚠️ [SUBSCRIBE-STICKERS] Folder does not exist: {sticker_folder}")
+
+            return []
+
+        supported_extensions = (".gif", ".webp", ".apng")
+
+        valid_stickers = []
+
+        rejected_count = 0
+
+        for filename in os.listdir(sticker_folder):
+
+            path = os.path.join(sticker_folder, filename)
+
+            if not os.path.isfile(path) or not filename.lower().endswith(supported_extensions):
+
+                continue
+
+            try:
+
+                with Image.open(path) as source:
+
+                    frame_count = max(1, int(getattr(source, "n_frames", 1)))
+
+                    # The request is for animated stickers, not still images.
+
+                    if frame_count <= 1:
+
+                        rejected_count += 1
+
+                        print(
+
+                            f"⏭️ [SUBSCRIBE-STICKERS] Rejected static image (not animated): {filename}"
+
+                        )
+
+                        continue
+
+                    transparent_frames = 0
+
+                    total_duration_ms = 0
+
+                    for frame_index in range(frame_count):
+
+                        source.seek(frame_index)
+
+                        frame_duration = source.info.get("duration", 100)
+
+                        try:
+
+                            frame_duration = max(20, int(frame_duration or 100))
+
+                        except (TypeError, ValueError):
+
+                            frame_duration = 100
+
+                        total_duration_ms += frame_duration
+
+                        rgba = source.convert("RGBA")
+
+                        alpha_histogram = rgba.getchannel("A").histogram()
+
+                        pixel_count = max(1, rgba.width * rgba.height)
+
+                        transparent_ratio = sum(alpha_histogram[:255]) / pixel_count
+
+                        visible_ratio = sum(alpha_histogram[1:]) / pixel_count
+
+                        # A valid sticker needs both visible artwork and a meaningful
+                        # transparent area. This rejects ordinary opaque GIFs.
+
+                        if transparent_ratio >= 0.005 and visible_ratio >= 0.005:
+
+                            transparent_frames += 1
+
+                        rgba.close()
+
+                    transparency_frame_ratio = transparent_frames / frame_count
+
+                    # Animated stickers must retain transparency for most frames.
+
+                    if transparency_frame_ratio < 0.70:
+
+                        rejected_count += 1
+
+                        print(
+
+                            f"⏭️ [SUBSCRIBE-STICKERS] Rejected non-transparent/opaque file: {filename}"
+
+                        )
+
+                        continue
+
+                    cycle_duration = max(0.10, total_duration_ms / 1000.0)
+
+                    valid_stickers.append({
+
+                        "path": path,
+
+                        "filename": filename,
+
+                        "cycle_duration": cycle_duration,
+
+                    })
+
+            except Exception as sticker_exc:
+
+                rejected_count += 1
+
+                print(
+
+                    f"⚠️ [SUBSCRIBE-STICKERS] Could not inspect '{filename}': {sticker_exc}"
+
+                )
+
+        random.shuffle(valid_stickers)
+
+        print(
+
+            f"✅ [SUBSCRIBE-STICKERS] {len(valid_stickers)} transparent sticker file(s) ready; "
+
+            f"{rejected_count} file(s) rejected"
+
+        )
+
+        return valid_stickers
+
+
+    def build_subscribe_sticker_events(recognized_words):
+
+        """Match LIKE AND SUBSCRIBE / SUBSCRIBE and allocate unique stickers."""
+
+        normalized_words = []
+
+        for token in recognized_words:
+
+            raw_word = str(token.get("word", "")).strip().lower()
+
+            normalized_words.append(re.sub(r"[^a-z]", "", raw_word))
+
+        trigger_indices = []
+
+        subscribe_indices_in_phrase = set()
+
+        for index in range(len(normalized_words)):
+
+            if (
+
+                normalized_words[index] == "like"
+
+                and index + 2 < len(normalized_words)
+
+                and normalized_words[index + 1] == "and"
+
+                and normalized_words[index + 2] == "subscribe"
+
+            ):
+
+                # Start the sticker before the L in LIKE, not at SUBSCRIBE.
+
+                trigger_indices.append(index)
+
+                subscribe_indices_in_phrase.add(index + 2)
+
+        for index, normalized_word in enumerate(normalized_words):
+
+            if normalized_word == "subscribe" and index not in subscribe_indices_in_phrase:
+
+                trigger_indices.append(index)
+
+        trigger_indices.sort()
+
+        if not trigger_indices:
+
+            print("ℹ️ [SUBSCRIBE-STICKERS] No LIKE AND SUBSCRIBE / SUBSCRIBE phrase found in captions")
+
+            return []
+
+        sticker_pool = discover_transparent_subscribe_stickers()
+
+        if not sticker_pool:
+
+            print("⚠️ [SUBSCRIBE-STICKERS] No verified transparent stickers available; continuing without overlays")
+
+            return []
+
+        selected_events = []
+
+        pool_index = 0
+
+        previous_path = None
+
+        pre_roll_seconds = 0.14
+
+        for trigger_index in trigger_indices:
+
+            if pool_index >= len(sticker_pool):
+
+                # All stickers have now been used once. Only now may the pool
+                # be shuffled again and previously used stickers be selected.
+
+                random.shuffle(sticker_pool)
+
+                if len(sticker_pool) > 1 and sticker_pool[0]["path"] == previous_path:
+
+                    sticker_pool[0], sticker_pool[1] = sticker_pool[1], sticker_pool[0]
+
+                pool_index = 0
+
+            selected_sticker = sticker_pool[pool_index]
+
+            pool_index += 1
+
+            previous_path = selected_sticker["path"]
+
+            token = recognized_words[trigger_index]
+
+            word_start = max(0.0, float(token.get("start", 0.0)))
+
+            sticker_start = max(0.0, word_start - pre_roll_seconds)
+
+            sticker_duration = min(
+
+                3.0,
+
+                max(1.25, float(selected_sticker.get("cycle_duration", 1.25)))
+
+            )
+
+            selected_events.append({
+
+                "path": selected_sticker["path"],
+
+                "filename": selected_sticker["filename"],
+
+                "start_time": sticker_start,
+
+                "end_time": sticker_start + sticker_duration,
+
+                "display_duration": sticker_duration,
+
+                "trigger_word": str(token.get("word", "")),
+
+            })
+
+            print(
+
+                f"🎯 [SUBSCRIBE-STICKERS] Selected '{selected_sticker['filename']}' "
+
+                f"for '{token.get('word', '')}' at {sticker_start:.2f}s "
+
+                f"(no-repeat selection {pool_index}/{len(sticker_pool)})"
+
+            )
+
+        print(f"✅ [SUBSCRIBE-STICKERS] Scheduled {len(selected_events)} centered sticker overlay(s)")
+
+        return selected_events
+
 
     # Force the finished video and every scene image to a fixed 16:9 frame.
 
@@ -7116,11 +7969,7 @@ def video_producer():
 
     print(f"📐 Output size (forced 16:9): {video_width}x{video_height}")
 
-
-
     def fit_image(image, width, height):
-
-
 
         # Fill the 16:9 frame by center-cropping excess edges, then resize.
 
@@ -7152,8 +8001,6 @@ def video_producer():
 
         return image.resize((width, height), Image.Resampling.LANCZOS)
 
-
-
     def load_font(size):
 
         candidates = [
@@ -7180,8 +8027,6 @@ def video_producer():
 
         return ImageFont.load_default()
 
-
-
     def wrap_words(draw, text, font, max_width):
 
         words = text.split()
@@ -7201,8 +8046,6 @@ def video_producer():
                 if current:
 
                     lines.append(current)
-
-
 
                 # Keep exceptionally long words from running off-screen.
 
@@ -7232,13 +8075,9 @@ def video_producer():
 
         return lines
 
-
-
     # Cache caption text measurements. Font and output dimensions stay unchanged.
 
     caption_text_width_cache = {}
-
-
 
     def _clean_caption_text(value):
 
@@ -7247,8 +8086,6 @@ def video_producer():
         value = re.sub(r"\s+", " ", str(value or "").strip())
 
         return re.sub(r",\s*$", "", value).rstrip()
-
-
 
     def _caption_text_width(draw, text, font):
 
@@ -7267,8 +8104,6 @@ def video_producer():
             caption_text_width_cache[text] = cached
 
         return cached
-
-
 
     def _fit_word_suffix(draw, text, font, max_width):
 
@@ -7294,234 +8129,565 @@ def video_producer():
 
         return text[-1:]
 
+    @lru_cache(maxsize=3)
 
+    def _load_subscribe_sticker_animation(sticker_path, frame_width, frame_height):
+
+        """Load and resize a transparent sticker animation only when it is needed."""
+
+        max_sticker_width = max(1, int(frame_width * 0.40))
+
+        max_sticker_height = max(1, int(frame_height * 0.28))
+
+        max_cached_frames = 72
+
+        try:
+
+            with Image.open(sticker_path) as source:
+
+                frame_count = max(1, int(getattr(source, "n_frames", 1)))
+
+                frame_step = max(1, (frame_count + max_cached_frames - 1) // max_cached_frames)
+
+                animation_frames = []
+
+                pending_duration_ms = 0
+
+                total_duration_ms = 0
+
+                for frame_index in range(frame_count):
+
+                    source.seek(frame_index)
+
+                    raw_duration = source.info.get("duration", 100)
+
+                    try:
+
+                        frame_duration_ms = max(20, int(raw_duration or 100))
+
+                    except (TypeError, ValueError):
+
+                        frame_duration_ms = 100
+
+                    pending_duration_ms += frame_duration_ms
+
+                    total_duration_ms += frame_duration_ms
+
+                    should_keep_frame = (
+
+                        frame_index % frame_step == 0
+
+                        or frame_index == frame_count - 1
+
+                    )
+
+                    if not should_keep_frame:
+
+                        continue
+
+                    sticker_frame = source.convert("RGBA")
+
+                    original_width, original_height = sticker_frame.size
+
+                    if original_width <= 0 or original_height <= 0:
+
+                        sticker_frame.close()
+
+                        pending_duration_ms = 0
+
+                        continue
+
+                    scale = min(
+
+                        max_sticker_width / original_width,
+
+                        max_sticker_height / original_height,
+
+                        2.5,
+
+                    )
+
+                    resized_size = (
+
+                        max(1, int(round(original_width * scale))),
+
+                        max(1, int(round(original_height * scale))),
+
+                    )
+
+                    if resized_size != sticker_frame.size:
+
+                        resized = sticker_frame.resize(
+
+                            resized_size, Image.Resampling.LANCZOS
+
+                        )
+
+                        sticker_frame.close()
+
+                        sticker_frame = resized
+
+                    animation_frames.append((
+
+                        sticker_frame.copy(),
+
+                        max(0.02, pending_duration_ms / 1000.0),
+
+                    ))
+
+                    sticker_frame.close()
+
+                    pending_duration_ms = 0
+
+                if not animation_frames:
+
+                    return (), 0.0
+
+                cycle_duration = max(0.02, total_duration_ms / 1000.0)
+
+                return tuple(animation_frames), cycle_duration
+
+        except Exception as sticker_load_exc:
+
+            print(
+
+                f"⚠️ [SUBSCRIBE-STICKERS] Could not load sticker '{os.path.basename(sticker_path)}': "
+
+                f"{sticker_load_exc}"
+
+            )
+
+            return (), 0.0
 
 
     def draw_animated_caption(frame_image, global_time, duration, caption_plan):
+
         """
+
         Preserve the existing single-row typewriter appearance, but reveal each
+
         recognized character according to the word timestamps detected in audio.
+
         """
-        if not caption_plan or not caption_plan.get("events"):
+
+        if not caption_plan:
+
             return frame_image
 
         width, height = frame_image.size
 
+        now = max(0.0, float(global_time))
+
+        # Render any active transparent sticker first, centered in both axes.
+        # The caption is drawn afterwards, so the existing caption appearance remains intact.
+
+        for sticker_event in caption_plan.get("sticker_events", []):
+
+            sticker_start = float(sticker_event.get("start_time", 0.0))
+
+            sticker_end = float(sticker_event.get("end_time", sticker_start))
+
+            if not (sticker_start <= now < sticker_end):
+
+                continue
+
+            animation_frames, animation_cycle = _load_subscribe_sticker_animation(
+
+                sticker_event["path"], width, height
+
+            )
+
+            if not animation_frames or animation_cycle <= 0:
+
+                continue
+
+            animation_time = (now - sticker_start) % animation_cycle
+
+            elapsed_frame_time = 0.0
+
+            sticker_frame = animation_frames[-1][0]
+
+            for candidate_frame, candidate_duration in animation_frames:
+
+                if animation_time < elapsed_frame_time + candidate_duration:
+
+                    sticker_frame = candidate_frame
+
+                    break
+
+                elapsed_frame_time += candidate_duration
+
+            sticker_x = (width - sticker_frame.width) // 2
+
+            sticker_y = (height - sticker_frame.height) // 2
+
+            frame_image.paste(sticker_frame, (sticker_x, sticker_y), sticker_frame)
+
+        events = caption_plan.get("events", [])
+
+        if not events:
+
+            return frame_image
+
         # IMPORTANT: original font-size calculation is unchanged.
+
         font_size = max(24, min(64, int(width / 35)))
+
         font = load_font(font_size)
+
         draw = ImageDraw.Draw(frame_image)
 
-        now = max(0.0, float(global_time))
-        events = caption_plan["events"]
         event_starts = caption_plan["event_start_times"]
 
         low, high = 0, len(event_starts)
+
         while low < high:
+
             middle = (low + high) // 2
+
             if event_starts[middle] <= now:
+
                 low = middle + 1
+
             else:
+
                 high = middle
 
         event_index = low - 1
+
         if event_index < 0:
+
             return frame_image
 
         event = events[event_index]
+
         char_times = event["char_times"]
 
         # Reveal only characters whose corresponding spoken-word timing has
+
         # arrived. The text still appears with the same progressive typewriter.
+
         visible_count = 0
+
         for reveal_time in char_times:
+
             if reveal_time <= now:
+
                 visible_count += 1
+
             else:
+
                 break
 
         row = event["text"][:visible_count].rstrip()
+
         if not row:
+
             return frame_image
 
         bbox = draw.textbbox((0, 0), row or " ", font=font, stroke_width=1)
+
         line_height = bbox[3] - bbox[1]
+
         bottom_margin = int(height * 0.075)
+
         y = max(4, height - bottom_margin - line_height)
 
         anchor_width = max(
+
             1,
+
             min(
+
                 int(width * 0.84),
+
                 int(event.get("anchor_width", caption_plan["anchor_width"]))
+
             )
+
         )
+
         x_left = max(10, (width - anchor_width) // 2)
 
         # Existing shadow, white text and black outline remain unchanged.
+
         shadow_offset = max(2, font_size // 28)
+
         draw.text(
+
             (x_left + shadow_offset, y + shadow_offset),
+
             row,
+
             font=font,
+
             fill=(0, 0, 0),
+
             stroke_width=2,
+
             stroke_fill=(0, 0, 0),
+
         )
+
         draw.text(
+
             (x_left, y),
+
             row,
+
             font=font,
+
             fill=(255, 255, 255),
+
             stroke_width=1,
+
             stroke_fill=(0, 0, 0),
+
         )
+
         return frame_image
 
+    def build_caption_stream_plans(prepared_items, frame_width, recognized_words, sticker_events=None):
 
-    def build_caption_stream_plans(prepared_items, frame_width, recognized_words):
         """
+
         Build one continuous, single-row caption stream from ASR word timings.
 
         Each character is revealed during the actual spoken interval of its word.
+
         Rows are still greedily packed to the same maximum width and remain
+
         visible until the next row's first spoken word.
+
         """
+
         measure_canvas = Image.new("RGB", (frame_width, 100))
+
         measure_draw = ImageDraw.Draw(measure_canvas)
 
         # IMPORTANT: original font-size calculation is unchanged.
+
         font_size = max(24, min(64, int(frame_width / 35)))
+
         font = load_font(font_size)
+
         max_text_width = int(frame_width * 0.84)
 
         rows = []
+
         for token in recognized_words:
+
             raw_word = str(token.get("word", "")).strip()
+
             if not raw_word:
+
                 continue
 
             display_word = raw_word.upper()
+
             if _caption_text_width(measure_draw, display_word, font) > max_text_width:
+
                 display_word = _fit_word_suffix(
+
                     measure_draw, display_word, font, max_text_width
+
                 )
 
             token_start = max(0.0, float(token.get("start", 0.0)))
+
             token_end = max(token_start + 0.015, float(token.get("end", token_start + 0.1)))
 
             if not rows:
+
                 rows.append({
+
                     "words": [],
+
                     "tokens": [],
+
                     "start_time": token_start,
+
                 })
 
             current_text = " ".join(rows[-1]["words"])
+
             candidate = f"{current_text} {display_word}".strip()
 
             if rows[-1]["words"] and _caption_text_width(
+
                 measure_draw, candidate, font
+
             ) > max_text_width:
+
                 rows.append({
+
                     "words": [],
+
                     "tokens": [],
+
                     "start_time": token_start,
+
                 })
 
             rows[-1]["words"].append(display_word)
+
             rows[-1]["tokens"].append({
+
                 "word": display_word,
+
                 "start": token_start,
+
                 "end": token_end,
+
             })
 
         row_widths = []
+
         for row_info in rows:
+
             row_text = " ".join(row_info["words"])
+
             row_widths.append(_caption_text_width(measure_draw, row_text, font))
 
         anchor_width = max(row_widths, default=1)
+
         events = []
 
         for row_id, row_info in enumerate(rows):
+
             words = row_info["words"]
+
             tokens = row_info["tokens"]
+
             full_text = " ".join(words)
+
             char_times = []
 
             for token_index, token in enumerate(tokens):
+
                 word = token["word"]
+
                 word_start = token["start"]
+
                 word_end = max(word_start + 0.015, token["end"])
+
                 word_duration = word_end - word_start
 
                 # Spread character reveal across the detected spoken duration.
+
                 for char_index in range(len(word)):
+
                     reveal_time = word_start + (
+
                         (char_index + 1) / max(1, len(word))
+
                     ) * word_duration
+
                     if char_times:
+
                         reveal_time = max(reveal_time, char_times[-1])
+
                     char_times.append(reveal_time)
 
                 if token_index < len(tokens) - 1:
+
                     # The space appears as the next word begins.
+
                     space_time = tokens[token_index + 1]["start"]
+
                     if char_times:
+
                         space_time = max(space_time, char_times[-1])
+
                     char_times.append(space_time)
 
             row_start = float(row_info["start_time"])
+
             next_row_start = (
+
                 float(rows[row_id + 1]["start_time"])
+
                 if row_id + 1 < len(rows)
+
                 else max(
+
                     sum(float(item["duration"]) for item in prepared_items),
+
                     max(
+
                         (token["end"] for token in row_info["tokens"]),
+
                         default=row_start
+
                     ) + 0.5
+
                 )
+
             )
 
             slot_duration = max(0.01, next_row_start - row_start)
+
             events.append({
+
                 "row_id": row_id,
+
                 "start_time": row_start,
+
                 "slot_duration": slot_duration,
+
                 "text": full_text,
+
                 "char_times": char_times,
+
                 "anchor_width": max(row_widths[:row_id + 1], default=1),
+
             })
 
         try:
+
             measure_canvas.close()
+
         except Exception:
+
             pass
 
         print(
+
             f"📝 [CAPTIONS] Planned {len(events)} single-row caption segments "
+
             f"from {sum(len(row['tokens']) for row in rows)} recognized words. "
+
             "Character reveal follows detected speech timestamps."
+
         )
 
         scene_starts = []
+
         scene_cursor = 0.0
+
         for item in prepared_items:
+
             scene_starts.append(scene_cursor)
+
             scene_cursor += max(0.001, float(item.get("duration", 0.1)))
 
         return {
+
             "events": events,
+
             "event_start_times": [event["start_time"] for event in events],
+
             "scene_starts": scene_starts,
+
             "anchor_width": anchor_width,
+
+            "sticker_events": sticker_events or [],
+
         }
 
     def apply_image_motion(image, local_time, duration, scene_index):
 
-        """Apply a subtle Ken Burns-style zoom/pan without changing caption layout."""
+        """Apply visible continuous zoom plus one smooth left/right pan reversal."""
 
         width, height = image.size
 
@@ -7529,31 +8695,48 @@ def video_producer():
 
         progress = min(1.0, max(0.0, float(local_time) / safe_duration))
 
+        # Start slightly zoomed-in, then continue zooming for the entire scene.
+        # The 18-point increase is deliberately stronger than the old 4.5% move.
 
+        zoom = 1.04 + (0.18 * progress)
 
-        # Alternate gentle zoom directions and pan directions from scene to scene.
+        crop_width = max(2, min(width, int(round(width / zoom))))
 
-        zoom = 1.0 + 0.045 * progress
-
-        crop_width = max(2, int(width / zoom))
-
-        crop_height = max(2, int(height / zoom))
+        crop_height = max(2, min(height, int(round(height / zoom))))
 
         max_x = max(0, width - crop_width)
 
         max_y = max(0, height - crop_height)
 
+        # A triangular path gives one uninterrupted move to one side during
+        # the first half, then an immediate direction change and return during
+        # the second half. It has no pause/easing wobble at the midpoint.
 
+        if progress <= 0.5:
 
-        # Ease the motion so it starts and ends smoothly.
+            travel = progress * 2.0
 
-        eased = progress * progress * (3.0 - 2.0 * progress)
+        else:
 
-        direction = 1 if scene_index % 2 == 0 else -1
+            travel = (1.0 - progress) * 2.0
 
-        x = int((max_x * eased) if direction > 0 else (max_x * (1.0 - eased)))
+        # Pick one direction per entry, not per frame. A fixed per-entry seed
+        # keeps the same clip deterministic across MoviePy's repeated frame calls.
 
-        y = int((max_y * eased) if (scene_index // 2) % 2 == 0 else (max_y * (1.0 - eased)))
+        direction = random.Random(1947 + int(scene_index)).choice((-1, 1))
+
+        pan_fraction = travel if direction > 0 else (1.0 - travel)
+
+        x = int(round(max_x * pan_fraction))
+
+        # Keep vertical framing centered so the visible motion is cleanly
+        # horizontal rather than adding a second distracting direction.
+
+        y = int(round(max_y * 0.5))
+
+        x = max(0, min(x, width - crop_width))
+
+        y = max(0, min(y, height - crop_height))
 
         cropped = image.crop((x, y, x + crop_width, y + crop_height))
 
@@ -7641,8 +8824,6 @@ def video_producer():
 
     if audio_duration and audio_duration > 0 and prepared:
 
-
-
         # Keep the final image visible through the exact end of the narration.
 
         # Earlier scenes keep their durations when they fit within the audio.
@@ -7654,8 +8835,6 @@ def video_producer():
         last_available = float(audio_duration) - previous_duration
 
         if last_available > 0:
-
-
 
             # Extend OR shorten only the final image so the video ends with audio.
 
@@ -7678,8 +8857,6 @@ def video_producer():
                 print("🎯 Final image timing already matches the audio end")
 
         else:
-
-
 
             # If all preceding scenes alone exceed the audio, preserve the final
 
@@ -7709,8 +8886,6 @@ def video_producer():
 
             total_duration = sum(float(item["duration"]) for item in prepared)
 
-
-
             # Remove tiny floating-point discrepancies so the last frame lands
 
             # on the audio endpoint.
@@ -7727,11 +8902,9 @@ def video_producer():
 
             print("⚠️ Scene timings exceeded the audio; fitted earlier scenes so the final image remains until audio ends")
 
-
-
     # Existing outputs are preserved. If the target project filename already
 
-    # exists, it will be renamed to \\\\\\\<project>_old_N.mp4 before the new render
+    # exists, it will be renamed to \\\\\\\\\\\\\\\<project>_old_N.mp4 before the new render
 
     # is written, where N is one greater than the highest existing old number.
 
@@ -7747,11 +8920,23 @@ def video_producer():
 
     try:
 
-        print("🎬 Transitions enabled: alternating crossfade, directional wipe, and slide")
+        if include_transitions:
+
+            print("🎬 [TRANSITIONS] Enabled: alternating crossfade, directional wipe, and slide")
+
+        else:
+
+            print("⏭️ [TRANSITIONS] Disabled by project settings; scenes will use direct cuts")
+
+        if include_captions:
+
+            print("📝 [CAPTIONS] Caption engine enabled for this project")
+
+        else:
+
+            print("⏭️ [CAPTIONS] Caption engine is OFF; video frames will not call caption rendering")
 
         print("🖥️ Keep-awake request: preventing Windows sleep and display timeout during rendering")
-
-
 
         # Prevent Windows from sleeping or turning off the display during the
 
@@ -7791,15 +8976,11 @@ def video_producer():
 
             print(f"⚠️ Could not enable keep-awake: {awake_exc}")
 
-        transition_duration = 0.45  # seconds per image change
+        transition_duration = 0.45 if include_transitions else 0.0
 
         transition_types = ("crossfade", "wipe_left", "slide_left", "wipe_right", "crossfade", "slide_right")
 
         clips = []
-
-        scene_start = 0.0
-
-
 
         # Each scene uses its full assigned duration. The next scene begins
 
@@ -7807,15 +8988,35 @@ def video_producer():
 
         visual_durations = [float(item["duration"]) for item in prepared]
 
+        scene_start_offsets = []
 
+        scene_cursor = 0.0
 
-        # Pre-plan one continuous caption stream. Rows are timed using each
+        for scene_duration in visual_durations:
 
-        # entry's duration and the number of rows its words occupy.
+            scene_start_offsets.append(scene_cursor)
 
-        caption_stream_plan = build_caption_stream_plans(prepared, video_width, audio_words)
+            scene_cursor += max(0.001, float(scene_duration))
 
+        # Build the ASR-driven caption stream only when explicitly enabled.
+        # When disabled, no sticker search, caption planning, or caption render
+        # callback is executed during video production.
 
+        if include_captions:
+
+            subscribe_sticker_events = build_subscribe_sticker_events(audio_words)
+
+            caption_stream_plan = build_caption_stream_plans(
+
+                prepared, video_width, audio_words, subscribe_sticker_events
+
+            )
+
+        else:
+
+            subscribe_sticker_events = []
+
+            caption_stream_plan = None
 
         for scene_index, item in enumerate(prepared):
 
@@ -7823,17 +9024,39 @@ def video_producer():
 
             duration = float(visual_durations[scene_index])
 
-            caption_plan = caption_stream_plan
+            caption_plan = caption_stream_plan if include_captions else None
 
-            global_scene_start = caption_stream_plan["scene_starts"][scene_index]
+            global_scene_start = (
+
+                caption_stream_plan["scene_starts"][scene_index]
+
+                if include_captions and caption_stream_plan
+
+                else scene_start_offsets[scene_index]
+
+            )
 
             previous_image = prepared[scene_index - 1]["image"] if scene_index > 0 else None
 
-            transition_type = transition_types[(scene_index - 1) % len(transition_types)] if scene_index > 0 else "none"
+            transition_type = (
 
-            active_transition = min(transition_duration, duration * 0.45) if previous_image is not None else 0.0
+                transition_types[(scene_index - 1) % len(transition_types)]
 
+                if include_transitions and scene_index > 0
 
+                else "none"
+
+            )
+
+            active_transition = (
+
+                min(transition_duration, duration * 0.45)
+
+                if include_transitions and previous_image is not None
+
+                else 0.0
+
+            )
 
             def make_frame(
 
@@ -7863,13 +9086,11 @@ def video_producer():
 
                 current = animated_current.copy()
 
-
-
                 # Mix the previous scene into the beginning of this scene.
 
                 # Transitions are deterministic so repeated renders are stable.
 
-                if previous is not None and trans_duration > 0 and t < trans_duration:
+                if include_transitions and previous is not None and trans_duration > 0 and t < trans_duration:
 
                     progress = min(1.0, max(0.0, t / trans_duration))
 
@@ -7917,15 +9138,19 @@ def video_producer():
 
                             current.paste(animated_current.crop((w - offset, 0, w, h)), (0, 0))
 
-                rendered = draw_animated_caption(
+                if include_captions and stream_plan:
 
-                    current, absolute_scene_start + t, clip_duration, stream_plan
+                    rendered = draw_animated_caption(
 
-                )
+                        current, absolute_scene_start + t, clip_duration, stream_plan
+
+                    )
+
+                else:
+
+                    rendered = current
 
                 return np.asarray(rendered, dtype=np.uint8)
-
-
 
             clip = VideoClip(frame_function=make_frame, duration=duration)
 
@@ -7937,7 +9162,9 @@ def video_producer():
 
                 f"{item.get('filename', 'entry')} | {duration:.2f}s | "
 
-                f"transition={transition_type}"
+                f"transition={transition_type if include_transitions else 'OFF'} | "
+
+                f"captions={'ON' if include_captions else 'OFF'}"
 
             )
 
@@ -7977,17 +9204,15 @@ def video_producer():
 
                 final_clip = final_clip.set_audio(audio_clip)
 
-
-
         # Preserve the previous project output instead of deleting it.
 
-        # Continue numbering after the highest existing \\\\\\\<project>_old_N.mp4.
+        # Continue numbering after the highest existing \\\\\\\\\\\\\\\<project>_old_N.mp4.
 
         if os.path.isfile(output_path):
 
             old_pattern = re.compile(
 
-                rf"^{re.escape(normalized_project_title)}_old_(\d+)\.mp4$",
+                rf"^{re.escape(normalized_project_title)}_old_(\d+).mp4$",
 
                 re.IGNORECASE,
 
@@ -8085,8 +9310,6 @@ def video_producer():
 
     finally:
 
-
-
         # Safety net: release the Windows keep-awake request even if clip
 
         # construction or encoding failed before the normal release point.
@@ -8123,8 +9346,6 @@ def video_producer():
 
                 pass
 
-
-
     # Clean temporary folder left by older versions, if present.
 
     try:
@@ -8151,7 +9372,21 @@ def video_producer():
 
     print(f"   Final duration: {total_duration:.2f}s")
 
-    print("   Captions: animated typewriter reveal, pop-in, yellow current-word underline")
+    print(
+
+        "   Transitions: "
+
+        + ("✅ Enabled" if include_transitions else "⏭️ Disabled (direct cuts)")
+
+    )
+
+    print(
+
+        "   Captions: "
+
+        + ("✅ Animated typewriter reveal" if include_captions else "⏭️ Disabled")
+
+    )
 
     print(f"   Audio: {'✅ Added' if audio_file_path else '❌ None'}")
 
@@ -8185,11 +9420,13 @@ def video_producer():
 
         "output_path": output_path,
 
-        "caption_animation": "typewriter_pop",
+        "include_transitions": include_transitions,
+
+        "include_captions": include_captions,
+
+        "caption_animation": "typewriter_pop" if include_captions else None,
 
     }
-
-
 
     # Continue through READY_SCRIPT in the same invocation. The next call
 
@@ -8198,6 +9435,18 @@ def video_producer():
     # unfinished project. Return the current result if no further project is
 
     # eligible; otherwise return the last successful project's result.
+
+    # Release any cached sticker frames before the next queued project starts.
+
+    if include_captions:
+
+        try:
+
+            _load_subscribe_sticker_animation.cache_clear()
+
+        except Exception:
+
+            pass
 
     print("🔎 [READY-SCRIPT] Looking for the next unfinished project...")
 
