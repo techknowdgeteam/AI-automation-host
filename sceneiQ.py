@@ -3074,7 +3074,23 @@ def generate_google_flow_images():
     - On completion, verifies all scene images exist, appends the completed project
       snapshot to READY_SCRIPT, then removes project_name from PANEL_PATH
     - On any error/abort keeps currently_running as "generate_google_flow_images()"
-    - Retries failed workflow runs indefinitely until manually stopped with Alt+/
+    - Ctrl+R restarts the workflow from its entry point without resuming a scene phase
+    - Restart page detection checks whatdoyouwantocreate FIRST, then new_project,
+      and navigates to GOOGLE_FLOW_URL only when neither is visible
+    - A restart never resumes directly at generation completion or image download
+    - Alt+/ is the explicit manual stop shortcut
+    - Every image/page/generation/download polling wait is bounded to 40 seconds
+    - A single OS/pyautogui call cannot be safely force-killed while it is blocked
+    - Failed stages trigger a full automatic restart with fresh panel.json state
+    - Before opening Google Flow, detects the current visible page state in Edge
+    - Resumes directly from the prompt workspace or New Project chooser when visible
+    - Navigates to GOOGLE_FLOW_URL only when neither known page state is visible
+    - Re-detects the page state on every automatic or manual restart
+    - On every restart checks whatdoyouwantocreate FIRST, then new_project,
+      and opens GOOGLE_FLOW_URL only when neither is visible
+    - Restart does not reuse saved scene-phase checkpoints
+    - Checks for exit_editinggfimage.png regularly throughout every workflow stage
+    - Requires imagerenderingprogress.png and positions the cursor below it before preparing a download
     - Restores the image-hover cursor position before each download retry
     """
     import os
@@ -3083,6 +3099,7 @@ def generate_google_flow_images():
     import re
     import subprocess
     import traceback
+    import threading
 
     try:
         import pyautogui
@@ -3098,6 +3115,59 @@ def generate_google_flow_images():
         return
 
     pyautogui.PAUSE = 0.0
+    STAGE_TIMEOUT_SECONDS = 40.0
+    restart_event = threading.Event()
+    stop_event = threading.Event()
+    terminate_automation = False
+
+    # The shared polling path checks the exit editing control at most once per
+    # second. The re-entry guard is essential because clicking that control
+    # itself uses _sleep(), which also calls check_for_termination().
+    exit_editing_CHECK_INTERVAL = 1.0
+    last_exit_editing_check_at = 0.0
+    exit_editing_check_active = False
+    exit_editing_click_in_progress = False
+    download_ui_sequence_active = False
+
+    # While this lock is active, the cursor is pinned below the one
+    # imagerenderingprogress match. Only that progress indicator (during
+    # rendering) and moregf.png (after rendering) may be searched.
+    image_render_lock_active = False
+    image_render_lock_position = None
+
+    class _WorkflowRestart(BaseException):
+        """Unwind the current workflow and let the supervisor restart it."""
+        pass
+
+    class _ManualStop(BaseException):
+        """Raised only when the user presses Alt+/ ."""
+        pass
+
+    def _bounded_timeout(value):
+        try:
+            return max(0.1, min(float(value), STAGE_TIMEOUT_SECONDS))
+        except (TypeError, ValueError):
+            return STAGE_TIMEOUT_SECONDS
+
+    def _sleep(seconds):
+        """Sleep in short slices so Ctrl+R and Alt+/ are handled promptly."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while True:
+            # Poll continuously so Ctrl+R, Alt+/, and the exit editing control
+            # are handled during all waits, including generation/download stages.
+            check_for_termination()
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(0.2, remaining))
+
+    def _supervisor_wait(seconds):
+        """Interruptible delay used only between complete workflow attempts."""
+        deadline = time.monotonic() + max(0.0, float(seconds))
+        while time.monotonic() < deadline:
+            if stop_event.is_set() or restart_event.is_set():
+                return
+            time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
 
     # ------------------------------------------------------------------
     # Structure-independent JSON discovery helpers
@@ -3567,16 +3637,8 @@ def generate_google_flow_images():
     print(f"📊 [CONFIG] Found {total_entries} total entries")
 
     if total_entries == 0:
-        print("❌ No entries found to process")
-        try:
-            hud.print("No scenes were found to work on.", "error")
-        except Exception:
-            pass
-        _set_currently_running("generate_google_flow_images()", status="error",
-                               operation_status="❌ No entries found to process")
-        return
+        print("⚠️ No entries are currently available; the supervisor will re-read panel.json and retry.")
 
-    terminate_automation = False
     operation_status_flag = True
     operation_status_message = ""
     operation_aborted = False
@@ -3628,41 +3690,60 @@ def generate_google_flow_images():
                 raise IOError("Could not persist operation status to panel.json")
 
             if is_abort:
-                print(f"🛑 [STATUS] Operation aborted: {message}")
-                raise SystemExit(f"Operation aborted: {message}")
-        except SystemExit:
-            raise
+                print(f"🛑 [STATUS] Operation marked aborted: {message}")
         except Exception as e:
             print(f"⚠️ [STATUS] Failed to update operation status: {e}")
 
     def abort_operation(reason):
-        print(f"🛑 [ABORT] Aborting operation: {reason}")
-        update_operation_status(f"Aborting Google Flow image generation: {reason}", is_abort=True)
+        print(f"🔁 [RECOVERY] Restarting the complete Google Flow function: {reason}")
+        update_operation_status(f"Restart requested: {reason}", is_error=True)
+        raise _WorkflowRestart(str(reason))
 
     def check_operation_status():
-        if not operation_status_flag or operation_aborted:
-            print("🛑 [STATUS] Operation status is invalid - aborting")
-            update_operation_status("Operation status invalid - aborting Google Flow operation", is_abort=True)
-            return False
-        return True
+        return bool(operation_status_flag and not operation_aborted)
+
+    def on_restart_shortcut():
+        restart_event.set()
+        print("🔁 [HOTKEY] Ctrl+R pressed — current operation will be reset and restarted.")
 
     def on_terminate_shortcut():
         nonlocal terminate_automation
-        try:
-            hud.print("Stopped at your request.", "warning")
-        except Exception:
-            pass
-        print("🛑 Manual Stop Triggered!")
         terminate_automation = True
-        update_operation_status("Google Flow operation manually terminated by user (Alt+/)", is_abort=True)
-
+        stop_event.set()
+        print("🛑 [HOTKEY] Alt+/ pressed — manual stop requested.")
 
     def check_for_termination():
-        if terminate_automation:
-            update_operation_status("Google Flow operation terminated by user", is_abort=True)
-            raise KeyboardInterrupt("User forced exit via shortcut key.")
+        nonlocal last_exit_editing_check_at, exit_editing_check_active
+        nonlocal download_ui_sequence_active
+
+        if stop_event.is_set() or terminate_automation:
+            raise _ManualStop("Manual stop requested with Alt+/")
+        if restart_event.is_set():
+            restart_event.clear()
+            raise _WorkflowRestart("Manual restart requested with Ctrl+R")
         if not check_operation_status():
-            raise SystemExit("Operation status invalid")
+            raise _WorkflowRestart("Operation status is invalid; restarting the workflow")
+
+        # exit editing may appear unexpectedly if a generated photo opens in
+        # the editor. Check for it at every shared polling point, but throttle
+        # screen matching so it does not dominate the GUI automation.
+        now = time.monotonic()
+        if (
+            not download_ui_sequence_active
+            and not image_render_lock_active
+            and not exit_editing_check_active
+            and now - last_exit_editing_check_at >= exit_editing_CHECK_INTERVAL
+        ):
+            last_exit_editing_check_at = now
+            exit_editing_check_active = True
+            try:
+                check_and_click_exit_editing()
+            except (_WorkflowRestart, _ManualStop):
+                raise
+            except Exception as exit_editing_error:
+                print(f"⚠️ [DONE-EDITING] Periodic check failed safely: {exit_editing_error}")
+            finally:
+                exit_editing_check_active = False
 
     def format_entry_for_paste(entry_data):
         """Serialize only the two approved prompt fields for the new scene schema."""
@@ -3757,7 +3838,8 @@ def generate_google_flow_images():
                 pass
         return None, None
 
-    def wait_for_image_with_fallback(image_name, timeout_seconds=60, confidence=0.8, region=None):
+    def wait_for_image_with_fallback(image_name, timeout_seconds=40, confidence=0.8, region=None):
+        timeout_seconds = _bounded_timeout(timeout_seconds)
         variants = get_image_variants(image_name)
         if not variants:
             print(f"❌ [FALLBACK] No variants found for {image_name}")
@@ -3781,56 +3863,21 @@ def generate_google_flow_images():
                 elapsed = int(current_time - start_time)
                 print(f"⏳ [FALLBACK] Still waiting for {image_name}... ({elapsed}s elapsed)")
                 last_status_time = current_time
-            time.sleep(0.3)
+            _sleep(0.3)
         print(f"❌ [FALLBACK] {image_name} not found in any variant within {timeout_seconds} seconds")
         return None, None
 
     def wait_for_image_indefinitely(image_name, confidence=0.8, region=None):
-        print(f"🔍 [FALLBACK] Waiting indefinitely for {image_name}...")
-        start_time = time.time()
-        last_status_time = 0
-        last_variant_count = -1
-        warning_shown = False
-        while True:
-            check_for_termination()
-            variants = get_image_variants(image_name)
-            if len(variants) != last_variant_count:
-                print(f"🔍 [FALLBACK] {image_name}: {len(variants)} variant(s) available")
-                last_variant_count = len(variants)
-            if not variants:
-                if not warning_shown:
-                    print(f"⚠️ [FALLBACK] No variants found for {image_name} yet — will keep checking folder...")
-                    warning_shown = True
-                current_time = time.time()
-                if current_time - last_status_time > 10:
-                    elapsed = int(current_time - start_time)
-                    print(f"⏳ [FALLBACK] Still waiting for {image_name} (file not found in gui_images)... ({elapsed}s elapsed)")
-                    try:
-                        hud.print(f"Still getting the page ready... ({elapsed}s)", "waiting")
-                    except Exception:
-                        pass
-                    last_status_time = current_time
-                time.sleep(1.0)
-                continue
-            for variant_path in variants:
-                variant_name = os.path.basename(variant_path)
-                try:
-                    location = pyautogui.locateCenterOnScreen(variant_path, confidence=confidence, grayscale=False)
-                    if location:
-                        print(f"✅ [FALLBACK] Found {variant_name} at ({location.x}, {location.y})")
-                        return location
-                except Exception:
-                    pass
-            current_time = time.time()
-            if current_time - last_status_time > 10:
-                elapsed = int(current_time - start_time)
-                print(f"⏳ [FALLBACK] Still waiting for {image_name} on screen... ({elapsed}s elapsed)")
-                try:
-                    hud.print(f"Still getting the page ready... ({elapsed}s)", "waiting")
-                except Exception:
-                    pass
-                last_status_time = current_time
-            time.sleep(0.3)
+        """Legacy name; this is deliberately bounded and triggers recovery."""
+        location, _ = wait_for_image_with_fallback(
+            image_name,
+            timeout_seconds=STAGE_TIMEOUT_SECONDS,
+            confidence=confidence,
+            region=region
+        )
+        if not location:
+            raise _WorkflowRestart(f"{image_name} was not found within 40 seconds")
+        return location
 
     def find_image_at_location(image_name, target_x, target_y, tolerance=20, confidence=0.7):
         variants = get_image_variants(image_name)
@@ -3908,12 +3955,12 @@ def generate_google_flow_images():
                 if win32gui.IsIconic(hwnd):
                     print("🔄 [WINDOW] Window was minimized, restoring...")
                     win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    time.sleep(0.3)
+                    _sleep(0.3)
                 print("🔄 [WINDOW] Maximizing window...")
                 win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
-                time.sleep(0.5)
+                _sleep(0.5)
                 win32gui.SetForegroundWindow(hwnd)
-                time.sleep(0.2)
+                _sleep(0.2)
                 print("✅ [WINDOW] Window ready - maximized and focused")
                 update_operation_status("Browser window ready for Google Flow operation")
                 return hwnd
@@ -3930,7 +3977,7 @@ def generate_google_flow_images():
 
         for attempt in range(20):
             check_for_termination()
-            time.sleep(0.5)
+            _sleep(0.5)
             edge_windows = get_edge_window_on_monitor(current_monitor)
             if edge_windows:
                 hwnd = edge_windows[0]['hwnd']
@@ -3938,11 +3985,11 @@ def generate_google_flow_images():
                 try:
                     if win32gui.IsIconic(hwnd):
                         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                        time.sleep(0.3)
+                        _sleep(0.3)
                     win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
-                    time.sleep(0.5)
+                    _sleep(0.5)
                     win32gui.SetForegroundWindow(hwnd)
-                    time.sleep(0.2)
+                    _sleep(0.2)
                     print("✅ [WINDOW] New window ready - maximized and focused")
                     update_operation_status("Browser launched for Google Flow operation")
                     return hwnd
@@ -3968,22 +4015,22 @@ def generate_google_flow_images():
             if win32gui.IsIconic(hwnd):
                 print("🔄 [FOCUS] Window was minimized, restoring...")
                 win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                time.sleep(0.3)
+                _sleep(0.3)
             current_foreground = win32gui.GetForegroundWindow()
             if current_foreground != hwnd:
                 print("🛡️ [FOCUS] Correcting window focus...")
                 win32gui.SetForegroundWindow(hwnd)
-                time.sleep(0.15)
+                _sleep(0.15)
             try:
                 placement = win32gui.GetWindowPlacement(hwnd)
                 if placement[1] != win32con.SW_SHOWMAXIMIZED:
                     print("🔄 [FOCUS] Window not maximized, maximizing...")
                     win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
-                    time.sleep(0.3)
+                    _sleep(0.3)
             except Exception:
                 try:
                     win32gui.ShowWindow(hwnd, win32con.SW_MAXIMIZE)
-                    time.sleep(0.3)
+                    _sleep(0.3)
                 except Exception:
                     pass
             return True
@@ -4007,13 +4054,13 @@ def generate_google_flow_images():
         pyperclip.copy(url)
         enforce_window_focus(hwnd)
         pyautogui.hotkey('ctrl', 'l')
-        time.sleep(0.1)
+        _sleep(0.1)
         enforce_window_focus(hwnd)
         pyautogui.hotkey('ctrl', 'v')
         pyautogui.press('enter')
         update_operation_status("Navigating to Google Flow URL...")
 
-    def wait_for_image(image_name, timeout_seconds=60, confidence=0.8, region=None):
+    def wait_for_image(image_name, timeout_seconds=40, confidence=0.8, region=None):
         location, _ = wait_for_image_with_fallback(image_name, timeout_seconds, confidence, region)
         return location
 
@@ -4035,9 +4082,9 @@ def generate_google_flow_images():
     def move_cursor_below_search(search_location, offset_px=100):
         target_x = search_location.x
         target_y = search_location.y + offset_px
-        print(f"🖱️ [CURSOR] Moving cursor {offset_px}px BELOW searchgfimage.png (same column) to ({target_x}, {target_y})")
+        print(f"🖱️ [CURSOR] Moving cursor {offset_px}px BELOW imagerenderingprogress.png (same column) to ({target_x}, {target_y})")
         pyautogui.moveTo(target_x, target_y, duration=0.2)
-        time.sleep(0.3)
+        _sleep(0.3)
         return target_x, target_y
 
     def click_right_edge_of_image(image_name, confidence=0.7):
@@ -4051,7 +4098,7 @@ def generate_google_flow_images():
                     print(f"🎯 [RIGHT-EDGE] Clicking {os.path.basename(variant_path)} right edge at ({click_x}, {click_y})")
                     pyautogui.moveTo(click_x, click_y, duration=0.1)
                     pyautogui.click()
-                    time.sleep(0.5)
+                    _sleep(0.5)
                     return True
             except Exception:
                 pass
@@ -4060,53 +4107,309 @@ def generate_google_flow_images():
     def scroll_down_multiple(times=3):
         for i in range(times):
             pyautogui.scroll(500)
-            time.sleep(0.3)
+            _sleep(0.3)
             print(f"⬇️ [SCROLL] Scrolled down ({i+1}/{times}) at current cursor position")
-        time.sleep(0.5)
+        _sleep(0.5)
 
-    # --- GOOGLE FLOW SPECIFIC HELPERS (identical to original, status-aware) ---
-    def wait_for_new_project_and_click(hwnd, timeout_seconds=120):
-        print(f"🔍 [GF] Waiting for new_project.png...")
+    # --- GOOGLE FLOW PAGE-STATE DETECTION / RECOVERY HELPERS ---
+    # Page-state priority is intentional:
+    #   1. whatdoyouwantocreate.png = already inside the prompt workspace (most advanced)
+    #   2. new_project.png          = Google Flow landing / project chooser
+    #   3. expandgfsidepanel.png    = likely an existing workspace with its prompt panel collapsed
+    #   4. unknown                  = neither recognized page is currently visible
+    # The prompt workspace is checked FIRST so a restart never clicks New Project
+    # or reloads the URL when it can already continue processing entries.
+    def detect_google_flow_stage(hwnd=None):
+        check_for_termination()
+        if hwnd is not None:
+            enforce_window_focus(hwnd)
+
+        prompt_location, prompt_variant = find_image_with_fallback(
+            "whatdoyouwantocreate.png", confidence=0.8
+        )
+        if prompt_location:
+            variant_name = os.path.basename(prompt_variant) if prompt_variant else "whatdoyouwantocreate.png"
+            print(
+                f"✅ [PAGE-STATE] Prompt workspace detected ({variant_name}) at "
+                f"({prompt_location.x}, {prompt_location.y})"
+            )
+            return "prompt", prompt_location
+
+        new_project_location, new_project_variant = find_image_with_fallback(
+            "new_project.png", confidence=0.8
+        )
+        if new_project_location:
+            variant_name = os.path.basename(new_project_variant) if new_project_variant else "new_project.png"
+            print(
+                f"✅ [PAGE-STATE] New Project page detected ({variant_name}) at "
+                f"({new_project_location.x}, {new_project_location.y})"
+            )
+            return "new_project", new_project_location
+
+        expand_location, expand_variant = find_image_with_fallback(
+            "expandgfsidepanel.png", confidence=0.8
+        )
+        if expand_location:
+            variant_name = os.path.basename(expand_variant) if expand_variant else "expandgfsidepanel.png"
+            print(
+                f"✅ [PAGE-STATE] Existing Flow workspace likely detected; prompt panel is "
+                f"collapsed ({variant_name}) at ({expand_location.x}, {expand_location.y})"
+            )
+            return "collapsed_workspace", expand_location
+
+        print(
+            "ℹ️ [PAGE-STATE] Neither whatdoyouwantocreate.png nor new_project.png "
+            "is visible; no recognized Google Flow page state is currently detected."
+        )
+        return "unknown", None
+
+    def detect_restart_page_stage(hwnd=None):
+        """Restart priority: prompt workspace -> New Project -> URL navigation.
+
+        Do not inspect or act on New Project until the prompt field has first
+        been searched for. If neither image is present, return unknown so the
+        caller relaunches GOOGLE_FLOW_URL. The collapsed-panel fallback remains
+        available after URL navigation through detect_google_flow_stage().
+        """
+        check_for_termination()
+        if hwnd is not None:
+            enforce_window_focus(hwnd)
+
+        # Restart page detection must follow the user's exact priority with no
+        # intervening image checks: prompt workspace, then New Project, then URL.
+        print("🔎 [RESTART-STATE] First checking whatdoyouwantocreate.png...")
+        prompt_location, prompt_variant = find_image_with_fallback(
+            "whatdoyouwantocreate.png", confidence=0.8
+        )
+        if prompt_location:
+            variant_name = os.path.basename(prompt_variant) if prompt_variant else "whatdoyouwantocreate.png"
+            print(
+                f"✅ [RESTART-STATE] Prompt workspace found FIRST ({variant_name}) at "
+                f"({prompt_location.x}, {prompt_location.y}); New Project will not be checked."
+            )
+            return "prompt", prompt_location
+
+        print("🔎 [RESTART-STATE] Prompt field not found; now checking new_project.png...")
+        new_project_location, new_project_variant = find_image_with_fallback(
+            "new_project.png", confidence=0.8
+        )
+        if new_project_location:
+            variant_name = os.path.basename(new_project_variant) if new_project_variant else "new_project.png"
+            print(
+                f"✅ [RESTART-STATE] New Project found after the prompt-field check "
+                f"({variant_name}) at ({new_project_location.x}, {new_project_location.y})."
+            )
+            return "new_project", new_project_location
+
+        print(
+            "ℹ️ [RESTART-STATE] Neither whatdoyouwantocreate.png nor new_project.png "
+            "is visible. The restart path will open GOOGLE_FLOW_URL."
+        )
+        return "unknown", None
+
+    def _click_google_flow_control(hwnd, location, description):
+        if location is None:
+            return False
+        check_for_termination()
+        enforce_window_focus(hwnd)
         try:
-            hud.print("Looking for the new project option...", "waiting")
-        except Exception:
-            pass
-        update_operation_status("Waiting for new project button...")
-        location = wait_for_image_indefinitely("new_project.png", confidence=0.8)
-        if location:
-            print(f"✅ [GF] Found new_project.png, clicking...")
             pyautogui.moveTo(location.x, location.y, duration=0.1)
             pyautogui.click()
-            time.sleep(1)
-            try:
-                hud.print("Starting a fresh workspace...", "success")
-            except Exception:
-                pass
-            update_operation_status("Clicked new project button")
+            _sleep(0.8)
+            print(f"🖱️ [PAGE-STATE] Clicked {description} at ({location.x}, {location.y})")
             return True
-        return False
+        except Exception as click_error:
+            print(f"⚠️ [PAGE-STATE] Could not click {description}: {click_error}")
+            return False
 
-    def wait_for_gfmedia_and_confirm(hwnd, timeout_seconds=120):
-        print(f"🔍 [GF] Waiting indefinitely for gfmedia.png to confirm page load...")
-        print(f"   💡 Tip: If gfmedia.png is missing from gui_images folder, add it and it will be picked up automatically.")
+    def wait_for_google_flow_stage(hwnd, timeout_seconds=40, check_interval=0.5):
+        timeout_seconds = _bounded_timeout(timeout_seconds)
+        """Wait for either the prompt workspace or the New Project chooser.
+
+        A collapsed side panel is expanded once, then the prompt field is checked
+        again. gfmedia.png is logged as a loading clue only; it is NOT accepted
+        as proof that the prompt workspace is ready.
+        """
+        print(
+            f"🔍 [PAGE-STATE] Waiting up to {timeout_seconds}s for either "
+            "whatdoyouwantocreate.png or new_project.png..."
+        )
         try:
-            hud.print("Waiting for the workspace to finish loading...", "waiting")
+            hud.print("Identifying the current Google Flow page...", "waiting")
         except Exception:
             pass
-        update_operation_status("Waiting for page to load (gfmedia)...")
-        location = wait_for_image_indefinitely("gfmedia.png", confidence=0.8)
-        if location:
-            print(f"✅ [GF] Found gfmedia.png - page loaded successfully!")
-            try:
-                hud.print("Workspace is ready.", "success")
-            except Exception:
-                pass
-            update_operation_status("Page loaded - gfmedia confirmed")
-            return True
-        print(f"⚠️ [GF] gfmedia.png wait was terminated before finding it")
+        update_operation_status("Detecting current Google Flow page state...")
+
+        start_time = time.time()
+        last_status_time = start_time
+        expanded_panel = False
+        gfmedia_reported = False
+
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+            stage, location = detect_google_flow_stage(hwnd)
+
+            if stage in ("prompt", "new_project"):
+                return stage, location
+
+            if stage == "collapsed_workspace" and not expanded_panel:
+                print("🔄 [PAGE-STATE] Expanding the existing workspace side panel...")
+                if _click_google_flow_control(hwnd, location, "expandgfsidepanel.png"):
+                    expanded_panel = True
+                    _sleep(0.5)
+                    continue
+                expanded_panel = True
+
+            if not gfmedia_reported:
+                gfmedia_location = find_image("gfmedia.png", confidence=0.8)
+                if gfmedia_location:
+                    gfmedia_reported = True
+                    print(
+                        "ℹ️ [PAGE-STATE] gfmedia.png is visible. The Flow page shell has "
+                        "loaded, but the required prompt/project control is still being checked."
+                    )
+
+            now = time.time()
+            if now - last_status_time >= 10:
+                elapsed = int(now - start_time)
+                print(
+                    f"⏳ [PAGE-STATE] Still identifying the Google Flow page "
+                    f"({elapsed}s/{timeout_seconds}s)..."
+                )
+                try:
+                    hud.print(f"Identifying the page... ({elapsed}s)", "waiting")
+                except Exception:
+                    pass
+                last_status_time = now
+
+            _sleep(check_interval)
+
+        print(
+            f"⏰ [PAGE-STATE] Timed out after {timeout_seconds}s: neither "
+            "whatdoyouwantocreate.png nor new_project.png became visible."
+        )
+        return "timeout", None
+
+    def wait_for_prompt_workspace(hwnd, timeout_seconds=40, check_interval=0.5):
+        timeout_seconds = _bounded_timeout(timeout_seconds)
+        """Wait specifically for the prompt workspace after opening New Project.
+
+        The New Project button is deliberately ignored during this phase because
+        it may remain visible briefly while Flow transitions to the workspace.
+        """
+        print(
+            f"🔍 [PAGE-STATE] Waiting up to {timeout_seconds}s for "
+            "whatdoyouwantocreate.png after opening the project..."
+        )
+        update_operation_status("Waiting for the prompt workspace to become ready...")
+        start_time = time.time()
+        last_status_time = start_time
+        expanded_panel = False
+        gfmedia_reported = False
+
+        while time.time() - start_time < timeout_seconds:
+            check_for_termination()
+            enforce_window_focus(hwnd)
+
+            prompt_location, prompt_variant = find_image_with_fallback(
+                "whatdoyouwantocreate.png", confidence=0.8
+            )
+            if prompt_location:
+                variant_name = os.path.basename(prompt_variant) if prompt_variant else "whatdoyouwantocreate.png"
+                print(
+                    f"✅ [PAGE-STATE] Prompt workspace is ready ({variant_name}) at "
+                    f"({prompt_location.x}, {prompt_location.y})"
+                )
+                try:
+                    hud.print("Workspace is ready.", "success")
+                except Exception:
+                    pass
+                update_operation_status("Prompt workspace detected and ready for scene processing")
+                return True
+
+            if not expanded_panel:
+                expand_location = find_image("expandgfsidepanel.png", confidence=0.8)
+                if expand_location:
+                    print("🔄 [PAGE-STATE] Prompt field is not visible; expanding the side panel once...")
+                    if _click_google_flow_control(hwnd, expand_location, "expandgfsidepanel.png"):
+                        expanded_panel = True
+                        _sleep(0.5)
+                        continue
+                    expanded_panel = True
+
+            if not gfmedia_reported:
+                gfmedia_location = find_image("gfmedia.png", confidence=0.8)
+                if gfmedia_location:
+                    gfmedia_reported = True
+                    print(
+                        "ℹ️ [PAGE-STATE] gfmedia.png detected; workspace shell is present. "
+                        "Still waiting for the actual prompt input control."
+                    )
+
+            now = time.time()
+            if now - last_status_time >= 10:
+                elapsed = int(now - start_time)
+                print(
+                    f"⏳ [PAGE-STATE] Waiting for prompt workspace "
+                    f"({elapsed}s/{timeout_seconds}s)..."
+                )
+                try:
+                    hud.print(f"Waiting for the prompt area... ({elapsed}s)", "waiting")
+                except Exception:
+                    pass
+                last_status_time = now
+
+            _sleep(check_interval)
+
+        print(
+            f"⏰ [PAGE-STATE] Prompt workspace did not appear within {timeout_seconds}s. "
+            "The automatic supervisor will restart and inspect the current page again."
+        )
         return False
 
-    def find_whatdoyouwantocreate_with_fallbacks(hwnd, timeout_seconds=30):
+    def wait_for_new_project_and_click(hwnd, timeout_seconds=40, initial_location=None):
+        timeout_seconds = _bounded_timeout(timeout_seconds)
+        """Click New Project using a bounded wait; never wait forever for the image."""
+        print("🔍 [GF] Looking for new_project.png before clicking...")
+        try:
+            hud.print("Starting a fresh workspace...", "waiting")
+        except Exception:
+            pass
+        update_operation_status("Looking for the New Project button...")
+
+        location = initial_location
+        if location is None:
+            location, _ = wait_for_image_with_fallback(
+                "new_project.png", timeout_seconds=timeout_seconds, confidence=0.8
+            )
+
+        if not location:
+            print(f"❌ [GF] new_project.png was not found within {timeout_seconds}s")
+            return False
+
+        if not _click_google_flow_control(hwnd, location, "new_project.png"):
+            return False
+
+        try:
+            hud.print("Starting a fresh workspace...", "success")
+        except Exception:
+            pass
+        update_operation_status("Clicked New Project; waiting for the prompt workspace")
+        return True
+
+    def wait_for_gfmedia_and_confirm(hwnd, timeout_seconds=STAGE_TIMEOUT_SECONDS):
+        """Legacy compatibility helper; bounded and page-state aware."""
+        stage, _ = wait_for_google_flow_stage(hwnd, timeout_seconds=timeout_seconds)
+        if stage == "prompt":
+            return True
+        if stage == "new_project":
+            return wait_for_new_project_and_click(hwnd, initial_location=None) and wait_for_prompt_workspace(hwnd)
+        print("⚠️ [GF] Could not confirm a usable Google Flow page state.")
+        return False
+
+    def find_whatdoyouwantocreate_with_fallbacks(hwnd, timeout_seconds=40):
+        timeout_seconds = _bounded_timeout(timeout_seconds)
         print(f"🔍 [GF] Searching for whatdoyouwantocreate.png...")
         print(f"🔍 [GF] Step 1: Looking for expandgfsidepanel.png first...")
         try:
@@ -4127,7 +4430,7 @@ def generate_google_flow_images():
                 update_operation_status("Clicking expand side panel button")
                 pyautogui.moveTo(expand_panel_location.x, expand_panel_location.y, duration=0.1)
                 pyautogui.click()
-                time.sleep(1)
+                _sleep(1)
                 print(f"🔍 [GF] Now looking for whatdoyouwantocreate.png after expanding panel...")
                 location = wait_for_image("whatdoyouwantocreate.png", timeout_seconds=timeout_seconds, confidence=0.8)
                 if location:
@@ -4169,12 +4472,68 @@ def generate_google_flow_images():
             return True
         return False
 
-    def check_and_click_done_editing():
-        clicked = click_right_edge_of_image("done_editinggfimage.png", confidence=0.7)
-        if clicked:
-            print(f"✅ [DONE-EDITING] Clicked done_editinggfimage.png right edge — resuming normal checks")
-            return True
-        return False
+    def check_and_click_exit_editing():
+        """Exit an accidentally opened image editor whenever its Done control appears."""
+        nonlocal exit_editing_click_in_progress
+
+        # Prevent a periodic polling pass from double-clicking while an explicit
+        # exit editing click is still completing its short UI transition.
+        if exit_editing_click_in_progress:
+            return False
+
+        exit_editing_click_in_progress = True
+        try:
+            clicked = click_right_edge_of_image("exit_editinggfimage.png", confidence=0.7)
+            if clicked:
+                print(
+                    "✅ [DONE-EDITING] Clicked the right edge of exit_editinggfimage.png; "
+                    "the image editor should now be closed."
+                )
+                return True
+            return False
+        finally:
+            exit_editing_click_in_progress = False
+
+    def ensure_image_hover_position(timeout_seconds=STAGE_TIMEOUT_SECONDS, offset_px=100):
+        """
+        Return to the exact cursor anchor recorded when progress was first
+        detected. Never re-search imagerenderingprogress after that point.
+        """
+        nonlocal image_render_lock_active, image_render_lock_position
+
+        if image_render_lock_position is not None:
+            target_x, target_y = image_render_lock_position
+            image_render_lock_active = True
+            current_x, current_y = pyautogui.position()
+            if abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3:
+                print(
+                    f"🛡️ [HOVER-LOCK] Restoring cursor from ({current_x}, {current_y}) "
+                    f"to locked position ({target_x}, {target_y})."
+                )
+                pyautogui.moveTo(target_x, target_y, duration=0.1)
+            return type("LockedImagePosition", (), {"x": target_x, "y": target_y - offset_px})()
+
+        # Compatibility fallback for a workflow where the progress indicator
+        # never appeared and the legacy generation path completed instead.
+        timeout_seconds = _bounded_timeout(timeout_seconds)
+        start_time = time.monotonic()
+        while time.monotonic() - start_time < timeout_seconds:
+            check_for_termination()
+            search_location = find_image("imagerenderingprogress.png", confidence=0.7)
+            if search_location:
+                image_render_lock_position = (
+                    int(search_location.x),
+                    int(search_location.y + offset_px)
+                )
+                image_render_lock_active = True
+                pyautogui.moveTo(*image_render_lock_position, duration=0.2)
+                return search_location
+            _sleep(0.4)
+
+        abort_operation(
+            f"Could not establish the image hover position within {timeout_seconds} seconds"
+        )
+        return None
 
     def handle_exit_gfsidebar_and_recheck():
         print(f"🔍 [GF] no_active_gf_generation.png not found — looking for exit_gfsidebar.png fallback...")
@@ -4192,7 +4551,7 @@ def generate_google_flow_images():
                         print(f"🎯 [GF] Clicking {os.path.basename(variant_path)} right edge at ({click_x}, {click_y})")
                         pyautogui.moveTo(click_x, click_y, duration=0.1)
                         pyautogui.click()
-                        time.sleep(0.8)
+                        _sleep(0.8)
                         clicked = True
                         break
                 except Exception:
@@ -4200,7 +4559,7 @@ def generate_google_flow_images():
             if not clicked:
                 pyautogui.moveTo(exit_sidebar_location.x, exit_sidebar_location.y, duration=0.1)
                 pyautogui.click()
-                time.sleep(0.8)
+                _sleep(0.8)
             print(f"🔄 [GF] Re-checking for no_active_gf_generation.png after exit_gfsidebar click...")
             recheck_location = find_image("no_active_gf_generation.png", confidence=0.7)
             if recheck_location:
@@ -4226,7 +4585,7 @@ def generate_google_flow_images():
 
         pyautogui.moveTo(location.x, location.y, duration=0.1)
         pyautogui.click()
-        time.sleep(0.3)
+        _sleep(0.3)
 
         print(f"📝 [SEND-STEP] Pasting scene details...")
         try:
@@ -4234,21 +4593,21 @@ def generate_google_flow_images():
         except Exception:
             pass
         pyautogui.click()
-        time.sleep(0.1)
+        _sleep(0.1)
         pyautogui.hotkey('ctrl', 'a')
-        time.sleep(0.05)
+        _sleep(0.05)
         pyautogui.press('backspace')
-        time.sleep(0.05)
+        _sleep(0.05)
         pyperclip.copy(entry_json)
         pyautogui.hotkey('ctrl', 'v')
-        time.sleep(0.3)
+        _sleep(0.3)
 
         print(f"🔍 [SEND-STEP] Looking for sendgf.png (initial click)...")
         send_location = wait_for_image("sendgf.png", timeout_seconds=10, confidence=0.8)
         if not send_location:
             print(f"⚠️ [SEND-STEP] Send button not found - pressing Enter instead...")
             pyautogui.press('enter')
-            time.sleep(0.5)
+            _sleep(0.5)
             move_mouse_to_center_of_screen()
             return (None, None)
 
@@ -4257,9 +4616,9 @@ def generate_google_flow_images():
 
         print(f"🖱️ [SEND-STEP] Moving arrow away from send region before clicking...")
         move_mouse_to_center_of_screen()
-        time.sleep(0.15)
+        _sleep(0.15)
         pyautogui.click(send_x, send_y)
-        time.sleep(0.4)
+        _sleep(0.4)
         print(f"✅ [SEND-STEP] Initial click on sendgf.png sent at ({send_x}, {send_y})")
         print(f"🖱️ [SEND-STEP] Moving arrow away from send region after clicking...")
         move_mouse_to_center_of_screen()
@@ -4267,7 +4626,8 @@ def generate_google_flow_images():
 
     def confirm_sendgf_and_wait_for_generating(hwnd, entry_name, entry_json=None,
                                                send_x=None, send_y=None,
-                                               max_confirm_seconds=60, check_interval=0.4):
+                                               max_confirm_seconds=40, check_interval=0.4):
+        max_confirm_seconds = _bounded_timeout(max_confirm_seconds)
         """
         CONFIRMATION RULE:
         - First try gfpromptsent.png and its numbered variants.
@@ -4339,7 +4699,7 @@ def generate_google_flow_images():
             if check_for_tryagain_and_abort():
                 return "poor_network"
 
-            check_and_click_done_editing()
+            check_and_click_exit_editing()
 
             # Primary confirmation: prompt-sent image.
             prompt_sent_location, matched_prompt_variant = find_image_with_fallback(
@@ -4415,7 +4775,7 @@ def generate_google_flow_images():
                 )
                 last_status_time = current_time
 
-            time.sleep(check_interval)
+            _sleep(check_interval)
 
         print(
             f"⚠️ [SEND-CONFIRM] Neither gfpromptsent nor "
@@ -4443,79 +4803,121 @@ def generate_google_flow_images():
         return "needs_restart"
 
 
-    def wait_for_imagerenderingprogress_and_jump_to_search(hwnd, entry_name, max_wait_seconds=300, check_interval=0.4):
-        print(f"🔍 [GF-FASTPATH] Looking for imagerenderingprogress.png (fast-path)...")
-        start_time = time.time()
-        cursor_placed = False
-        search_location = None
+    def wait_for_imagerenderingprogress_and_jump_to_search(hwnd, entry_name, max_wait_seconds=40, check_interval=0.4):
+        """
+        Find imagerenderingprogress once, lock the cursor 100px below that
+        exact match, and remain there until rendering finishes.
 
-        while time.time() - start_time < max_wait_seconds:
+        Once the progress image is first found, no other GUI image/template is
+        searched until it disappears. Rendering has NO timeout. After it
+        disappears, the cursor remains locked while the caller searches only
+        for moregf.png.
+        """
+        nonlocal image_render_lock_active, image_render_lock_position
+
+        max_wait_seconds = _bounded_timeout(max_wait_seconds)
+        print("🔍 [GF-LOCK] Waiting for the FIRST imagerenderingprogress.png match...")
+        first_seen_at = time.monotonic()
+        rendering_location = None
+
+        # Before the progress indicator is found, retain the normal bounded
+        # discovery window. The strict lock begins immediately on first match.
+        while time.monotonic() - first_seen_at < max_wait_seconds:
             check_for_termination()
             enforce_window_focus(hwnd)
             if check_for_tryagain_and_abort():
                 return False
-            check_and_click_done_editing()
             rendering_location = find_image("imagerenderingprogress.png", confidence=0.7)
             if rendering_location:
-                print(f"✅ [GF-FASTPATH] Found imagerenderingprogress.png at ({rendering_location.x}, {rendering_location.y})")
                 break
-            time.sleep(check_interval)
-        else:
-            print(f"ℹ️ [GF-FASTPATH] imagerenderingprogress.png never appeared within {max_wait_seconds}s — falling back to normal flow")
+            _sleep(check_interval)
+
+        if not rendering_location:
+            print(
+                f"ℹ️ [GF-LOCK] imagerenderingprogress.png did not appear within "
+                f"{max_wait_seconds}s; normal generation fallback may be used."
+            )
             return False
 
-        print(f"🔍 [GF-FASTPATH] Now looking for searchgfimage.png to place cursor 100px below it...")
-        search_location = find_image("searchgfimage.png", confidence=0.7)
-        if search_location:
-            move_cursor_below_search(search_location, offset_px=100)
-            cursor_placed = True
-            print(f"✅ [GF-FASTPATH] Cursor placed 100px below searchgfimage.png (same column)")
-        else:
-            print(f"⚠️ [GF-FASTPATH] searchgfimage.png not found yet — will keep checking while rendering...")
+        # Record the original match and the exact cursor target. Do not search
+        # for the progress image a second time merely to position the cursor.
+        image_render_lock_position = (
+            int(rendering_location.x),
+            int(rendering_location.y + 100)
+        )
+        image_render_lock_active = True
+        target_x, target_y = image_render_lock_position
+        print(
+            "🔒 [GF-LOCK] First match recorded at "
+            f"({rendering_location.x}, {rendering_location.y}); "
+            f"cursor target permanently locked at ({target_x}, {target_y})."
+        )
+        pyautogui.moveTo(target_x, target_y, duration=0.2)
 
-        print(f"🔍 [GF-FASTPATH] Monitoring imagerenderingprogress.png until it disappears...")
         try:
-            hud.print("Your image is almost ready...", "processing")
+            hud.print("Image generation in progress...", "processing")
         except Exception:
             pass
-        update_operation_status(f"Rendering in progress for {entry_name}...")
-        render_seen_time = time.time()
-        last_status_time = render_seen_time
+        update_operation_status(f"Rendering in progress for {entry_name}; cursor position locked")
 
+        render_started = time.monotonic()
+        last_status_time = render_started
+
+        # IMPORTANT: no 40-second deadline here. Keep waiting for as long as
+        # Google Flow needs. During this phase, only search the progress image.
         while True:
             check_for_termination()
-            enforce_window_focus(hwnd)
-            if check_for_tryagain_and_abort():
-                return False
-            check_and_click_done_editing()
-            if not cursor_placed:
-                search_location = find_image("searchgfimage.png", confidence=0.7)
-                if search_location:
-                    move_cursor_below_search(search_location, offset_px=100)
-                    cursor_placed = True
-                    print(f"✅ [GF-FASTPATH] Cursor placed 100px below searchgfimage.png (delayed placement)")
+
+            # Force the cursor back if the user/UI moved it. This is a
+            # coordinate correction only; it does not inspect other programs.
+            try:
+                current_x, current_y = pyautogui.position()
+                if (abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3):
+                    print(
+                        f"🛡️ [GF-LOCK] Cursor drifted to ({current_x}, {current_y}); "
+                        f"forcing it back to ({target_x}, {target_y})."
+                    )
+                    pyautogui.moveTo(target_x, target_y, duration=0.1)
+            except Exception as cursor_error:
+                print(f"⚠️ [GF-LOCK] Could not verify cursor position: {cursor_error}")
+                pyautogui.moveTo(target_x, target_y, duration=0.1)
+
+            # This is the ONLY image/template lookup while rendering is active.
             rendering_location = find_image("imagerenderingprogress.png", confidence=0.7)
             if not rendering_location:
-                print(f"✅ [GF-FASTPATH] imagerenderingprogress.png disappeared — rendering complete!")
+                elapsed = int(time.monotonic() - render_started)
+                print(
+                    f"✅ [GF-LOCK] imagerenderingprogress.png disappeared after "
+                    f"{elapsed}s. Cursor remains locked at ({target_x}, {target_y}); "
+                    "next permitted search is moregf.png only."
+                )
                 try:
-                    hud.print("Your image is ready.", "success")
+                    hud.print("Image is ready; locating its More control...", "success")
                 except Exception:
                     pass
-                update_operation_status(f"Image generation complete for {entry_name} (fast-path)")
+                update_operation_status(
+                    f"Rendering complete for {entry_name}; cursor remains locked while locating moregf.png"
+                )
                 return True
-            current_time = time.time()
-            if current_time - last_status_time > 10:
-                elapsed = int(current_time - render_seen_time)
-                print(f"⏳ [GF-FASTPATH] Still rendering... ({elapsed}s since render started)")
+
+            now = time.monotonic()
+            if now - last_status_time >= 10:
+                elapsed = int(now - render_started)
+                print(f"⏳ [GF-LOCK] Still rendering... ({elapsed}s elapsed; no timeout)")
                 try:
-                    hud.print("Google Flow image generation in progress... ", "processing")
+                    hud.print(f"Image generation in progress... ({elapsed}s)", "processing")
                 except Exception:
                     pass
-                update_operation_status("Google Flow image generation in progress... ")
-                last_status_time = current_time
-            time.sleep(check_interval)
+                update_operation_status(
+                    f"Google Flow image generation in progress for {entry_name} ({elapsed}s); waiting without timeout"
+                )
+                last_status_time = now
 
-    def wait_for_generation_complete_gf(hwnd, entry_name, max_wait_seconds=300, check_interval=0.5):
+            _sleep(check_interval)
+
+
+    def wait_for_generation_complete_gf(hwnd, entry_name, max_wait_seconds=40, check_interval=0.5):
+        max_wait_seconds = _bounded_timeout(max_wait_seconds)
         print(f"⏳ [GF] Waiting for generation to complete...")
         print(f"🚀 [GF] Attempting fast-path via imagerenderingprogress.png...")
         fastpath_done = wait_for_imagerenderingprogress_and_jump_to_search(
@@ -4544,7 +4946,7 @@ def generate_google_flow_images():
             enforce_window_focus(hwnd)
             if check_for_tryagain_and_abort():
                 return False, "poor_network"
-            check_and_click_done_editing()
+            check_and_click_exit_editing()
             generating_location = find_image("generatinggf_image.png", confidence=0.7)
             if generating_location:
                 print(f"✅ [GF] Found generatinggf_image.png - generation in progress!")
@@ -4566,14 +4968,14 @@ def generate_google_flow_images():
                 except Exception:
                     pass
                 update_operation_status("Google Flow image generation in progress... ")
-            time.sleep(check_interval)
+            _sleep(check_interval)
 
         if not found_generating:
             print(f"⚠️ [GF] generatinggf_image.png not found within timeout — checking fallbacks...")
             if check_for_tryagain_and_abort():
                 return False, "poor_network"
             print(f"🔍 [GF] Checking for no_active_gf_generation.png directly...")
-            check_and_click_done_editing()
+            check_and_click_exit_editing()
             no_active_location = find_image("no_active_gf_generation.png", confidence=0.7)
             if no_active_location:
                 print(f"✅ [GF] Found no_active_gf_generation.png directly — image is ready!")
@@ -4613,12 +5015,12 @@ def generate_google_flow_images():
             enforce_window_focus(hwnd)
             if check_for_tryagain_and_abort():
                 return False, "poor_network"
-            check_and_click_done_editing()
+            check_and_click_exit_editing()
             generating_location = find_image("generatinggf_image.png", confidence=0.7)
             if not generating_location:
                 print(f"✅ [GF] generatinggf_image.png disappeared - checking for completion...")
-                time.sleep(0.5)
-                check_and_click_done_editing()
+                _sleep(0.5)
+                check_and_click_exit_editing()
                 no_active_location = find_image("no_active_gf_generation.png", confidence=0.7)
                 if no_active_location:
                     print(f"✅ [GF] Found no_active_gf_generation.png - image is ready!")
@@ -4643,10 +5045,10 @@ def generate_google_flow_images():
                         print(f"⚠️ [GF] Still not found - continuing to wait...")
                         for _ in range(10):
                             check_for_termination()
-                            time.sleep(0.5)
+                            _sleep(0.5)
                             if check_for_tryagain_and_abort():
                                 return False, "poor_network"
-                            check_and_click_done_editing()
+                            check_and_click_exit_editing()
                             no_active_location = find_image("no_active_gf_generation.png", confidence=0.7)
                             if no_active_location:
                                 print(f"✅ [GF] Found no_active_gf_generation.png - image is ready!")
@@ -4667,13 +5069,14 @@ def generate_google_flow_images():
                     except Exception:
                         pass
                     update_operation_status("Google Flow image generation in progress... ")
-                time.sleep(check_interval)
+                _sleep(check_interval)
 
         print(f"⏰ [GF] Generation timeout after {max_wait_seconds} seconds")
         return False, "timeout"
 
     # --- DOWNLOAD HELPERS (same as original) ---
-    def check_and_rename_download(entry_name, images_folder, timeout_seconds=180, check_interval=0.3):
+    def check_and_rename_download(entry_name, images_folder, timeout_seconds=40, check_interval=0.3):
+        timeout_seconds = _bounded_timeout(timeout_seconds)
         print(f"📊 [DOWNLOAD] Monitoring for download for {entry_name}...")
         try:
             hud.print("Waiting for the download to finish...", "waiting")
@@ -4708,7 +5111,7 @@ def generate_google_flow_images():
 
         while time.time() - start_time < timeout_seconds:
             check_for_termination()
-            check_and_click_done_editing()
+            check_and_click_exit_editing()
             elapsed = int(time.time() - start_time)
             try:
                 if os.path.exists(downloads_folder):
@@ -4733,6 +5136,8 @@ def generate_google_flow_images():
                                     stable_size = 0
                                     max_stable_checks = 5
                                     while stable_count < 3 and stable_count < max_stable_checks:
+                                        if time.time() - start_time >= timeout_seconds:
+                                            break
                                         try:
                                             current_size = os.path.getsize(entry.path)
                                             if current_size == stable_size and current_size > 1024:
@@ -4744,7 +5149,7 @@ def generate_google_flow_images():
                                                 print(f"   ⏳ File size changing: {current_size} bytes")
                                         except Exception as e:
                                             print(f"   ⚠️ Error checking size: {e}")
-                                        time.sleep(0.3)
+                                        _sleep(min(0.3, max(0.0, timeout_seconds - (time.time() - start_time))))
                                     if stable_count >= 3:
                                         print(f"✅ [DOWNLOAD] File stable and ready!")
                                         downloaded_file_path = entry.path
@@ -4765,10 +5170,10 @@ def generate_google_flow_images():
                     except Exception:
                         pass
                     update_operation_status(f"Waiting for download {entry_name}... ({elapsed}s)")
-                time.sleep(check_interval)
+                _sleep(check_interval)
             except Exception as e:
                 print(f"⚠️ [DOWNLOAD] Error in monitoring loop: {e}")
-                time.sleep(check_interval)
+                _sleep(check_interval)
                 continue
 
         if not download_detected or not downloaded_file_path:
@@ -4808,7 +5213,7 @@ def generate_google_flow_images():
                 print(f"❌ [DOWNLOAD] File no longer exists: {downloaded_file_path}")
                 return False, None
             try:
-                time.sleep(0.5)
+                _sleep(0.5)
                 os.rename(downloaded_file_path, target_path)
                 print(f"✅ [DOWNLOAD] File renamed to: {new_filename}")
                 print(f"📁 [DOWNLOAD] Moved to: {target_path}")
@@ -4838,149 +5243,188 @@ def generate_google_flow_images():
 
     def download_google_flow_image(hwnd, entry_name, images_folder):
         print(f"📥 [GF-DOWNLOAD] Starting Google Flow download procedure for {entry_name}...")
+
+        # Rendering completion leaves the cursor locked at the original
+        # progress-indicator anchor. Do not search for any other UI element
+        # except moregf.png until that control is found.
+        search_location = ensure_image_hover_position(
+            timeout_seconds=STAGE_TIMEOUT_SECONDS,
+            offset_px=100
+        )
+
+        # Protect the complete download UI sequence from periodic exit editing
+        # detection. Hotkeys/timeouts continue to be checked normally.
+        nonlocal download_ui_sequence_active
+        download_ui_sequence_active = True
         try:
-            hud.print("Preparing the download...", "downloading")
-        except Exception:
-            pass
-        update_operation_status(f"Starting download for {entry_name}...")
 
-        print(f"🔍 [GF-DOWNLOAD] Step 1: Looking for searchgfimage.png...")
-        check_and_click_done_editing()
-        search_location = find_image("searchgfimage.png", confidence=0.7)
-        if search_location:
-            move_cursor_below_search(search_location, offset_px=100)
-        else:
-            print(f"⚠️ [GF-DOWNLOAD] searchgfimage.png not found — continuing anyway...")
-
-        print(f"⬇️ [GF-DOWNLOAD] Step 2: Scrolling DOWN at current cursor position...")
-        check_and_click_done_editing()
-        scroll_down_multiple(2)
-
-        print(f"🔍 [GF-DOWNLOAD] Step 3: Looking for moregf.png...")
-        moregf_found = False
-        for attempt in range(5):
-            check_and_click_done_editing()
-            moregf_location = find_image("moregf.png", confidence=0.7)
-            if moregf_location:
-                clicked = click_right_edge_of_image("moregf.png", confidence=0.7)
-                if clicked:
-                    moregf_found = True
-                break
-            else:
-                print(f"⏳ [GF-DOWNLOAD] moregf.png not found (attempt {attempt+1}/5) — scrolling DOWN...")
-                check_and_click_done_editing()
-                scroll_down_multiple(2)
-                time.sleep(0.5)
-
-        if not moregf_found:
-            print(f"⚠️ [GF-DOWNLOAD] moregf.png not found after multiple attempts — continuing anyway...")
-
-        print(f"🔍 [GF-DOWNLOAD] Step 4: Looking for downloadgfimage.png...")
-        check_and_click_done_editing()
-        download_location = wait_for_image("downloadgfimage.png", timeout_seconds=20, confidence=0.7)
-        if download_location:
-            pyautogui.moveTo(download_location.x, download_location.y, duration=0.1)
-            pyautogui.click()
-            time.sleep(0.5)
-            print(f"✅ [GF-DOWNLOAD] Clicked downloadgfimage.png")
-        else:
-            print(f"❌ [GF-DOWNLOAD] downloadgfimage.png not found — download cannot proceed")
-            check_and_click_done_editing()
-            return False
-
-        print(f"🔍 [GF-DOWNLOAD] Step 5: Looking for gfdownloadquality.png...")
-        check_and_click_done_editing()
-        quality_location = wait_for_image("gfdownloadquality.png", timeout_seconds=15, confidence=0.7)
-        if quality_location:
-            pyautogui.moveTo(quality_location.x, quality_location.y, duration=0.1)
-            pyautogui.click()
-            time.sleep(0.5)
-            print(f"✅ [GF-DOWNLOAD] Clicked gfdownloadquality.png")
-        else:
-            print(f"⚠️ [GF-DOWNLOAD] gfdownloadquality.png not found — download may still proceed...")
-
-        print(f"📊 [GF-DOWNLOAD] Step 6: Monitoring background for new download...")
-        try:
-            hud.print("Downloading your image...", "downloading")
-        except Exception:
-            pass
-        update_operation_status(f"Downloading {entry_name}...")
-
-        download_success = False
-        file_path = None
-        download_attempts = 0
-        max_download_attempts = 3
-
-        while download_attempts < max_download_attempts and not download_success:
-            download_attempts += 1
-            print(f"🔄 [GF-DOWNLOAD] Download attempt {download_attempts}/{max_download_attempts}")
-            check_and_click_done_editing()
-            timeout_seconds = 30 if download_attempts == 1 else 20
-            download_success, file_path = check_and_rename_download(
-                entry_name, images_folder, timeout_seconds=timeout_seconds, check_interval=0.3
+            print(
+                "✅ [GF-DOWNLOAD] Image hover position is confirmed; now preparing "
+                "the download controls."
             )
+            try:
+                hud.print("Preparing the download...", "downloading")
+            except Exception:
+                pass
+            update_operation_status(f"Starting download for {entry_name}...")
+
+            print(
+                "🔍 [GF-DOWNLOAD] Step 1 complete: imagerenderingprogress.png was found and "
+                "the cursor was moved below it before download preparation."
+            )
+
+            print(
+                "🔒 [GF-DOWNLOAD] Cursor remains locked at the original image position. "
+                "Searching ONLY for moregf.png; no scrolling or other UI searches."
+            )
+            moregf_found = False
+            moregf_wait_started = time.monotonic()
+            last_more_log = moregf_wait_started
+
+            while not moregf_found:
+                check_for_termination()
+
+                # Enforce the exact saved cursor location before each More lookup.
+                target_x, target_y = image_render_lock_position
+                current_x, current_y = pyautogui.position()
+                if abs(current_x - target_x) > 3 or abs(current_y - target_y) > 3:
+                    print(
+                        f"🛡️ [GF-DOWNLOAD-LOCK] Cursor moved to ({current_x}, {current_y}); "
+                        f"forcing it back to ({target_x}, {target_y})."
+                    )
+                    pyautogui.moveTo(target_x, target_y, duration=0.1)
+
+                # The ONLY permitted lookup after rendering has disappeared.
+                moregf_location = find_image("moregf.png", confidence=0.7)
+                if moregf_location:
+                    print(
+                        f"✅ [GF-DOWNLOAD] moregf.png found at "
+                        f"({moregf_location.x}, {moregf_location.y}); clicking its right edge."
+                    )
+                    clicked = click_right_edge_of_image("moregf.png", confidence=0.7)
+                    if clicked:
+                        moregf_found = True
+                        image_render_lock_active = False
+                        print(
+                            "🔓 [GF-DOWNLOAD] More control found and clicked; "
+                            "cursor-position lock released."
+                        )
+                        break
+                    # If the match could not be clicked, restore the anchor and
+                    # continue looking ONLY for moregf.png.
+                    pyautogui.moveTo(target_x, target_y, duration=0.1)
+
+                now = time.monotonic()
+                if now - last_more_log >= 10:
+                    elapsed = int(now - moregf_wait_started)
+                    print(
+                        f"⏳ [GF-DOWNLOAD-LOCK] moregf.png not found after {elapsed}s; "
+                        f"cursor remains forced to ({target_x}, {target_y})."
+                    )
+                    update_operation_status(
+                        f"Waiting for moregf.png for {entry_name}; cursor position remains locked"
+                    )
+                    last_more_log = now
+                _sleep(0.4)
+
+            print(f"🔍 [GF-DOWNLOAD] Step 4: Looking for downloadgfimage.png...")
+            download_location = wait_for_image("downloadgfimage.png", timeout_seconds=20, confidence=0.7)
+            if download_location:
+                pyautogui.moveTo(download_location.x, download_location.y, duration=0.1)
+                pyautogui.click()
+                _sleep(0.5)
+                print(f"✅ [GF-DOWNLOAD] Clicked downloadgfimage.png")
+            else:
+                print(f"❌ [GF-DOWNLOAD] downloadgfimage.png not found — download cannot proceed")
+                return False
+
+            print(f"🔍 [GF-DOWNLOAD] Step 5: Looking for gfdownloadquality.png...")
+            quality_location = wait_for_image("gfdownloadquality.png", timeout_seconds=15, confidence=0.7)
+            if quality_location:
+                pyautogui.moveTo(quality_location.x, quality_location.y, duration=0.1)
+                pyautogui.click()
+                _sleep(0.5)
+                print(f"✅ [GF-DOWNLOAD] Clicked gfdownloadquality.png")
+            else:
+                print(f"⚠️ [GF-DOWNLOAD] gfdownloadquality.png not found — download may still proceed...")
+
+            print(f"📊 [GF-DOWNLOAD] Step 6: Monitoring background for new download...")
+            try:
+                hud.print("Downloading your image...", "downloading")
+            except Exception:
+                pass
+            update_operation_status(f"Downloading {entry_name}...")
+
+            download_success = False
+            file_path = None
+            download_attempts = 0
+            max_download_attempts = 3
+
+            while download_attempts < max_download_attempts and not download_success:
+                download_attempts += 1
+                print(f"🔄 [GF-DOWNLOAD] Download attempt {download_attempts}/{max_download_attempts}")
+                timeout_seconds = 30 if download_attempts == 1 else 20
+                download_success, file_path = check_and_rename_download(
+                    entry_name, images_folder, timeout_seconds=timeout_seconds, check_interval=0.3
+                )
+                if download_success:
+                    print(f"✅ [GF-DOWNLOAD] Download successful on attempt {download_attempts}")
+                    break
+                if download_attempts < max_download_attempts:
+                    print(f"⚠️ [GF-DOWNLOAD] Download not found after {timeout_seconds}s — retrying...")
+                    try:
+                        hud.print(f"Retrying the download... ({download_attempts}/{max_download_attempts})", "warning")
+                    except Exception:
+                        pass
+                    update_operation_status(f"Retrying download for {entry_name}... (attempt {download_attempts + 1})")
+
+                    # Restore the saved anchor directly. The progress indicator
+                    # has already disappeared; never search for it again.
+                    search_location = ensure_image_hover_position(
+                        timeout_seconds=STAGE_TIMEOUT_SECONDS,
+                        offset_px=100
+                    )
+                    print(
+                        "🖱️ [GF-DOWNLOAD-RETRY] Required hover position restored; "
+                        "retrying the download controls."
+                    )
+
+                    target_x, target_y = image_render_lock_position
+                    pyautogui.moveTo(target_x, target_y, duration=0.1)
+                    more_retry_location = find_image("moregf.png", confidence=0.7)
+                    if more_retry_location:
+                        click_right_edge_of_image("moregf.png", confidence=0.7)
+                    download_location = wait_for_image("downloadgfimage.png", timeout_seconds=10, confidence=0.7)
+                    if download_location:
+                        pyautogui.moveTo(download_location.x, download_location.y, duration=0.1)
+                        pyautogui.click()
+                        _sleep(0.5)
+                    quality_location = wait_for_image("gfdownloadquality.png", timeout_seconds=10, confidence=0.7)
+                    if quality_location:
+                        pyautogui.moveTo(quality_location.x, quality_location.y, duration=0.1)
+                        pyautogui.click()
+                        _sleep(0.5)
+                    _sleep(2)
+
             if download_success:
-                print(f"✅ [GF-DOWNLOAD] Download successful on attempt {download_attempts}")
-                break
-            if download_attempts < max_download_attempts:
-                print(f"⚠️ [GF-DOWNLOAD] Download not found after {timeout_seconds}s — retrying...")
+                print(f"🎉 [GF-DOWNLOAD] {entry_name} downloaded and saved successfully!")
                 try:
-                    hud.print(f"Retrying the download... ({download_attempts}/{max_download_attempts})", "warning")
+                    hud.print("Image downloaded successfully.", "success")
                 except Exception:
                     pass
-                update_operation_status(f"Retrying download for {entry_name}... (attempt {download_attempts + 1})")
+                update_operation_status(f"{entry_name} completed successfully", is_success=True)
+                return True
+            else:
+                print(f"❌ [GF-DOWNLOAD] Failed to download {entry_name} after {max_download_attempts} attempts")
+                try:
+                    hud.print("Could not download the image.", "error")
+                except Exception:
+                    pass
+                update_operation_status(f"Failed to download {entry_name} after multiple attempts", is_error=True)
+                return False
 
-                # Restore the same hover position used while the submitted image
-                # is rendering. Google Flow may reveal image actions only when
-                # the pointer is hovering over the generated image.
-                check_for_termination()
-                search_location = find_image("searchgfimage.png", confidence=0.7)
-                if search_location:
-                    move_cursor_below_search(search_location, offset_px=100)
-                    print(
-                        "🖱️ [GF-DOWNLOAD-RETRY] Restored cursor to the "
-                        "rendering/hover position before retrying download."
-                    )
-                    time.sleep(0.5)
-                else:
-                    print(
-                        "⚠️ [GF-DOWNLOAD-RETRY] searchgfimage.png not found; "
-                        "continuing with the existing download retry flow."
-                    )
-
-                check_and_click_done_editing()
-                click_right_edge_of_image("moregf.png", confidence=0.7)
-                check_and_click_done_editing()
-                download_location = wait_for_image("downloadgfimage.png", timeout_seconds=10, confidence=0.7)
-                if download_location:
-                    pyautogui.moveTo(download_location.x, download_location.y, duration=0.1)
-                    pyautogui.click()
-                    time.sleep(0.5)
-                check_and_click_done_editing()
-                quality_location = wait_for_image("gfdownloadquality.png", timeout_seconds=10, confidence=0.7)
-                if quality_location:
-                    pyautogui.moveTo(quality_location.x, quality_location.y, duration=0.1)
-                    pyautogui.click()
-                    time.sleep(0.5)
-                time.sleep(2)
-
-        if download_success:
-            print(f"🎉 [GF-DOWNLOAD] {entry_name} downloaded and saved successfully!")
-            try:
-                hud.print("Image downloaded successfully.", "success")
-            except Exception:
-                pass
-            update_operation_status(f"{entry_name} completed successfully", is_success=True)
-            return True
-        else:
-            print(f"❌ [GF-DOWNLOAD] Failed to download {entry_name} after {max_download_attempts} attempts")
-            try:
-                hud.print("Could not download the image.", "error")
-            except Exception:
-                pass
-            update_operation_status(f"Failed to download {entry_name} after multiple attempts", is_error=True)
-            return False
-
+        finally:
+            download_ui_sequence_active = False
     def handle_webdownloadconfirmationmodal():
         """
         Handles webdownloadconfirmationmodal.png using a mandatory 2-step
@@ -5064,9 +5508,9 @@ def generate_google_flow_images():
             duration=0.1
         )
         pyautogui.click()
-        time.sleep(0.5)
+        _sleep(0.5)
         move_mouse_to_center_of_screen()
-        time.sleep(0.3)
+        _sleep(0.3)
 
         # --------------------------------------------------------------
         # RE-CHECK AFTER THE FIRST CLICK
@@ -5098,9 +5542,9 @@ def generate_google_flow_images():
                 duration=0.1
             )
             pyautogui.click()
-            time.sleep(0.5)
+            _sleep(0.5)
             move_mouse_to_center_of_screen()
-            time.sleep(0.3)
+            _sleep(0.3)
 
             print(
                 f"✅ [MODAL] Second click completed with both "
@@ -5196,13 +5640,21 @@ def generate_google_flow_images():
         except Exception:
             pass
 
+        # A restart is a fresh workflow attempt, never a continuation of a
+        # saved phase such as submitted/rendering/ready/downloading. Submit the
+        # scene prompt again and follow the complete send -> render -> download
+        # sequence from its beginning.
+        print(
+            f"🔄 [RESTART-SEMANTICS] Scene {entry_index + 1} will run from its "
+            "prompt submission stage; saved phase checkpoints are ignored."
+        )
         send_attempt = 0
         send_confirmed = False
         while not send_confirmed:
             send_attempt += 1
             print(f"\n🔁 [SEND-LOOP] Send attempt #{send_attempt} for {entry_name}")
             update_operation_status(f"Preparing to send scene {entry_index + 1} (attempt {send_attempt})...")
-            check_and_click_done_editing()
+            check_and_click_exit_editing()
             send_coords = paste_prompt_and_click_send(hwnd, entry_json, entry_name)
             if send_coords is None:
                 print(f"❌ [SEND-LOOP] Could not paste & click send for {entry_name} — aborting")
@@ -5212,40 +5664,20 @@ def generate_google_flow_images():
             confirm_result = confirm_sendgf_and_wait_for_generating(
                 hwnd, entry_name, entry_json,
                 send_x, send_y,
-                max_confirm_seconds=60, check_interval=0.4
+                max_confirm_seconds=STAGE_TIMEOUT_SECONDS, check_interval=0.4
             )
             if confirm_result == "confirmed":
                 print(f"✅ [SEND-LOOP] Confirmed: prompt truly sent")
                 send_confirmed = True
                 break
-            elif confirm_result == "needs_restart":
+            elif confirm_result in ("needs_restart", "timeout"):
                 print(
-                    f"🔁 [SEND-LOOP] gfpromptsent confirmation was not detected — "
-                    f"re-searching input, re-pasting, and sending again"
+                    f"🔁 [SEND-LOOP] Prompt confirmation failed for {entry_name}; "
+                    f"requesting a full function restart instead of retrying inside this scene."
                 )
-                try:
-                    hud.print(
-                        "Prompt confirmation not found — re-searching the input and sending again.",
-                        "warning"
-                    )
-                except Exception:
-                    pass
-                update_operation_status(
-                    f"gfpromptsent not found for {entry_name} — "
-                    f"re-searching input, re-pasting, and resending "
-                    f"(attempt {send_attempt + 1})..."
+                abort_operation(
+                    f"Prompt confirmation was not detected for {entry_name} within 40 seconds"
                 )
-                time.sleep(1.5)
-                continue
-            elif confirm_result == "timeout":
-                print(f"🔁 [SEND-LOOP] Confirmation timed out — treating as needs_restart")
-                try:
-                    hud.print("The prompt didn't go through — trying again.", "warning")
-                except Exception:
-                    pass
-                update_operation_status(f"Restarting send for {entry_name} (attempt {send_attempt + 1})...")
-                time.sleep(1.5)
-                continue
             elif confirm_result == "poor_network":
                 print(f"❌ [SEND-LOOP] Poor network detected during send confirmation — aborting")
                 return False
@@ -5253,12 +5685,14 @@ def generate_google_flow_images():
                 print(f"🛑 [SEND-LOOP] Send confirmation aborted by user")
                 return False
             else:
-                print(f"⚠️ [SEND-LOOP] Unexpected confirm result '{confirm_result}' — restarting")
-                time.sleep(1.5)
-                continue
+                abort_operation(
+                    f"Unexpected send-confirmation result for {entry_name}: {confirm_result}"
+                )
 
         print(f"⏳ [SCENE] Step 4: Waiting for the image to be created...")
-        generation_complete, status = wait_for_generation_complete_gf(hwnd, entry_name, max_wait_seconds=300)
+        generation_complete, status = wait_for_generation_complete_gf(
+            hwnd, entry_name, max_wait_seconds=STAGE_TIMEOUT_SECONDS
+        )
 
         if not generation_complete:
             print(f"❌ [SCENE] Image creation did not complete: {status}")
@@ -5340,49 +5774,106 @@ def generate_google_flow_images():
 
             hwnd = ensure_window_ready_and_focused()
             print(f"🪟 [MAIN] Browser ready (HWND: {hwnd})")
-            update_operation_status("Browser initialized for Google Flow operation")
+            update_operation_status("Browser initialized; inspecting the current Edge page before navigation")
 
-            print(f"🔍 [MAIN] Loading Google Flow URL...")
+            # IMPORTANT: on every automatic/manual restart, search in this exact
+            # order before navigating: (1) whatdoyouwantocreate, (2) new_project,
+            # (3) GOOGLE_FLOW_URL if neither is visible. This prevents a restart
+            # from opening a second project when the prompt workspace is ready.
+            print("🔎 [MAIN] Inspecting the current Edge page before loading any URL...")
             try:
-                hud.print("Opening Google Flow...", "navigating")
+                hud.print("Checking the current Google Flow page...", "waiting")
             except Exception:
                 pass
-            update_operation_status("Loading Google Flow...")
-            fast_paste_url(hwnd, GOOGLE_FLOW_URL)
-            time.sleep(3)
-            hwnd = ensure_window_ready_and_focused()
 
-            print(f"🔍 [MAIN] Waiting for new_project.png...")
-            try:
-                hud.print("Looking for the new project option...", "waiting")
-            except Exception:
-                pass
-            success = wait_for_new_project_and_click(hwnd)
-            if not success:
-                print(f"❌ [MAIN] Failed to find/click new_project.png")
+            current_stage, current_location = detect_restart_page_stage(hwnd)
+            print(
+                f"🧭 [MAIN] Initial restart page state (prompt checked before New Project): "
+                f"{current_stage}"
+            )
+
+            if current_stage == "prompt":
+                print(
+                    "✅ [MAIN] whatdoyouwantocreate.png is already visible. "
+                    "Skipping URL navigation and New Project; starting the scene workflow from its entry point." 
+                )
+                update_operation_status("Existing prompt workspace detected; starting the scene workflow from its entry point")
+                page_ready = True
+
+            elif current_stage == "new_project":
+                print(
+                    "✅ [MAIN] new_project.png is already visible. "
+                    "Skipping URL navigation and clicking the existing New Project control."
+                )
+                clicked = wait_for_new_project_and_click(
+                    hwnd, timeout_seconds=20, initial_location=current_location
+                )
+                if not clicked:
+                    update_operation_status("Could not click the detected New Project button", is_error=True)
+                    return
+                page_ready = wait_for_prompt_workspace(hwnd, timeout_seconds=STAGE_TIMEOUT_SECONDS)
+
+            elif current_stage == "collapsed_workspace":
+                print(
+                    "✅ [MAIN] An existing Google Flow workspace is detected with its side panel collapsed. "
+                    "Skipping URL navigation and expanding the existing workspace."
+                )
+                if not _click_google_flow_control(hwnd, current_location, "expandgfsidepanel.png"):
+                    update_operation_status("Could not expand the existing Google Flow prompt panel", is_error=True)
+                    return
+                page_ready = wait_for_prompt_workspace(hwnd, timeout_seconds=STAGE_TIMEOUT_SECONDS)
+
+            else:
+                # Only navigate when neither of the known page states is visible.
+                print(
+                    "🌐 [MAIN] Neither the prompt workspace nor New Project is visible. "
+                    "Only now will GOOGLE_FLOW_URL be opened."
+                )
                 try:
-                    hud.print("Could not start a new project.", "error")
+                    hud.print("Opening Google Flow because no known page is visible...", "navigating")
                 except Exception:
                     pass
-                update_operation_status("Failed to find new project button", is_error=True)
-                return
+                update_operation_status("No known Google Flow page detected; opening Google Flow URL")
+                fast_paste_url(hwnd, GOOGLE_FLOW_URL)
+                _sleep(2)
+                hwnd = ensure_window_ready_and_focused()
 
-            print(f"🔍 [MAIN] Waiting for gfmedia.png to confirm page load...")
-            try:
-                hud.print("Waiting for the workspace to load...", "waiting")
-            except Exception:
-                pass
-            success = wait_for_gfmedia_and_confirm(hwnd)
-            if not success:
-                print(f"❌ [MAIN] Failed to confirm page load (gfmedia.png)")
+                detected_stage, detected_location = wait_for_google_flow_stage(
+                    hwnd, timeout_seconds=STAGE_TIMEOUT_SECONDS, check_interval=0.5
+                )
+                print(f"🧭 [MAIN] Page state after navigation: {detected_stage}")
+
+                if detected_stage == "prompt":
+                    print("✅ [MAIN] Prompt workspace detected after navigation; no New Project click needed.")
+                    page_ready = True
+
+                elif detected_stage == "new_project":
+                    print("✅ [MAIN] New Project chooser detected after navigation; clicking it now.")
+                    clicked = wait_for_new_project_and_click(
+                        hwnd, timeout_seconds=20, initial_location=detected_location
+                    )
+                    if not clicked:
+                        update_operation_status("Could not click New Project after navigation", is_error=True)
+                        return
+                    page_ready = wait_for_prompt_workspace(hwnd, timeout_seconds=STAGE_TIMEOUT_SECONDS)
+
+                else:
+                    page_ready = False
+
+            if not page_ready:
+                error_message = (
+                    "Google Flow did not reach the whatdoyouwantocreate prompt workspace. "
+                    "The supervisor will restart and inspect the current page before deciding whether to navigate."
+                )
+                print(f"❌ [MAIN] {error_message}")
                 try:
-                    hud.print("The workspace did not finish loading.", "error")
+                    hud.print("The prompt workspace was not detected. Retrying page detection...", "error")
                 except Exception:
                     pass
-                update_operation_status("Failed to confirm page load", is_error=True)
+                update_operation_status(error_message, is_error=True)
                 return
 
-            print(f"✅ [MAIN] Google Flow page loaded successfully")
+            print("✅ [MAIN] Google Flow prompt workspace is ready; beginning scene processing from the start of this workflow attempt.")
             try:
                 hud.print("Everything is ready. Starting now...", "success")
             except Exception:
@@ -5426,7 +5917,7 @@ def generate_google_flow_images():
                             )
 
                             if right_edge_clicked:
-                                time.sleep(0.5)
+                                _sleep(0.5)
                                 move_mouse_to_center_of_screen()
                                 update_operation_status(
                                     "Clicked right edge of generatinggf_image.png "
@@ -5452,7 +5943,7 @@ def generate_google_flow_images():
 
                 success = process_single_entry_gf(hwnd, i, entry, images_folder)
                 if success:
-                    time.sleep(2)
+                    _sleep(2)
                 else:
                     print(f"❌ [MAIN] Scene {i+1} failed — aborting entire operation (never skip)")
                     try:
@@ -5482,94 +5973,182 @@ def generate_google_flow_images():
             else:
                 print("⚠️ [GF] Images may be generated, but project transfer did not complete.")
 
-        except KeyboardInterrupt as ki:
-            update_operation_status("Google Flow operation manually terminated by user", is_abort=True)
+        except (_WorkflowRestart, _ManualStop):
+            raise
+        except KeyboardInterrupt as exc:
+            raise _ManualStop(str(exc))
+        except SystemExit as exc:
+            raise _WorkflowRestart(str(exc))
+        except Exception as exc:
+            print(f"❌ [MAIN] Error: {exc}")
+            traceback.print_exc()
+            error_message = f"Unexpected error in Google Flow operation: {exc}"
+            update_operation_status(error_message, is_error=True)
             try:
+                hud.print("Something went wrong. Restarting the workflow...", "warning")
+            except Exception:
+                pass
+            raise _WorkflowRestart(error_message) from exc
+
+    # ------------------------------------------------------------------
+    # Full-workflow restart supervisor and global keyboard shortcuts
+    # ------------------------------------------------------------------
+    # Ctrl+R: suppress the browser's normal refresh and restart this function.
+    # Alt+/: stop the function manually.
+    # Both shortcuts are registered once and remain active across restarts.
+    restart_number = 0
+    restart_hotkey = None
+    stop_hotkey = None
+
+    try:
+        restart_hotkey = keyboard.add_hotkey("ctrl+r", on_restart_shortcut, suppress=True)
+        print("⌨️ [HOTKEY] Ctrl+R registered: restart the complete function without refreshing Edge.")
+    except Exception as hotkey_error:
+        print(f"⚠️ [HOTKEY] Could not register Ctrl+R: {hotkey_error}")
+
+    try:
+        stop_hotkey = keyboard.add_hotkey("alt+/", on_terminate_shortcut, suppress=True)
+        print("⌨️ [HOTKEY] Alt+/ registered: stop the function manually.")
+    except Exception as hotkey_error:
+        print(f"⚠️ [HOTKEY] Could not register Alt+/: {hotkey_error}")
+
+    try:
+        while True:
+            if stop_event.is_set() or terminate_automation:
+                print("🛑 [SUPERVISOR] Manual stop requested; exiting the function.")
+                break
+
+            if restart_event.is_set():
+                restart_event.clear()
+                print("🔁 [SUPERVISOR] Ctrl+R restart request received; rebuilding all run state.")
+
+            restart_number += 1
+            operation_status_flag = True
+            operation_status_message = ""
+            operation_aborted = False
+
+            # Re-read panel.json on every attempt so a restart behaves like a fresh console run.
+            try:
+                panel_data = _load_panel()
+                if not panel_data:
+                    raise ValueError("panel.json is empty, missing, or could not be read")
+                image_generation_engine = _find_engine(panel_data)
+                if image_generation_engine.lower() != "google flow":
+                    print(f"ℹ️ [ENGINE] Image generation engine changed to '{image_generation_engine}'; Google Flow worker will stop.")
+                    _set_currently_running(
+                        None,
+                        status="skipped",
+                        operation_status=f"Google Flow worker skipped because the selected engine is '{image_generation_engine}'"
+                    )
+                    break
+                project_title = _find_project_title(panel_data)
+                script_data = _find_script_data(panel_data)
+                all_entries.clear()
+                _collect_scene_entries(script_data)
+                total_entries = len(all_entries)
+            except Exception as reload_error:
+                print(f"⚠️ [SUPERVISOR] Could not refresh project configuration: {reload_error}")
+                _set_currently_running(
+                    "generate_google_flow_images()",
+                    status="pending",
+                    operation_status=f"Waiting for a readable Google Flow project configuration: {reload_error}"
+                )
+                _supervisor_wait(3)
+                continue
+
+            if total_entries <= 0:
+                print("⚠️ [SUPERVISOR] No scene entries found; checking panel.json again in 3 seconds.")
+                _set_currently_running(
+                    "generate_google_flow_images()",
+                    status="pending",
+                    operation_status="No scene entries found yet; waiting and retrying automatically"
+                )
+                _supervisor_wait(3)
+                continue
+
+            print(
+                f"\n🔁 [RESTART] Starting Google Flow workflow attempt {restart_number} "
+                "from the beginning: reread panel.json, inspect prompt workspace, "
+                "then New Project, otherwise navigate to GOOGLE_FLOW_URL; "
+                f"project='{project_title}', scenes={total_entries}."
+            )
+            _set_currently_running(
+                "generate_google_flow_images()",
+                status="pending",
+                operation_status=f"Starting Google Flow workflow attempt {restart_number}"
+            )
+
+            try:
+                main_google_flow_workflow()
+            except _WorkflowRestart as restart_reason:
+                print(f"🔁 [SUPERVISOR] Restarting from the beginning: {restart_reason}")
+                operation_status_flag = True
+                operation_aborted = False
+                _set_currently_running(
+                    "generate_google_flow_images()",
+                    status="pending",
+                    operation_status=f"Automatic restart after: {restart_reason}"
+                )
+            except _ManualStop as stop_reason:
+                print(f"🛑 [SUPERVISOR] {stop_reason}")
+                stop_event.set()
+                terminate_automation = True
+            except Exception as unexpected_error:
+                print(f"❌ [SUPERVISOR] Unexpected supervisor error: {unexpected_error}")
+                traceback.print_exc()
+                operation_status_flag = True
+                operation_aborted = False
+                _set_currently_running(
+                    "generate_google_flow_images()",
+                    status="pending",
+                    operation_status=f"Supervisor caught an error and will retry: {unexpected_error}"
+                )
+
+            if stop_event.is_set() or terminate_automation:
+                break
+
+            if restart_event.is_set():
+                restart_event.clear()
+                operation_status_flag = True
+                operation_aborted = False
+                print("🔁 [SUPERVISOR] Ctrl+R arrived at the end of an attempt; starting a fresh attempt instead of accepting the old result.")
+                _set_currently_running(
+                    "generate_google_flow_images()",
+                    status="pending",
+                    operation_status="Manual Ctrl+R restart requested"
+                )
+                continue
+
+            final_panel = _load_panel()
+            final_running = str(_get_status_value(final_panel, "currently_running", "") or "").strip()
+            if final_running == "generate_google_flow_images_successful":
+                print("✅ [SUPERVISOR] Workflow completed successfully; no restart is needed.")
+                break
+
+            operation_status_flag = True
+            operation_aborted = False
+            print("🔁 [SUPERVISOR] Workflow is incomplete; the next attempt will re-read panel.json and inspect the current Edge page.")
+            try:
+                hud.print("The workflow needs recovery. Restarting automatically...", "warning")
+            except Exception:
+                pass
+            _supervisor_wait(2)
+    finally:
+        for hotkey_handle in (restart_hotkey, stop_hotkey):
+            if hotkey_handle is not None:
+                try:
+                    keyboard.remove_hotkey(hotkey_handle)
+                except Exception:
+                    pass
+
+        if stop_event.is_set() or terminate_automation:
+            try:
+                update_operation_status("Google Flow operation manually stopped by user (Alt+/)", is_abort=True)
                 hud.show_summary("Stopped at your request.")
             except Exception:
                 pass
-            print(f"\n✅ Program successfully halted: {ki}")
-        except SystemExit as se:
-            print(f"🛑 System exit: {se}")
-        except Exception as e:
-            print(f"❌ [MAIN] Error: {e}")
-            traceback.print_exc()
-            error_msg = f"Unexpected error in Google Flow operation: {str(e)}"
-            update_operation_status(error_msg, is_error=True)
-            try:
-                hud.print("Something went wrong.", "error")
-            except Exception:
-                pass
-        finally:
-            try:
-                keyboard.remove_hotkey('alt+/')
-                print("🧹 Cleaned up hotkey")
-            except Exception:
-                pass
+            print("🛑 [SUPERVISOR] Google Flow function stopped by the user.")
 
-    # ------------------------------------------------------------------
-    # Automatic full-workflow restart supervisor
-    # ------------------------------------------------------------------
-    # Any unexpected failure, timeout, or failed scene causes the workflow
-    # to start again without a retry limit. Alt+/ remains the explicit manual
-    # stop control. Successful completion exits normally.
-    restart_number = 0
-    while True:
-        if terminate_automation:
-            print("🛑 [RESTART] Manual stop requested; not restarting.")
-            break
-
-        restart_number += 1
-        operation_status_flag = True
-        operation_status_message = ""
-        operation_aborted = False
-
-        print(
-            f"\\n🔁 [RESTART] Starting Google Flow workflow from the beginning "
-            f"(workflow attempt {restart_number}; unlimited automatic retries)."
-        )
-        _set_currently_running(
-            "generate_google_flow_images()",
-            status="pending",
-            operation_status=f"Restarting Google Flow workflow (attempt {restart_number})"
-        )
-
-        try:
-            keyboard.add_hotkey('alt+/', on_terminate_shortcut)
-        except Exception as hotkey_error:
-            print(f"⚠️ [RESTART] Could not register Alt+/ manual stop hotkey: {hotkey_error}")
-
-        main_google_flow_workflow()
-
-        # main_google_flow_workflow catches most failures internally, so inspect
-        # the persisted state to decide whether it completed or should restart.
-        final_panel = _load_panel()
-        final_running = str(_get_status_value(final_panel, "currently_running", "") or "").strip()
-        final_status = str(_get_status_value(final_panel, "status", "") or "").strip().lower()
-
-        try:
-            keyboard.remove_hotkey('alt+/')
-        except Exception:
-            pass
-
-        if final_running == "generate_google_flow_images_successful":
-            print("✅ [RESTART] Workflow completed successfully; supervisor is exiting.")
-            break
-
-        if terminate_automation:
-            print("🛑 [RESTART] Workflow stopped manually; supervisor is exiting.")
-            break
-
-        print(
-            f"⚠️ [RESTART] Workflow did not complete "
-            f"(status={final_status or 'unknown'}, currently_running={final_running or 'empty'}). "
-            "Waiting 3 seconds, then restarting from the beginning."
-        )
-        try:
-            hud.print("The workflow encountered a problem. Restarting automatically...", "warning")
-        except Exception:
-            pass
-        time.sleep(3)
 
 def video_producer():
 
@@ -7634,8 +8213,16 @@ def main():
     video_producer()
   
 if __name__ == "__main__":
-   generate_google_flow_images()
-   #video_producer()
+    print("🚀 Starting Google Flow image generation...", flush=True)
+
+    try:
+        generate_google_flow_images()
+        #video_producer()
+    except Exception as e:
+        import traceback
+        print(f"❌ FATAL ERROR: {e}", flush=True)
+        traceback.print_exc()
+   
 
    
 
