@@ -3199,6 +3199,19 @@
 .account-dynamic-field-info { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: 8px 14px; color: #64748b; font-size: 13px; overflow-wrap: anywhere; }
 .account-dynamic-subfield { grid-column: 1 / -1; margin-left: 8px; font-size: 12px; color: #64748b; }
 .account-dynamic-field-actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; padding: 12px 0 0; border: 1px solid #e5eaf0; border-radius: 9px; }
+.account-object-reorder { margin-top: 14px; padding: 12px; border: 1px solid #dbe5ec; border-radius: 10px; background: #fff; }
+.account-object-reorder-heading { display:flex; flex-direction:column; gap:4px; margin-bottom:10px; color:#1e293b; }
+.account-object-reorder-heading small { color:#64748b; font-size:12px; line-height:1.45; }
+.account-object-reorder-list { list-style:none; display:flex; flex-direction:column; gap:7px; padding:0; margin:0; }
+.account-object-reorder-item { display:flex; align-items:center; gap:10px; min-width:0; padding:9px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; }
+.account-object-position { display:flex; align-items:center; justify-content:center; flex:0 0 25px; height:25px; border-radius:7px; background:#e2e8f0; color:#334155; font-size:12px; font-weight:700; }
+.account-object-element-name { display:flex; flex:1; flex-direction:column; min-width:0; gap:3px; overflow-wrap:anywhere; color:#334155; font-size:13px; }
+.account-object-element-name small { color:#64748b; font-size:11px; }
+.account-object-move-controls { display:flex; gap:5px; }
+.account-object-move-controls .btn { min-width:34px; padding:5px 9px; }
+.account-object-move-controls .btn:disabled { opacity:.35; cursor:not-allowed; }
+.account-dynamic-field-card.is-saving-order { opacity:.65; pointer-events:none; }
+
 @media (max-width: 640px) {
     #user_tab_submit_tabs .submit-tabs-save-bar .btn,
     #user_tab_dynamic_fields .account-dynamic-fields-add-bar .btn { width: 100%; }
@@ -4987,6 +5000,68 @@
         card.setAttribute('aria-expanded', opening ? 'true' : 'false');
     }
 
+    // Persist object sub-field order by rebuilding fieldkeyvalue in the requested order.
+    // JavaScript object insertion order is retained by JSON.stringify and PHP json_decode.
+    function moveAccountObjectSubField(fieldKey, subKey, direction, button) {
+        var field = (globalDynamicFields || {})[fieldKey];
+        if (!field || field.field_type !== 'objects') return;
+        var current = field.fieldkeyvalue || {};
+        var keys = Object.keys(current);
+        var from = keys.indexOf(subKey);
+        var to = from + (direction === 'up' ? -1 : 1);
+        if (from < 0 || to < 0 || to >= keys.length) return;
+
+        var reorderedKeys = keys.slice();
+        var moved = reorderedKeys.splice(from, 1)[0];
+        reorderedKeys.splice(to, 0, moved);
+        var reordered = {};
+        reorderedKeys.forEach(function(k) { reordered[k] = current[k]; });
+        var previous = current;
+        field.fieldkeyvalue = reordered;
+
+        var card = button && button.closest('.account-dynamic-field-card');
+        if (card) card.classList.add('is-saving-order');
+        var formData = new FormData();
+        formData.append('save_global_single_field', 'true');
+        formData.append('user_id', selectedUserId);
+        formData.append('field_data', JSON.stringify({
+            'field-title': field['field-title'] || fieldKey,
+            'field-name': fieldKey,
+            'field_type': 'objects',
+            'fieldkeyvalue': reordered
+        }));
+
+        fetch(window.location.href, { method: 'POST', body: formData })
+            .then(function(response) {
+                if (!response.ok) throw new Error('HTTP ' + response.status);
+                return response.json();
+            })
+            .then(function(result) {
+                if (!result || !result.success) throw new Error((result && result.message) || 'The new order could not be saved.');
+                renderUserGlobalDynamicFields();
+                var cards = document.querySelectorAll('#userGlobalDynamicFieldsList .account-dynamic-field-card');
+                Array.prototype.forEach.call(cards, function(c) {
+                    var keyNode = c.querySelector('.account-dynamic-field-key');
+                    if (keyNode && keyNode.textContent === 'Key: ' + fieldKey) {
+                        var details = c.querySelector('.account-dynamic-field-details');
+                        var icon = c.querySelector('.account-dynamic-field-chevron');
+                        if (details) details.hidden = false;
+                        c.classList.add('is-expanded');
+                        c.setAttribute('aria-expanded', 'true');
+                        if (icon) icon.textContent = '−';
+                    }
+                });
+            })
+            .catch(function(error) {
+                field.fieldkeyvalue = previous;
+                renderUserGlobalDynamicFields();
+                if (typeof showDialog === 'function') showDialog('Order not saved', error.message || 'Could not save the new element order.');
+            })
+            .finally(function() {
+                if (card) card.classList.remove('is-saving-order');
+            });
+    }
+
     function renderUserGlobalDynamicFields() {
         var container = document.getElementById('userGlobalDynamicFieldsList');
         if (!container) return;
@@ -5016,17 +5091,29 @@
 
             var fieldType = field.field_type === 'objects' ? 'Objects field' : 'Individual field';
             var fieldInfo = '';
+            var reorderHtml = '';
             if (field.field_type === 'objects') {
                 var subFields = field.fieldkeyvalue || {};
                 var subKeys = Object.keys(subFields);
                 fieldInfo = '<div><strong>Type:</strong> Objects field</div>' +
-                    '<div><strong>Sub-fields:</strong> ' + subKeys.length + '</div>' +
-                    subKeys.map(function(sk) {
-                        var sub = subFields[sk] || {};
-                        var subElement = sub.element_type || 'input';
-                        var extraInfo = subElement === 'button' ? ' (Button → ' + (sub.button_url || 'No URL') + ')' : '';
-                        return '<div class="account-dynamic-subfield">• ' + escapeHtml(String(sk)) + ' (' + escapeHtml(String(subElement + extraInfo)) + ')</div>';
-                    }).join('');
+                    '<div><strong>Elements:</strong> ' + subKeys.length + '</div>';
+                if (subKeys.length) {
+                    reorderHtml = '<div class="account-object-reorder"><div class="account-object-reorder-heading">' +
+                        '<strong>Reposition elements</strong><small>Use the arrows to move an element above or below another element. Changes save automatically.</small></div>' +
+                        '<ol class="account-object-reorder-list">' +
+                        subKeys.map(function(sk, index) {
+                            var sub = subFields[sk] || {};
+                            var subElement = sub.element_type || 'input';
+                            var extraInfo = subElement === 'button' ? ' (Button)' : '';
+                            return '<li class="account-object-reorder-item" data-sub-key="' + escapeHtml(String(sk)) + '">' +
+                                '<span class="account-object-position">' + (index + 1) + '</span>' +
+                                '<span class="account-object-element-name"><strong>' + escapeHtml(String(sub['field-title'] || sk)) + '</strong><small>' + escapeHtml(String(sk)) + ' · ' + escapeHtml(String(subElement + extraInfo)) + '</small></span>' +
+                                '<span class="account-object-move-controls">' +
+                                '<button type="button" class="btn btn-secondary btn-sm account-object-move-up" aria-label="Move ' + escapeHtml(String(sk)) + ' up" ' + (index === 0 ? 'disabled' : '') + '>↑</button>' +
+                                '<button type="button" class="btn btn-secondary btn-sm account-object-move-down" aria-label="Move ' + escapeHtml(String(sk)) + ' down" ' + (index === subKeys.length - 1 ? 'disabled' : '') + '>↓</button>' +
+                                '</span></li>';
+                        }).join('') + '</ol></div>';
+                }
             } else {
                 var defaultValue = field.default_value || '';
                 var defaultValues = field.default_values || [];
@@ -5039,7 +5126,6 @@
                     (defaultValues.length ? '<div><strong>Select options:</strong> ' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</div>' : '');
             }
 
-            var safeKey = String(key).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
             card.innerHTML =
                 '<div class="account-dynamic-field-heading">' +
                     '<div class="account-dynamic-field-title-wrap">' +
@@ -5053,11 +5139,13 @@
                 '</div>' +
                 '<div class="account-dynamic-field-details" hidden>' +
                     '<div class="account-dynamic-field-info">' + fieldInfo + '</div>' +
+                    reorderHtml +
                     '<div class="account-dynamic-field-actions">' +
                         '<button type="button" class="btn btn-primary btn-sm account-field-edit">Edit Field</button>' +
                         '<button type="button" class="btn btn-danger btn-sm account-field-delete">Delete</button>' +
                     '</div>' +
                 '</div>';
+
             var editButton = card.querySelector('.account-field-edit');
             var deleteButton = card.querySelector('.account-field-delete');
             editButton.addEventListener('click', function(event) {
@@ -5067,6 +5155,20 @@
             deleteButton.addEventListener('click', function(event) {
                 event.stopPropagation();
                 deleteGlobalDynamicField(key);
+            });
+            card.querySelectorAll('.account-object-move-up').forEach(function(button) {
+                button.addEventListener('click', function(event) {
+                    event.preventDefault(); event.stopPropagation();
+                    var item = button.closest('.account-object-reorder-item');
+                    if (item) moveAccountObjectSubField(key, item.getAttribute('data-sub-key'), 'up', button);
+                });
+            });
+            card.querySelectorAll('.account-object-move-down').forEach(function(button) {
+                button.addEventListener('click', function(event) {
+                    event.preventDefault(); event.stopPropagation();
+                    var item = button.closest('.account-object-reorder-item');
+                    if (item) moveAccountObjectSubField(key, item.getAttribute('data-sub-key'), 'down', button);
+                });
             });
             container.appendChild(card);
         });
