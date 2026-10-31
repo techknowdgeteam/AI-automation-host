@@ -263,7 +263,99 @@
 
     // Set dashboard view
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['set_dashboard_view'])) {
-        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'initialize'), ['initialize', 'accounts', 'all_config'], true) ? $_POST['view'] : 'initialize';
+        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'initialize'), ['initialize', 'accounts', 'copy_data'], true) ? $_POST['view'] : 'initialize';
+        $redirect = true;
+    }
+
+    // Copy complete Dynamic Tabs and/or Dynamic Content configuration between accounts.
+    // The selected database column values are copied as raw strings. They are NOT decoded,
+    // filtered, re-indexed, normalized, or re-encoded, so every stored JSON character/value
+    // in the selected configuration category is retained exactly as it exists in the source.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_account_data'])) {
+        $sourceUserId = intval($_POST['copy_from_account'] ?? 0);
+        $targetUserId = intval($_POST['copy_to_account'] ?? 0);
+        $copyScope = (string)($_POST['copy_data_scope'] ?? '');
+
+        $scopeColumns = [
+            'dynamic_tabs_and_fields' => ['dynamic_tabs', 'dynamic_fields'],
+            'dynamic_tabs' => ['dynamic_tabs'],
+            'dynamic_fields' => ['dynamic_fields']
+        ];
+
+        if ($sourceUserId <= 0 || $targetUserId <= 0) {
+            $_SESSION['flash_error'] = 'Select both the source account and destination account.';
+        } elseif ($sourceUserId === $targetUserId) {
+            $_SESSION['flash_error'] = 'The source and destination accounts must be different.';
+        } elseif (!isset($scopeColumns[$copyScope])) {
+            $_SESSION['flash_error'] = 'Select valid data to copy.';
+        } else {
+            $sourceUser = getUserById($pdo, $sourceUserId);
+            $targetUser = getUserById($pdo, $targetUserId);
+            $sourceConfig = getUserConfig($pdo, $sourceUserId);
+
+            if (!$sourceUser || !$targetUser) {
+                $_SESSION['flash_error'] = 'The selected source or destination account could not be found.';
+            } elseif (!$sourceConfig) {
+                $_SESSION['flash_error'] = 'The source account does not have any saved configuration to copy.';
+            } else {
+                try {
+                    $columnsToCopy = $scopeColumns[$copyScope];
+                    $pdo->beginTransaction();
+                    $targetConfig = getUserConfig($pdo, $targetUserId);
+
+                    if ($targetConfig) {
+                        $setParts = [];
+                        $parameters = [':id' => (int)$targetConfig['id']];
+                        foreach ($columnsToCopy as $columnName) {
+                            // Column names are selected only from the fixed whitelist above.
+                            $setParts[] = '`' . $columnName . '` = :' . $columnName;
+                            $parameters[':' . $columnName] = array_key_exists($columnName, $sourceConfig)
+                                ? $sourceConfig[$columnName]
+                                : null;
+                        }
+
+                        $copyStmt = $pdo->prepare(
+                            'UPDATE sceneiq_config SET ' . implode(', ', $setParts) . ' WHERE id = :id'
+                        );
+                        $copyStmt->execute($parameters);
+                    } else {
+                        // A new destination config needs default values for columns outside
+                        // the chosen scope. Selected columns still use the source's raw values.
+                        $dynamicFieldsRaw = in_array('dynamic_fields', $columnsToCopy, true)
+                            ? $sourceConfig['dynamic_fields']
+                            : '[]';
+                        $dynamicTabsRaw = in_array('dynamic_tabs', $columnsToCopy, true)
+                            ? $sourceConfig['dynamic_tabs']
+                            : '[]';
+
+                        $copyStmt = $pdo->prepare(
+                            'INSERT INTO sceneiq_config (user_id, settings, dynamic_fields, dynamic_tabs)
+' .
+                            'VALUES (:user_id, :settings, :dynamic_fields, :dynamic_tabs)'
+                        );
+                        $copyStmt->execute([
+                            ':user_id' => $targetUserId,
+                            ':settings' => '[]',
+                            ':dynamic_fields' => $dynamicFieldsRaw,
+                            ':dynamic_tabs' => $dynamicTabsRaw
+                        ]);
+                    }
+
+                    $pdo->commit();
+                    $scopeLabel = $copyScope === 'dynamic_tabs_and_fields'
+                        ? 'Dynamic tab and Dynamic content'
+                        : ($copyScope === 'dynamic_tabs' ? 'Dynamic tab' : 'Dynamic content');
+                    $_SESSION['flash_success'] = $scopeLabel . ' copied completely from "' .
+                        $sourceUser['username'] . '" to "' . $targetUser['username'] . '".';
+                } catch (Throwable $e) {
+                    if ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
+                    error_log('Account data copy failed: ' . $e->getMessage());
+                    $_SESSION['flash_error'] = 'Unable to copy account data. No partial copy was saved.';
+                }
+            }
+        }
         $redirect = true;
     }
 
@@ -339,7 +431,16 @@
                     unset($dynamicFields[$oldKey]);
                 }
                 
-                // Add with new key
+                // Add with new key. Object multiple-selection sub-fields must always
+                // retain JSON as their saved data type, including the edit/update path.
+                if (($fieldData['field_type'] ?? '') === 'objects' && isset($fieldData['fieldkeyvalue']) && is_array($fieldData['fieldkeyvalue'])) {
+                    foreach ($fieldData['fieldkeyvalue'] as &$updatedSubField) {
+                        if (is_array($updatedSubField) && ($updatedSubField['element_type'] ?? '') === 'multiple-selections') {
+                            $updatedSubField['data_type'] = 'json';
+                        }
+                    }
+                    unset($updatedSubField);
+                }
                 $dynamicFields[$newKey] = $fieldData;
                 
                 $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
@@ -394,6 +495,10 @@
                         foreach ($subFields as &$subField) {
                             if (!is_array($subField)) $subField = [];
                             $subType = strtolower((string)($subField['data_type'] ?? 'string'));
+                            // Multiple selections always store an array, so their data type is JSON.
+                            if (($subField['element_type'] ?? '') === 'multiple-selections') {
+                                $subType = 'json';
+                            }
                             $subField['data_type'] = in_array($subType, ['string', 'int', 'integer', 'json'], true)
                                 ? ($subType === 'integer' ? 'int' : $subType)
                                 : 'string';
@@ -1004,7 +1109,7 @@
     $users = getAllUsers($pdo);
     $selectedUserId = isset($_SESSION['selected_user_id']) ? intval($_SESSION['selected_user_id']) : 0;
     $dashboardView = isset($_SESSION['dashboard_view']) ? $_SESSION['dashboard_view'] : 'initialize';
-    if (!in_array($dashboardView, ['initialize', 'accounts', 'all_config'], true)) { $dashboardView = 'initialize'; }
+    if (!in_array($dashboardView, ['initialize', 'accounts', 'copy_data'], true)) { $dashboardView = 'initialize'; }
 
     $selectedUser = null;
     $userConfig = null;
@@ -1018,24 +1123,6 @@
     $statusLabels = ['pending' => 'Pending', 'completed' => 'Completed', 'aborted' => 'Aborted'];
     $statusColors = ['pending' => '#f59e0b', 'completed' => '#10b981', 'aborted' => '#ef4444'];
     $statusIcons = ['pending' => '', 'completed' => '', 'aborted' => ''];
-
-    // For All Account Config - get all entries across all users
-    $allUsersEntries = ['pending' => [], 'completed' => [], 'aborted' => []];
-    foreach ($users as $user) {
-        $userConf = getUserConfig($pdo, $user['id']);
-        if ($userConf) {
-            $settings = json_decode($userConf['settings'], true) ?: [];
-            if (!is_array($settings)) $settings = [];
-            $settings = repairSettings($settings);
-            foreach ($settings as $index => $entry) {
-                $status = isset($entry['status']) ? strtolower($entry['status']) : 'pending';
-                $entry['_user'] = $user['username'];
-                $entry['_user_id'] = $user['id'];
-                $entry['_index'] = $index;
-                $allUsersEntries[$status][] = $entry;
-            }
-        }
-    }
 
     if ($selectedUserId > 0) {
         $selectedUser = getUserById($pdo, $selectedUserId);
@@ -3814,6 +3901,16 @@
 .account-list-name { font-weight:650; color:#1f2937; overflow-wrap:anywhere; }
 .account-list-email { color:#6b7280; font-size:13px; overflow-wrap:anywhere; text-align:right; }
 .accounts-empty { padding:28px 12px; color:#6b7280; text-align:center; }
+.copy-data-panel { width:100%; max-width:760px; margin:10px auto; padding:22px; border:1px solid #e2e8f0; border-radius:14px; background:#fff; box-shadow:0 4px 18px rgba(15,23,42,.05); }
+.copy-data-panel h3 { margin:0 0 8px; color:#172033; font-size:20px; }
+.copy-data-description { margin:0 0 22px; color:#64748b; font-size:13px; line-height:1.6; }
+.copy-data-form { display:flex; flex-direction:column; gap:16px; }
+.copy-data-field { display:flex; flex-direction:column; gap:7px; min-width:0; }
+.copy-data-field label { color:#334155; font-size:13px; font-weight:700; }
+.copy-data-field select { width:100%; min-height:44px; padding:10px 12px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#172033; }
+.copy-data-actions { display:flex; justify-content:flex-end; padding-top:4px; }
+.copy-data-empty { padding:22px 12px; border:1px dashed #cbd5e1; border-radius:10px; color:#64748b; text-align:center; }
+@media(max-width:560px) { .copy-data-panel { padding:15px; } .copy-data-actions .btn { width:100%; } }
 .menu-drawer-overlay { position:fixed; inset:0; z-index:5000; background:rgba(15,23,42,.42); opacity:0; visibility:hidden; pointer-events:none; transition:opacity .22s ease, visibility .22s ease; }
 .menu-drawer-overlay.active { opacity:1; visibility:visible; pointer-events:auto; }
 .menu-drawer { position:absolute; top:0; left:0; bottom:0; width:min(340px,86vw); background:#fff; box-shadow:8px 0 30px rgba(0,0,0,.18); transform:translateX(-105%); transition:transform .25s ease; padding:20px 16px; display:flex; flex-direction:column; gap:10px; }
@@ -3833,6 +3930,43 @@
 .password-form-message { margin-top:8px; color:#b91c1c; font-size:12px; }
 
 @media (max-width:640px) { .account-list-select { align-items:flex-start; flex-direction:column; gap:5px; } .account-list-email { text-align:left; } }
+
+/* Multiple selections field: searchable modal and selected-value storer */
+.multiple-selections-control { width:100%; min-width:0; }
+.multiple-selections-trigger { display:block; width:100%; min-height:44px; padding:11px 13px; border:1px solid #cbd5e1; border-radius:8px; background:#fff; color:#334155; text-align:left; cursor:pointer; }
+.multiple-selections-trigger:focus { outline:none; border-color:#0f766e; box-shadow:0 0 0 3px rgba(15,118,110,.12); }
+.multiple-selections-storer { display:flex; flex-wrap:wrap; align-items:center; gap:7px; min-height:42px; margin-top:8px; padding:9px; border:1px solid #e2e8f0; border-radius:8px; background:#f8fafc; }
+.multiple-selections-empty { color:#94a3b8; font-size:12px; }
+.multiple-selections-chip { display:inline-flex; align-items:center; gap:7px; max-width:100%; padding:6px 9px; border:1px solid #99f6e4; border-radius:7px; background:#ecfdf5; color:#115e59; font-size:12px; overflow-wrap:anywhere; }
+.multiple-selections-chip-text { min-width:0; white-space:pre-wrap; overflow-wrap:anywhere; }
+.multiple-selections-chip-remove { border:0; background:transparent; color:#b91c1c; font-size:17px; line-height:1; cursor:pointer; padding:0 1px; }
+.multiple-selections-modal { position:fixed; inset:0; z-index:2000000; display:flex; align-items:center; justify-content:center; width:100vw; height:100vh; height:100dvh; padding:16px; overflow:hidden; overscroll-behavior:contain; background:rgba(15,23,42,.58); }
+.multiple-selections-modal[hidden] { display:none !important; }
+.multiple-selections-dialog { display:flex; flex-direction:column; gap:12px; width:min(560px, calc(100vw - 28px)); max-height:calc(100vh - 32px); max-height:calc(100dvh - 32px); min-height:0; padding:18px; overflow:hidden; border:1px solid #dbe3ea; border-radius:14px; background:#fff; box-shadow:0 24px 70px rgba(15,23,42,.28); }
+.multiple-selections-dialog-header { display:flex; align-items:center; justify-content:space-between; gap:12px; flex:0 0 auto; color:#0f172a; }
+.multiple-selections-dialog-header h4 { margin:0; font-size:17px; }
+.multiple-selections-dialog-search { width:100%; min-height:42px; flex:0 0 auto; padding:10px 12px; border:1px solid #cbd5e1; border-radius:8px; color:#0f172a; background:#fff; }
+.multiple-selections-options { display:flex; flex:1 1 auto; flex-direction:column; gap:7px; min-height:0; overflow-x:hidden; overflow-y:auto; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; padding:2px; }
+.multiple-selections-option { display:flex; align-items:center; gap:11px; width:100%; min-height:42px; flex:0 0 auto; padding:10px 12px; border:1px solid #e2e8f0; border-radius:8px; background:#fff; color:#334155; text-align:left; cursor:pointer; overflow-wrap:anywhere; user-select:none; -webkit-user-select:none; }
+.multiple-selections-option:hover { border-color:#0f766e; background:#f0fdfa; }
+.multiple-selections-option.is-selected { border-color:#0f766e; background:#ecfdf5; color:#115e59; }
+.multiple-selections-option-checkbox { width:18px; height:18px; flex:0 0 18px; margin:0; accent-color:#0f766e; cursor:pointer; }
+.multiple-selections-option-label { min-width:0; flex:1 1 auto; overflow-wrap:anywhere; pointer-events:none; }
+.multiple-selections-no-results { flex:0 0 auto; padding:12px; color:#64748b; font-size:13px; text-align:center; }
+.multiple-selections-dialog-footer { display:flex; flex:0 0 auto; justify-content:flex-end; gap:8px; padding-top:8px; border-top:1px solid #e2e8f0; }
+
+/* A visible custom modal sits above the page and locks the page's scroll viewport.
+   Scrolling remains available only inside the modal's own content area. */
+html.sceneiq-modal-open, body.sceneiq-modal-open { overflow:hidden !important; }
+body.sceneiq-modal-open .custom-body { overflow:hidden !important; }
+body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
+.custom-dialog-overlay { position:fixed !important; inset:0 !important; width:100vw !important; height:100vh !important; height:100dvh !important; overflow:hidden !important; overscroll-behavior:contain; }
+.custom-dialog-box { min-height:0; max-height:calc(100vh - 40px) !important; max-height:calc(100dvh - 40px) !important; overflow-x:hidden !important; overflow-y:auto !important; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
+.custom-dialog-box .dialog-content-area,
+.user-search-modal .dialog-body { min-height:0; overscroll-behavior:contain; -webkit-overflow-scrolling:touch; }
+.user-search-modal .custom-dialog-box { overflow:hidden !important; }
+.user-search-modal .dialog-body { overflow-y:auto !important; }
+@media (max-width:560px) { .multiple-selections-dialog { padding:14px; } .multiple-selections-dialog-header h4 { font-size:15px; } }
 </style>
 </head>
 <body class="<?php echo $selectedUserId > 0 ? 'sceneiq-folder-pending' : ''; ?>">
@@ -4025,7 +4159,7 @@
                             <div class="dashboard-tabs" role="tablist" aria-label="Account dashboard">
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>" onclick="switchDashboardTab('initialize', this)">Initialize Account</button>
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>" onclick="switchDashboardTab('accounts', this)">All Accounts</button>
-                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'all_config') ? 'active' : ''; ?>" onclick="switchDashboardTab('all_config', this)">All Account Config</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'copy_data') ? 'active' : ''; ?>" onclick="switchDashboardTab('copy_data', this)">Copy Data</button>
                             </div>
                             
                             <div id="dash_tab_initialize" class="dashboard-content <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>">
@@ -4062,13 +4196,56 @@
                                 </div>
                             </div>
                             
-                            <div id="dash_tab_all_config" class="dashboard-content <?php echo ($dashboardView === 'all_config') ? 'active' : ''; ?>">
-                                <h3 style="margin-bottom:15px; color:#1a1a2e;">All Account Configuration</h3>
-                                
-                                <?php if (empty($users)): ?>
-                                    <p style="color:#6b7280; text-align:center; padding:40px;">No users found. Create a user first.</p>
-                                <?php else: ?>
-                                <?php endif; ?>
+                            <div id="dash_tab_copy_data" class="dashboard-content <?php echo ($dashboardView === 'copy_data') ? 'active' : ''; ?>">
+                                <section class="copy-data-panel">
+                                    <h3>Copy Data Between Accounts</h3>
+                                    <p class="copy-data-description">
+                                        Copy the complete saved Dynamic tab configuration, Dynamic content definitions, or both.
+                                        The selected destination data will be replaced by the source data exactly as stored.
+                                        Project entries (Pending, Completed, and Aborted) are not changed.
+                                    </p>
+
+                                    <?php if (count($users) < 2): ?>
+                                        <p class="copy-data-empty">At least two accounts are required to copy data between accounts.</p>
+                                    <?php else: ?>
+                                        <form method="POST" id="copyAccountDataForm" class="copy-data-form" onsubmit="return confirmCopyDataForm();">
+                                            <input type="hidden" name="copy_account_data" value="1">
+
+                                            <div class="copy-data-field">
+                                                <label for="copyDataFromAccount">Copy data from Account</label>
+                                                <select name="copy_from_account" id="copyDataFromAccount" required>
+                                                    <option value="">Select source account</option>
+                                                    <?php foreach ($users as $user): ?>
+                                                        <option value="<?php echo (int)$user['id']; ?>"><?php echo htmlspecialchars($user['username'] . ' — ' . $user['email'], ENT_QUOTES, 'UTF-8'); ?></option>
+                                                    <?php endforeach; ?>
+                                                </select>
+                                            </div>
+
+                                            <div class="copy-data-field">
+                                                <label for="copyDataScope">Copy data of</label>
+                                                <select name="copy_data_scope" id="copyDataScope" required>
+                                                    <option value="dynamic_tabs_and_fields">Dynamic tab and Dynamic content</option>
+                                                    <option value="dynamic_tabs">Dynamic tab</option>
+                                                    <option value="dynamic_fields">Dynamic content</option>
+                                                </select>
+                                            </div>
+
+                                            <div class="copy-data-field">
+                                                <label for="copyDataToAccount">Copy These Data to Account</label>
+                                                <select name="copy_to_account" id="copyDataToAccount" required>
+                                                    <option value="">Select destination account</option>
+                                                    <?php foreach ($users as $user): ?>
+                                                        <option value="<?php echo (int)$user['id']; ?>"><?php echo htmlspecialchars($user['username'] . ' — ' . $user['email'], ENT_QUOTES, 'UTF-8'); ?></option>
+                                                    <?php endforeach; ?>
+                                                </select>
+                                            </div>
+
+                                            <div class="copy-data-actions">
+                                                <button type="submit" class="btn btn-primary">Copy Data</button>
+                                            </div>
+                                        </form>
+                                    <?php endif; ?>
+                                </section>
                             </div>
                         <?php endif; ?>
                     </div>
@@ -4202,6 +4379,38 @@
                                                 <option value="<?php echo htmlspecialchars($val); ?>" <?php echo ($val === $defaultValue) ? 'selected' : ''; ?>><?php echo htmlspecialchars($val); ?></option>
                                             <?php endforeach; ?>
                                         </select>
+                                    <?php elseif ($elementType === 'multiple-selections'): ?>
+                                        <div id="field_<?php echo htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8'); ?>_<?php echo htmlspecialchars((string)$subKey, ENT_QUOTES, 'UTF-8'); ?>_container" class="multiple-selections-control">
+                                            <input type="text" class="multiple-selections-trigger" readonly role="button" aria-haspopup="dialog" placeholder="Click to search and select values..." onclick="openMultipleSelectionsModal(this)">
+                                            <div class="multiple-selections-storer" aria-live="polite">
+                                                <span class="multiple-selections-empty">No values selected yet.</span>
+                                            </div>
+                                            <input type="hidden" id="entry_<?php echo htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8'); ?>_<?php echo htmlspecialchars((string)$subKey, ENT_QUOTES, 'UTF-8'); ?>" value="[]" class="new-project-field" data-field-key="<?php echo htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8'); ?>" data-sub-key="<?php echo htmlspecialchars((string)$subKey, ENT_QUOTES, 'UTF-8'); ?>">
+                                            <div class="multiple-selections-modal" hidden onclick="if(event.target === this) closeMultipleSelectionsModal(this)">
+                                                <div class="multiple-selections-dialog" role="dialog" aria-modal="true" aria-label="Select values for <?php echo htmlspecialchars($title, ENT_QUOTES, 'UTF-8'); ?>">
+                                                    <div class="multiple-selections-dialog-header">
+                                                        <h4><?php echo htmlspecialchars($title); ?></h4>
+                                                        <button type="button" class="btn btn-secondary btn-sm" onclick="closeMultipleSelectionsModal(this)">Done</button>
+                                                    </div>
+                                                    <input type="search" class="multiple-selections-dialog-search" placeholder="Search available values..." oninput="filterMultipleSelectionOptions(this)">
+                                                    <div class="multiple-selections-options">
+                                                        <?php foreach (($subField['default_values'] ?? []) as $optionValue): ?>
+                                                            <label class="multiple-selections-option" data-value="<?php echo htmlspecialchars((string)$optionValue, ENT_QUOTES, 'UTF-8'); ?>">
+                                                                <input type="checkbox" class="multiple-selections-option-checkbox" value="<?php echo htmlspecialchars((string)$optionValue, ENT_QUOTES, 'UTF-8'); ?>" aria-label="Select <?php echo htmlspecialchars((string)$optionValue, ENT_QUOTES, 'UTF-8'); ?>" onchange="selectMultipleSelectionOption(this)">
+                                                                <span class="multiple-selections-option-label"><?php echo htmlspecialchars((string)$optionValue); ?></span>
+                                                            </label>
+                                                        <?php endforeach; ?>
+                                                        <div class="multiple-selections-no-results" hidden>No matching values found.</div>
+                                                    </div>
+                                                    <?php if (empty($subField['default_values'])): ?>
+                                                        <div class="multiple-selections-no-results">No values have been configured for this field.</div>
+                                                    <?php endif; ?>
+                                                    <div class="multiple-selections-dialog-footer">
+                                                        <button type="button" class="btn btn-primary btn-sm" onclick="closeMultipleSelectionsModal(this)">Done</button>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        </div>
                                     <?php elseif ($elementType === 'button'): ?>
                                         <div>
                                             <button type="button" class="btn btn-primary" onclick="openUrl('<?php echo htmlspecialchars(trim($buttonUrl), ENT_QUOTES); ?>')" style="padding:8px 20px;">
@@ -4277,6 +4486,41 @@
                                     </div>
                                 <?php endif; ?>
                             </div>
+                        <?php elseif ($elementType === 'multiple-selections'): ?>
+                            <div id="field_<?php echo htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8'); ?>_container" class="multiple-selections-control">
+                                <input type="text" class="multiple-selections-trigger" readonly role="button" aria-haspopup="dialog" placeholder="Click to search and select values..." onclick="openMultipleSelectionsModal(this)">
+                                <div class="multiple-selections-storer" aria-live="polite">
+                                    <span class="multiple-selections-empty">No values selected yet.</span>
+                                </div>
+                                <input type="hidden" id="entry_<?php echo htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8'); ?>" value="[]" class="new-project-field" data-field-key="<?php echo htmlspecialchars((string)$key, ENT_QUOTES, 'UTF-8'); ?>">
+                                <div class="multiple-selections-modal" hidden onclick="if(event.target === this) closeMultipleSelectionsModal(this)">
+                                    <div class="multiple-selections-dialog" role="dialog" aria-modal="true" aria-label="Select values">
+                                        <div class="multiple-selections-dialog-header">
+                                            <h4><?php echo htmlspecialchars($field['field-title'] ?? $key); ?></h4>
+                                            <button type="button" class="btn btn-secondary btn-sm" onclick="closeMultipleSelectionsModal(this)">Done</button>
+                                        </div>
+                                        <input type="search" class="multiple-selections-dialog-search" placeholder="Search available values..." oninput="filterMultipleSelectionOptions(this)">
+                                        <div class="multiple-selections-options">
+                                            <?php foreach ($defaultValues as $optionValue): ?>
+                                                <label class="multiple-selections-option" data-value="<?php echo htmlspecialchars((string)$optionValue, ENT_QUOTES, 'UTF-8'); ?>">
+                                                    <input type="checkbox" class="multiple-selections-option-checkbox" value="<?php echo htmlspecialchars((string)$optionValue, ENT_QUOTES, 'UTF-8'); ?>" aria-label="Select <?php echo htmlspecialchars((string)$optionValue, ENT_QUOTES, 'UTF-8'); ?>" onchange="selectMultipleSelectionOption(this)">
+                                                    <span class="multiple-selections-option-label"><?php echo htmlspecialchars((string)$optionValue); ?></span>
+                                                </label>
+                                            <?php endforeach; ?>
+                                            <div class="multiple-selections-no-results" hidden>No matching values found.</div>
+                                        </div>
+                                        <?php if (empty($defaultValues)): ?>
+                                            <div class="multiple-selections-no-results">No values have been configured for this field.</div>
+                                        <?php endif; ?>
+                                        <div class="multiple-selections-dialog-footer">
+                                            <button type="button" class="btn btn-primary btn-sm" onclick="closeMultipleSelectionsModal(this)">Done</button>
+                                        </div>
+                                    </div>
+                                </div>
+                                <div style="margin-top:5px;display:flex;gap:8px;flex-wrap:wrap;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyIndividualFromDOM(this)">📋 Copy Data</button>
+                                </div>
+                            </div>
                         <?php elseif ($elementType === 'select'): ?>
                             <div id="field_<?php echo $key; ?>_container">
                                 <select id="entry_<?php echo $key; ?>" class="new-project-field" data-field-key="<?php echo $key; ?>">
@@ -4335,7 +4579,6 @@
     var globalDynamicFields = <?php echo json_encode($globalDynamicFields); ?>;
     var userSettings = <?php echo json_encode($userSettings); ?>;
     var userDynamicTabs = <?php echo json_encode($userDynamicTabs); ?>;
-    var allUsersEntries = <?php echo json_encode($allUsersEntries); ?>;
     var _pendingSaveData = null;
 
     // ============================================================
@@ -4343,6 +4586,192 @@
     // ============================================================
 
     window._fieldValueCache = {};
+
+    // Keep active modal overlays attached directly to <body> so fixed positioning
+    // is relative to the viewport rather than clipped by the page's scroll container.
+    // Restore each modal to its original DOM location when it closes.
+    var _sceneiqOpenModals = new Set();
+    var _sceneiqLockedScrollTop = 0;
+
+    function moveSceneIQModalToBody(modal) {
+        if (!modal || !modal.parentNode || modal.parentNode === document.body) return;
+        if (!modal._sceneiqModalPlaceholder) {
+            modal._sceneiqModalPlaceholder = document.createComment('SceneIQ modal placeholder');
+            modal.parentNode.insertBefore(modal._sceneiqModalPlaceholder, modal);
+        }
+        document.body.appendChild(modal);
+    }
+
+    function restoreSceneIQModal(modal) {
+        if (!modal) return;
+        var placeholder = modal._sceneiqModalPlaceholder;
+        if (placeholder && placeholder.parentNode) {
+            placeholder.parentNode.insertBefore(modal, placeholder);
+            placeholder.parentNode.removeChild(placeholder);
+        }
+        modal._sceneiqModalPlaceholder = null;
+    }
+
+    function lockSceneIQBackground(modal) {
+        if (!modal || _sceneiqOpenModals.has(modal)) return;
+        if (_sceneiqOpenModals.size === 0) {
+            var scrollHost = document.querySelector('.scroll-body');
+            _sceneiqLockedScrollTop = scrollHost ? scrollHost.scrollTop : 0;
+            document.documentElement.classList.add('sceneiq-modal-open');
+            document.body.classList.add('sceneiq-modal-open');
+        }
+        _sceneiqOpenModals.add(modal);
+    }
+
+    function unlockSceneIQBackground(modal) {
+        if (!modal) return;
+        _sceneiqOpenModals.delete(modal);
+        if (_sceneiqOpenModals.size === 0) {
+            document.documentElement.classList.remove('sceneiq-modal-open');
+            document.body.classList.remove('sceneiq-modal-open');
+            var scrollHost = document.querySelector('.scroll-body');
+            if (scrollHost) scrollHost.scrollTop = _sceneiqLockedScrollTop;
+        }
+    }
+
+    // Multiple selections values are kept as a native JSON array in the hidden
+    // form control, then submitted as an array (not as a comma-joined string).
+    function readMultipleSelectionValues(control) {
+        if (!control) return [];
+        var hidden = control.querySelector('.new-project-field[data-field-key]');
+        if (!hidden) return [];
+        try {
+            var parsed = JSON.parse(hidden.value || '[]');
+            return Array.isArray(parsed) ? parsed.map(function(value) { return String(value); }) : [];
+        } catch (error) {
+            console.warn('[SceneIQ Multiple Selections] Could not parse selected values.', error);
+            return [];
+        }
+    }
+
+    function writeMultipleSelectionValues(control, values) {
+        if (!control) return;
+        var hidden = control.querySelector('.new-project-field[data-field-key]');
+        var storer = control.querySelector('.multiple-selections-storer');
+        var modal = control._multipleSelectionsModal || control.querySelector('.multiple-selections-modal');
+        var cleanValues = [];
+        (Array.isArray(values) ? values : []).forEach(function(value) {
+            value = String(value == null ? '' : value).trim();
+            if (value && cleanValues.indexOf(value) === -1) cleanValues.push(value);
+        });
+
+        if (hidden) hidden.value = JSON.stringify(cleanValues);
+        if (storer) {
+            storer.innerHTML = '';
+            if (!cleanValues.length) {
+                var empty = document.createElement('span');
+                empty.className = 'multiple-selections-empty';
+                empty.textContent = 'No values selected yet.';
+                storer.appendChild(empty);
+            } else {
+                cleanValues.forEach(function(value) {
+                    var chip = document.createElement('span');
+                    chip.className = 'multiple-selections-chip';
+                    var label = document.createElement('span');
+                    label.className = 'multiple-selections-chip-text';
+                    label.textContent = value;
+                    var remove = document.createElement('button');
+                    remove.type = 'button';
+                    remove.className = 'multiple-selections-chip-remove';
+                    remove.setAttribute('aria-label', 'Remove ' + value);
+                    remove.textContent = '×';
+                    remove.addEventListener('click', function() {
+                        writeMultipleSelectionValues(control, readMultipleSelectionValues(control).filter(function(item) { return item !== value; }));
+                    });
+                    chip.appendChild(label);
+                    chip.appendChild(remove);
+                    storer.appendChild(chip);
+                });
+            }
+        }
+
+        if (modal) {
+            modal.querySelectorAll('.multiple-selections-option').forEach(function(option) {
+                var isSelected = cleanValues.indexOf(option.getAttribute('data-value') || '') !== -1;
+                var checkbox = option.querySelector('.multiple-selections-option-checkbox');
+                option.classList.toggle('is-selected', isSelected);
+                option.setAttribute('aria-checked', isSelected ? 'true' : 'false');
+                if (checkbox) checkbox.checked = isSelected;
+            });
+        }
+        if (typeof syncFieldValues === 'function') syncFieldValues();
+    }
+
+    function openMultipleSelectionsModal(trigger) {
+        var control = trigger && trigger.closest ? trigger.closest('.multiple-selections-control') : null;
+        if (!control) return;
+        var modal = control._multipleSelectionsModal || control.querySelector('.multiple-selections-modal');
+        if (!modal) return;
+        control._multipleSelectionsModal = modal;
+        modal._sceneiqModalControl = control;
+        moveSceneIQModalToBody(modal);
+        lockSceneIQBackground(modal);
+        modal.hidden = false;
+        modal.style.display = 'flex';
+        var search = modal.querySelector('.multiple-selections-dialog-search');
+        if (search) {
+            search.value = '';
+            filterMultipleSelectionOptions(search);
+            window.setTimeout(function() { search.focus(); }, 50);
+        }
+        writeMultipleSelectionValues(control, readMultipleSelectionValues(control));
+    }
+
+    function closeMultipleSelectionsModal(source) {
+        var modal = source && source.classList && source.classList.contains('multiple-selections-modal')
+            ? source
+            : (source && source.closest ? source.closest('.multiple-selections-modal') : null);
+        if (!modal) return;
+        var control = modal._sceneiqModalControl || null;
+        modal.hidden = true;
+        modal.style.display = 'none';
+        unlockSceneIQBackground(modal);
+        restoreSceneIQModal(modal);
+        if (control) {
+            control._multipleSelectionsModal = null;
+            modal._sceneiqModalControl = null;
+        }
+    }
+
+    function filterMultipleSelectionOptions(searchInput) {
+        var modal = searchInput && searchInput.closest ? searchInput.closest('.multiple-selections-modal') : null;
+        if (!modal) return;
+        var query = String(searchInput.value || '').trim().toLowerCase();
+        var visibleCount = 0;
+        modal.querySelectorAll('.multiple-selections-option').forEach(function(option) {
+            var matches = (option.textContent || '').toLowerCase().indexOf(query) !== -1;
+            option.style.display = matches ? '' : 'none';
+            if (matches) visibleCount++;
+        });
+        var optionButtons = modal.querySelectorAll('.multiple-selections-option');
+        var noResults = modal.querySelector('.multiple-selections-options .multiple-selections-no-results');
+        if (noResults) noResults.hidden = optionButtons.length === 0 || visibleCount !== 0;
+    }
+
+    function selectMultipleSelectionOption(optionCheckbox) {
+        if (!optionCheckbox) return;
+        var option = optionCheckbox.closest ? optionCheckbox.closest('.multiple-selections-option') : null;
+        if (!option) return;
+        var modal = option.closest ? option.closest('.multiple-selections-modal') : null;
+        var control = option.closest ? option.closest('.multiple-selections-control') : null;
+        if (!control && modal) control = modal._sceneiqModalControl || null;
+        if (!control) return;
+
+        var value = option.getAttribute('data-value');
+        if (value === null) value = optionCheckbox.value || option.textContent || '';
+        var selected = readMultipleSelectionValues(control);
+        if (optionCheckbox.checked) {
+            if (selected.indexOf(value) === -1) selected.push(value);
+        } else {
+            selected = selected.filter(function(item) { return item !== value; });
+        }
+        writeMultipleSelectionValues(control, selected);
+    }
 
     function syncFieldValues() {
         var activeContent = document.querySelector('#user_tab_add_entry .dynamic-sub-tab-content.active');
@@ -4376,7 +4805,16 @@
                             subKey.includes('_minute_12') || subKey.includes('_ampm')) {
                             return;
                         }
-                        objectData[subKey] = input.value || '';
+                        if (input.classList && input.classList.contains('new-project-field') && input.closest('.multiple-selections-control')) {
+                            try {
+                                var selectedArray = JSON.parse(input.value || '[]');
+                                objectData[subKey] = Array.isArray(selectedArray) ? selectedArray : [];
+                            } catch (parseError) {
+                                objectData[subKey] = [];
+                            }
+                        } else {
+                            objectData[subKey] = input.value || '';
+                        }
                     }
                 });
             });
@@ -4480,8 +4918,14 @@
         subFields.forEach(function(subField) {
             var values = [];
             var inputs = subField.querySelectorAll('input, textarea, select');
+            var multipleControl = subField.querySelector('.multiple-selections-control');
+            if (multipleControl) {
+                // Keep selected multiple-selection values as a JSON array when copying an object.
+                values.push(JSON.stringify(readMultipleSelectionValues(multipleControl)));
+            }
 
             inputs.forEach(function(input) {
+                if (multipleControl && input.closest && input.closest('.multiple-selections-control')) return;
                 if (input.id && (
                     input.id.includes('_date') ||
                     input.id.includes('_hour_12') ||
@@ -4669,6 +5113,8 @@
         
         var dialog = document.getElementById('customDialog');
         if (dialog) {
+            moveSceneIQModalToBody(dialog);
+            lockSceneIQBackground(dialog);
             dialog.style.display = 'flex';
             dialog.classList.add('active');
             console.log('Dialog overlay activated');
@@ -4698,6 +5144,8 @@
         if (dialog) {
             dialog.classList.remove('active');
             dialog.style.display = 'none';
+            unlockSceneIQBackground(dialog);
+            restoreSceneIQModal(dialog);
         }
         document.getElementById('dialogContent').innerHTML = '';
         window._dialogCallbacks = null;
@@ -4775,94 +5223,73 @@
     // ============================================================
 
     function switchDashboardTab(tabName, btn) {
+        var targetPanel = document.getElementById('dash_tab_' + tabName);
+        if (!targetPanel) return;
+
         document.querySelectorAll('.dashboard-content').forEach(function(el) { el.classList.remove('active'); });
         document.querySelectorAll('.dashboard-tab-btn').forEach(function(el) { el.classList.remove('active'); });
-        document.getElementById('dash_tab_' + tabName).classList.add('active');
+        targetPanel.classList.add('active');
         if (btn) btn.classList.add('active');
+
         var formData = new FormData();
         formData.append('set_dashboard_view', 'true');
         formData.append('view', tabName);
         fetch(window.location.href, {
             method: 'POST',
-            body: formData
+            body: formData,
+            credentials: 'same-origin'
+        }).catch(function(error) {
+            console.error('Unable to save dashboard view:', error);
         });
-        if (tabName === 'all_config') {
-            renderAllUsersEntries('pending', 'allUsersPendingList');
+    }
+
+    // Exclude the selected source account from the destination options.
+    function syncCopyDataTargetAccounts() {
+        var sourceSelect = document.getElementById('copyDataFromAccount');
+        var targetSelect = document.getElementById('copyDataToAccount');
+        if (!sourceSelect || !targetSelect) return;
+
+        var sourceId = sourceSelect.value;
+        Array.prototype.forEach.call(targetSelect.options, function(option) {
+            if (!option.value) return;
+            var isSource = option.value === sourceId;
+            option.disabled = isSource;
+            option.hidden = isSource;
+        });
+
+        if (targetSelect.value && targetSelect.value === sourceId) {
+            targetSelect.value = '';
         }
     }
 
-    function switchAllUsersConfigTab(tabName, btn) {
-        document.querySelectorAll('#dash_tab_all_config .user-config-content').forEach(function(el) { el.classList.remove('active'); });
-        document.querySelectorAll('#dash_tab_all_config .user-config-tab-btn').forEach(function(el) { el.classList.remove('active'); });
-        var targetId = 'allusers_tab_' + tabName;
-        document.getElementById(targetId).classList.add('active');
-        if (btn) btn.classList.add('active');
-        var listId = tabName === 'pending' ? 'allUsersPendingList' : 
-                       tabName === 'completed' ? 'allUsersCompletedList' : 'allUsersAbortedList';
-        renderAllUsersEntries(tabName, listId);
+    function confirmCopyDataForm() {
+        var sourceSelect = document.getElementById('copyDataFromAccount');
+        var targetSelect = document.getElementById('copyDataToAccount');
+        var scopeSelect = document.getElementById('copyDataScope');
+        if (!sourceSelect || !targetSelect || !scopeSelect) return false;
+
+        if (!sourceSelect.value || !targetSelect.value) {
+            showDialog('Select Accounts', 'Choose both the source account and destination account.');
+            return false;
+        }
+        if (sourceSelect.value === targetSelect.value) {
+            showDialog('Invalid Selection', 'The source and destination accounts must be different.');
+            return false;
+        }
+
+        var sourceLabel = sourceSelect.options[sourceSelect.selectedIndex].text;
+        var targetLabel = targetSelect.options[targetSelect.selectedIndex].text;
+        var scopeLabel = scopeSelect.options[scopeSelect.selectedIndex].text;
+        return window.confirm(
+            'Copy ' + scopeLabel + ' from ' + sourceLabel + ' to ' + targetLabel + '?\n\n' +
+            'The selected destination data will be replaced completely. This action cannot be undone.'
+        );
     }
 
-    function renderAllUsersEntries(status, containerId) {
-        var container = document.getElementById(containerId);
-        if (!container) return;
-        container.innerHTML = '';
-        var entries = allUsersEntries[status] || [];
-        if (entries.length === 0) {
-            container.innerHTML = '<p style="color:#6b7280; text-align:center; padding:20px;">No ' + status + ' entries found across all users.</p>';
-            return;
-        }
-        var statusColors = {
-            'pending': '#f59e0b',
-            'completed': '#10b981',
-            'aborted': '#ef4444'
-        };
-        var statusLabels = {
-            'pending': 'Pending',
-            'completed': 'Completed',
-            'aborted': 'Aborted'
-        };
-        entries.forEach(function(entry, idx) {
-            var div = document.createElement('div');
-            div.className = 'config-item';
-            var entryStatus = (entry.status || 'pending').toLowerCase();
-            var username = entry._user || 'Unknown';
-            var userId = entry._user_id || 0;
-            var index = entry._index || 0;
-            var fieldsHtml = renderEntryFields(entry, index);
-            div.innerHTML = 
-                '<div class="item-header">' +
-                '<div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap;">' +
-                '<span class="item-id">Entry #' + (idx + 1) + '</span>' +
-                '<span class="entry-user-tag"> ' + username + '</span>' +
-                '</div>' +
-                '<span class="item-status" style="background: ' + (statusColors[entryStatus] || '#6b7280') + '">' + (statusLabels[entryStatus] || entryStatus) + '</span>' +
-                '</div>' +
-                fieldsHtml +
-                '<div class="item-actions">' +
-                '<form method="POST" style="display:inline;">' +
-                '<input type="hidden" name="delete_entry" value="true">' +
-                '<input type="hidden" name="user_id" value="' + userId + '">' +
-                '<input type="hidden" name="index" value="' + index + '">' +
-                '<button type="button" class="btn btn-danger btn-sm" onclick="confirmAction(\'Delete Entry\', \'Delete this entry for ' + username + '?\', function(){ this.closest(\'form\').submit(); }.bind(this))"> Delete</button>' +
-                '</form>' +
-                '<form method="POST" style="display:inline;">' +
-                '<input type="hidden" name="update_entry_status" value="true">' +
-                '<input type="hidden" name="user_id" value="' + userId + '">' +
-                '<input type="hidden" name="index" value="' + index + '">' +
-                '<select name="new_status" class="status-select" onchange="this.form.submit()">' +
-                '<option value="pending" ' + (entryStatus === 'pending' ? 'selected' : '') + '> Pending</option>' +
-                '<option value="completed" ' + (entryStatus === 'completed' ? 'selected' : '') + '> Completed</option>' +
-                '<option value="aborted" ' + (entryStatus === 'aborted' ? 'selected' : '') + '> Aborted</option>' +
-                '</select>' +
-                '</form>' +
-                '<form method="POST" style="display:inline;">' +
-                '<input type="hidden" name="select_user" value="true">' +
-                '<input type="hidden" name="user_id" value="' + userId + '">' +
-                '<button type="submit" class="btn btn-primary btn-sm"> View Account</button>' +
-                '</form>' +
-                '</div>';
-            container.appendChild(div);
-        });
+    var copyDataFromSelect = document.getElementById('copyDataFromAccount');
+    if (copyDataFromSelect) {
+        copyDataFromSelect.addEventListener('change', syncCopyDataTargetAccounts);
+        syncCopyDataTargetAccounts();
     }
 
     // ============================================================
@@ -5123,7 +5550,7 @@
                 fieldInfo = '<div><strong>Type:</strong> Individual field</div>' +
                     '<div><strong>Element:</strong> ' + escapeHtml(String(elementType + extraInfo)) + '</div>' +
                     (defaultValue ? '<div><strong>Default value:</strong> ' + escapeHtml(String(defaultValue)) + '</div>' : '') +
-                    (defaultValues.length ? '<div><strong>Select options:</strong> ' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</div>' : '');
+                    (defaultValues.length ? '<div><strong>' + (elementType === 'multiple-selections' ? 'Available values:' : 'Select options:') + '</strong> ' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</div>' : '');
             }
 
             card.innerHTML =
@@ -5334,6 +5761,20 @@
         }
 
         copyToClipboard(formatted, button);
+    }
+
+    // Copy one complete entry without requiring the bulk status export.
+    // Use the same type normalization as the bulk copy action so JSON and integer
+    // values remain native JSON values in the copied object.
+    function copySingleStatusEntry(index, button) {
+        var entryIndex = Number(index);
+        if (!Number.isInteger(entryIndex) || entryIndex < 0 || !Array.isArray(userSettings) || !userSettings[entryIndex]) {
+            showDialog('Copy Error', 'This entry could not be found. Refresh the account and try again.');
+            return;
+        }
+
+        var record = normalizeRecordTypesForCopy(userSettings[entryIndex]);
+        copyToClipboard(JSON.stringify(record, null, 2), button);
     }
 
     function renderStatusEntries(status, containerId) {
@@ -5628,6 +6069,7 @@
                 '</div>' +
                 fieldsHtml +
                 '<div class="item-actions">' +
+                '<button type="button" class="btn btn-secondary btn-sm" onclick="copySingleStatusEntry(' + index + ', this)">📋 Copy Entry</button>' +
                 '<form method="POST" style="display:inline;">' +
                 '<input type="hidden" name="delete_entry" value="true">' +
                 '<input type="hidden" name="user_id" value="' + selectedUserId + '">' +
@@ -6318,13 +6760,23 @@
         var entryData = {};
         var objectContainers = activeScope.querySelectorAll('[id^="object_"]');
         inputs.forEach(function(input) {
+            // Object sub-fields are serialized together under their parent object below.
+            // Do not also treat entry_parent_subfield as an unrelated top-level field.
+            if (input.closest && input.closest('[id^="object_"][id$="_container"]')) return;
             if (input.id && input.id.startsWith('entry_')) {
                 var key = input.id.replace('entry_', '');
                 if (key.includes('_date') || key.includes('_hour_12') || key.includes('_minute_12') || key.includes('_ampm')) return;
                 var fieldDefinition = globalDynamicFields[key] || {};
                 var valueType = fieldDefinition.data_type || 'string';
                 try {
-                    entryData[key] = convertEntryValueByType(input.value, valueType);
+                    if (fieldDefinition.element_type === 'multiple-selections') {
+                        var selectedValues = JSON.parse(input.value || '[]');
+                        if (!Array.isArray(selectedValues)) throw new Error('Multiple selections must be stored as a JSON array.');
+                        selectedValues = selectedValues.map(function(value) { return String(value); }).filter(function(value) { return value.trim() !== ''; });
+                        if (selectedValues.length) entryData[key] = selectedValues;
+                    } else {
+                        entryData[key] = convertEntryValueByType(input.value, valueType);
+                    }
                 } catch (typeError) {
                     showDialog('Invalid ' + (fieldDefinition['field-title'] || key), typeError.message);
                     throw typeError;
@@ -6342,7 +6794,17 @@
                     var parentDefinition = globalDynamicFields[objectKey] || {};
                     var subDefinition = (parentDefinition.fieldkeyvalue || {})[subKey] || {};
                     try {
-                        objectData[subKey] = convertEntryValueByType(input.value, subDefinition.data_type || 'string');
+                        if (subDefinition.element_type === 'multiple-selections') {
+                            var nestedSelectedValues = JSON.parse(input.value || '[]');
+                            if (!Array.isArray(nestedSelectedValues)) {
+                                throw new Error('Multiple selections must be stored as a JSON array.');
+                            }
+                            objectData[subKey] = nestedSelectedValues.map(function(value) {
+                                return String(value);
+                            }).filter(function(value) { return value.trim() !== ''; });
+                        } else {
+                            objectData[subKey] = convertEntryValueByType(input.value, subDefinition.data_type || 'string');
+                        }
                     } catch (typeError) {
                         showDialog('Invalid ' + (subDefinition['field-title'] || subKey), typeError.message);
                         throw typeError;
@@ -6356,9 +6818,6 @@
         });
 
         var hasData = Object.values(entryData).some(function(value) {
-            if (value && typeof value === 'object') {
-                return Object.keys(value).some(function(key) { return key !== '_object' && value[key] !== ''; });
-            }
             return value !== '';
         });
         if (!hasData) {
@@ -6426,7 +6885,7 @@
                     '<div><strong>Type:</strong> Individual Field</div>' +
                     '<div><strong>Element:</strong> ' + elementType + extraInfo + '</div>' +
                     (defaultValue ? '<div><strong>Default Value:</strong> ' + defaultValue + '</div>' : '') +
-                    (defaultValues.length > 0 ? '<div><strong>Select Options:</strong> ' + defaultValues.join(', ') + '</div>' : '');
+                    (defaultValues.length > 0 ? '<div><strong>' + (elementType === 'multiple-selections' ? 'Available values:' : 'Select options:') + '</strong> ' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</div>' : '');
                 editFieldsHtml = 
                     '<div style="margin-top:10px; padding-top:10px; border-top:1px solid #e5e7eb;">' +
                     '<button type="button" class="btn btn-primary btn-sm" onclick="editGlobalDynamicField(\'' + key + '\')"> Edit Field</button>' +
@@ -6520,6 +6979,7 @@
                     '<select id="sub_element_' + idx + '" onchange="toggleSubDefaultValueInput(' + idx + ')" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
                     '<option value="input" ' + (subElement === 'input' ? 'selected' : '') + '>Input</option>' +
                     '<option value="select" ' + (subElement === 'select' ? 'selected' : '') + '>Select</option>' +
+                    '<option value="multiple-selections" ' + (subElement === 'multiple-selections' ? 'selected' : '') + '>Multiple selections</option>' +
                     '<option value="textarea" ' + (subElement === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
                     '<option value="date-time-input" ' + (subElement === 'date-time-input' ? 'selected' : '') + '>Date & Time</option>' +
                     '<option value="button" ' + (subElement === 'button' ? 'selected' : '') + '>Button</option>' +
@@ -6548,6 +7008,13 @@
                     '<button type="button" class="btn btn-secondary" onclick="addSubDefaultValue(' + idx + ')">Add</button>' +
                     '</div>' +
                     '<div id="sub_default_values_list_' + idx + '" style="margin-top:8px;"></div>' +
+                    '</div>' +
+                    '<div class="form-group" id="sub_multiple_selection_container_' + idx + '" style="display:none;">' +
+                    '<label>Multiple selections values</label>' +
+                    '<textarea id="sub_multiple_selection_text_' + idx + '" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
+                    '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addSubMultipleSelectionValues(' + idx + ')">Add</button>' +
+                    '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
+                    '<div id="sub_multiple_selection_values_list_' + idx + '" style="margin-top:8px;"></div>' +
                     '</div>' +
                     '<div class="form-group" id="sub_url_container_' + idx + '" style="' + (subElement === 'button' ? 'display:block;' : 'display:none;') + '">' +
                     '<label>Button URL (onclick value)</label>' +
@@ -6589,6 +7056,7 @@
             '<select id="df_element_type" onchange="toggleDefaultValueInput(); toggleCopySentencesConfig()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '<option value="input" ' + (elementType === 'input' ? 'selected' : '') + '>Input</option>' +
             '<option value="select" ' + (elementType === 'select' ? 'selected' : '') + '>Select</option>' +
+            '<option value="multiple-selections" ' + (elementType === 'multiple-selections' ? 'selected' : '') + '>Multiple selections</option>' +
             '<option value="textarea" ' + (elementType === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
             '<option value="date-time-input" ' + (elementType === 'date-time-input' ? 'selected' : '') + '>Date & Time</option>' +
             '<option value="button" ' + (elementType === 'button' ? 'selected' : '') + '>Button</option>' +
@@ -6628,6 +7096,13 @@
             '</div>' +
             '<div id="df_default_values_list" style="margin-top:8px;">' + defaultValuesHtml + '</div>' +
             '</div>' +
+            '<div class="form-group" id="df_multiple_selection_container" style="' + (elementType === 'multiple-selections' ? 'display:block;' : 'display:none;') + '">' +
+            '<label>Multiple selections values</label>' +
+            '<textarea id="df_multiple_selection_text" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
+            '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addMultipleSelectionValues()">Add</button>' +
+            '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
+            '<div id="df_multiple_selection_values_list" style="margin-top:8px;">' + defaultValuesHtml + '</div>' +
+            '</div>' +
             '<div class="form-group" id="df_url_container" style="' + (elementType === 'button' ? 'display:block;' : 'display:none;') + '">' +
             '<label>Button URL (onclick value)</label>' +
             '<div id="df_url_input_container">' +
@@ -6649,6 +7124,11 @@
             '</div>';
         
         showDialog('Edit Dynamic Field', '', null, content);
+        var editDataTypeControl = document.getElementById('df_data_type');
+        if (editDataTypeControl && elementType === 'multiple-selections') {
+            // JSON is forced only while this element type is active; restore string if changed away.
+            editDataTypeControl.dataset.previousType = 'string';
+        }
         toggleFieldCategory();
         toggleDefaultValueInput();
         loadCopySentenceInputs(field);
@@ -6783,6 +7263,7 @@
             '<select id="sub_element_' + index + '" onchange="toggleSubDefaultValueInput(' + index + ')" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '<option value="input">Input</option>' +
             '<option value="select">Select</option>' +
+            '<option value="multiple-selections">Multiple selections</option>' +
             '<option value="textarea">Textarea</option>' +
             '<option value="date-time-input">Date & Time</option>' +
             '<option value="button">Button</option>' +
@@ -6811,6 +7292,13 @@
             '</div>' +
             '<div id="sub_default_values_list_' + index + '" style="margin-top:8px;"></div>' +
             '</div>' +
+            '<div class="form-group" id="sub_multiple_selection_container_' + index + '" style="display:none;">' +
+            '<label>Multiple selections values</label>' +
+            '<textarea id="sub_multiple_selection_text_' + index + '" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
+            '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addSubMultipleSelectionValues(' + index + ')">Add</button>' +
+            '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
+            '<div id="sub_multiple_selection_values_list_' + index + '" style="margin-top:8px;"></div>' +
+            '</div>' +
             '<div class="form-group" id="sub_url_container_' + index + '" style="display:none;">' +
             '<label>Button URL (onclick value)</label>' +
             '<div id="sub_url_input_container_' + index + '">' +
@@ -6830,34 +7318,54 @@
     // Replace the entire function with this version
 
     function toggleSubDefaultValueInput(index) {
-        var elementType = document.getElementById('sub_element_' + index).value;
+        var elementTypeControl = document.getElementById('sub_element_' + index);
+        if (!elementTypeControl) return;
+        var elementType = elementTypeControl.value;
         var defaultValueContainer = document.getElementById('sub_default_value_container_' + index);
         var defaultValueInputContainer = document.getElementById('sub_default_value_input_container_' + index);
         var defaultValueTextareaContainer = document.getElementById('sub_default_value_textarea_container_' + index);
         var selectValuesContainer = document.getElementById('sub_select_values_container_' + index);
+        var multipleSelectionContainer = document.getElementById('sub_multiple_selection_container_' + index);
         var urlContainer = document.getElementById('sub_url_container_' + index);
-        
-        // Hide all optional containers first
+        var dataTypeSelect = document.getElementById('sub_data_type_' + index);
+
+        // Hide optional controls first, then show only the control for this element type.
         if (defaultValueContainer) defaultValueContainer.style.display = 'none';
         if (selectValuesContainer) selectValuesContainer.style.display = 'none';
+        if (multipleSelectionContainer) multipleSelectionContainer.style.display = 'none';
         if (urlContainer) urlContainer.style.display = 'none';
         if (defaultValueInputContainer) defaultValueInputContainer.style.display = 'none';
         if (defaultValueTextareaContainer) defaultValueTextareaContainer.style.display = 'none';
-        
-        if (elementType === 'select') {
+
+        if (dataTypeSelect) {
+            if (elementType === 'multiple-selections') {
+                if (!dataTypeSelect.dataset.previousType) {
+                    dataTypeSelect.dataset.previousType = dataTypeSelect.value || 'string';
+                }
+                dataTypeSelect.value = 'json';
+                dataTypeSelect.disabled = true;
+            } else {
+                dataTypeSelect.disabled = false;
+                if (dataTypeSelect.dataset.previousType) {
+                    dataTypeSelect.value = dataTypeSelect.dataset.previousType;
+                    delete dataTypeSelect.dataset.previousType;
+                }
+            }
+        }
+
+        if (elementType === 'multiple-selections') {
+            if (multipleSelectionContainer) multipleSelectionContainer.style.display = 'block';
+        } else if (elementType === 'select') {
             if (defaultValueContainer) defaultValueContainer.style.display = 'block';
             if (selectValuesContainer) selectValuesContainer.style.display = 'block';
         } else if (elementType === 'textarea') {
             if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (defaultValueInputContainer) defaultValueInputContainer.style.display = 'none';
             if (defaultValueTextareaContainer) defaultValueTextareaContainer.style.display = 'block';
         } else if (elementType === 'button') {
             if (urlContainer) urlContainer.style.display = 'block';
         } else {
-            // Input, date-time-input, etc.
             if (defaultValueContainer) defaultValueContainer.style.display = 'block';
             if (defaultValueInputContainer) defaultValueInputContainer.style.display = 'block';
-            if (defaultValueTextareaContainer) defaultValueTextareaContainer.style.display = 'none';
         }
     }
 
@@ -6891,20 +7399,54 @@
     }
 
     function renderSubFieldDefaultValues(index) {
-        var container = document.getElementById('sub_default_values_list_' + index);
-        if (!container) return;
-        container.innerHTML = '';
+        var containers = [
+            document.getElementById('sub_default_values_list_' + index),
+            document.getElementById('sub_multiple_selection_values_list_' + index)
+        ].filter(Boolean);
         var values = subFields[index] ? subFields[index].defaultValues || [] : [];
-        if (values.length === 0) {
-            container.innerHTML = '<span style="color:#6b7280; font-size:13px;">No options added.</span>';
-            return;
-        }
-        values.forEach(function(val, idx) {
-            var span = document.createElement('span');
-            span.className = 'value-tag';
-            span.innerHTML = val + ' <span class="remove-value" onclick="removeSubDefaultValue(' + index + ', ' + idx + ')">×</span>';
-            container.appendChild(span);
+        containers.forEach(function(container) {
+            container.innerHTML = '';
+            if (!values.length) {
+                var empty = document.createElement('span');
+                empty.style.cssText = 'color:#6b7280;font-size:13px;';
+                empty.textContent = container.id.indexOf('multiple_selection') !== -1 ? 'No values added.' : 'No options added.';
+                container.appendChild(empty);
+                return;
+            }
+            values.forEach(function(value, valueIndex) {
+                var tag = document.createElement('span');
+                tag.className = 'value-tag';
+                var label = document.createElement('span');
+                label.textContent = String(value);
+                var remove = document.createElement('span');
+                remove.className = 'remove-value';
+                remove.textContent = '×';
+                remove.style.cursor = 'pointer';
+                remove.addEventListener('click', function() {
+                    removeSubDefaultValue(index, valueIndex);
+                });
+                tag.appendChild(label);
+                tag.appendChild(document.createTextNode(' '));
+                tag.appendChild(remove);
+                container.appendChild(tag);
+            });
         });
+    }
+
+    function addSubMultipleSelectionValues(index) {
+        var textarea = document.getElementById('sub_multiple_selection_text_' + index);
+        if (!textarea) return;
+        var values = parseMultipleSelectionOptionText(textarea.value);
+        if (!values.length) return;
+        if (!subFields[index]) subFields[index] = { defaultValues: [], default_value: '' };
+        if (!Array.isArray(subFields[index].defaultValues)) subFields[index].defaultValues = [];
+        values.forEach(function(value) {
+            if (subFields[index].defaultValues.indexOf(value) === -1) {
+                subFields[index].defaultValues.push(value);
+            }
+        });
+        textarea.value = '';
+        renderSubFieldDefaultValues(index);
     }
 
     function addDefaultValue() {
@@ -6920,6 +7462,28 @@
         }
     }
 
+    function parseMultipleSelectionOptionText(text) {
+        var value = String(text == null ? '' : text).trim();
+        if (!value) return [];
+        // Commas are the ONLY bulk delimiter. Text with no comma stays one value,
+        // even when it contains several words or line breaks.
+        var parts = value.indexOf(',') !== -1 ? value.split(',') : [value];
+        return parts.map(function(part) { return part.trim(); }).filter(function(part) { return part !== ''; });
+    }
+
+    function addMultipleSelectionValues() {
+        var textarea = document.getElementById('df_multiple_selection_text');
+        if (!textarea) return;
+        var values = parseMultipleSelectionOptionText(textarea.value);
+        if (!values.length) return;
+        if (!window._dfDefaultValues) window._dfDefaultValues = [];
+        values.forEach(function(value) {
+            if (window._dfDefaultValues.indexOf(value) === -1) window._dfDefaultValues.push(value);
+        });
+        textarea.value = '';
+        renderDefaultValuesList();
+    }
+
     function removeDefaultValue(index) {
         if (window._dfDefaultValues) {
             window._dfDefaultValues.splice(index, 1);
@@ -6928,19 +7492,39 @@
     }
 
     function renderDefaultValuesList() {
-        var container = document.getElementById('df_default_values_list');
-        if (!container) return;
-        container.innerHTML = '';
+        var containers = [
+            document.getElementById('df_default_values_list'),
+            document.getElementById('df_multiple_selection_values_list')
+        ].filter(Boolean);
         var values = window._dfDefaultValues || [];
-        if (values.length === 0) {
-            container.innerHTML = '<span style="color:#6b7280; font-size:13px;">No options added.</span>';
-            return;
-        }
-        values.forEach(function(val, idx) {
-            var span = document.createElement('span');
-            span.className = 'value-tag';
-            span.innerHTML = val + ' <span class="remove-value" onclick="removeDefaultValue(' + idx + ')">×</span>';
-            container.appendChild(span);
+        containers.forEach(function(container) {
+            container.innerHTML = '';
+            if (values.length === 0) {
+                var empty = document.createElement('span');
+                empty.style.cssText = 'color:#6b7280;font-size:13px;';
+                empty.textContent = container.id === 'df_default_values_list' ? 'No options added.' : 'No values added.';
+                container.appendChild(empty);
+                return;
+            }
+            values.forEach(function(value, index) {
+                var tag = document.createElement('span');
+                tag.className = 'value-tag';
+                var label = document.createElement('span');
+                label.textContent = String(value);
+                var remove = document.createElement('span');
+                remove.className = 'remove-value';
+                remove.textContent = '×';
+                remove.setAttribute('role', 'button');
+                remove.setAttribute('tabindex', '0');
+                remove.setAttribute('aria-label', 'Remove ' + value);
+                remove.addEventListener('click', function() { removeDefaultValue(index); });
+                remove.addEventListener('keydown', function(event) {
+                    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); removeDefaultValue(index); }
+                });
+                tag.appendChild(label);
+                tag.appendChild(remove);
+                container.appendChild(tag);
+            });
         });
     }
 
@@ -6966,8 +7550,8 @@
             
             if (elementType === 'textarea') {
                 defaultValue = document.getElementById('df_default_value_textarea').value.trim();
-            } else if (elementType === 'select') {
-                // For select, we don't use defaultValue directly
+            } else if (elementType === 'select' || elementType === 'multiple-selections') {
+                // Select and multiple-selections use configured option lists, not a scalar default value.
             } else if (elementType === 'button') {
                 buttonUrl = document.getElementById('df_url_value').value.trim();
                 // ADD PROTOCOL IF MISSING
@@ -6993,7 +7577,7 @@
                 'field-name': key,
                 'field_type': 'individual',
                 'element_type': elementType,
-                'data_type': (document.getElementById('df_data_type') || {}).value || 'string',
+                'data_type': elementType === 'multiple-selections' ? 'json' : ((document.getElementById('df_data_type') || {}).value || 'string'),
                 'default_value': defaultValue,
                 'default_values': defaultValues,
                 'button_url': buttonUrl,
@@ -7028,7 +7612,7 @@
                                 sButtonUrl = 'https://' + sButtonUrl;
                             }
                         }
-                    } else if (se !== 'select') {
+                    } else if (se !== 'select' && se !== 'multiple-selections') {
                         var input = document.getElementById('sub_default_value_' + idx);
                         if (input) sDefaultValue = input.value.trim();
                     }
@@ -7039,7 +7623,7 @@
                             'field-name': sk,
                             'field_type': 'individual',
                             'element_type': se,
-                            'data_type': (document.getElementById('sub_data_type_' + idx) || {}).value || 'string',
+                            'data_type': se === 'multiple-selections' ? 'json' : ((document.getElementById('sub_data_type_' + idx) || {}).value || 'string'),
                             'default_value': sDefaultValue,
                             'default_values': sdv,
                             'button_url': sButtonUrl
@@ -7135,17 +7719,36 @@
         var defaultValueInput = document.getElementById('df_default_value_input_container');
         var defaultValueTextarea = document.getElementById('df_default_value_textarea_container');
         var selectValuesContainer = document.getElementById('df_select_values_container');
+        var multipleSelectionContainer = document.getElementById('df_multiple_selection_container');
         var urlContainer = document.getElementById('df_url_container');
         var urlInput = document.getElementById('df_url_input_container');
+        var dataTypeSelect = document.getElementById('df_data_type');
         
         // Hide all optional containers first
         if (defaultValueContainer) defaultValueContainer.style.display = 'none';
         if (selectValuesContainer) selectValuesContainer.style.display = 'none';
+        if (multipleSelectionContainer) multipleSelectionContainer.style.display = 'none';
         if (urlContainer) urlContainer.style.display = 'none';
         if (defaultValueInput) defaultValueInput.style.display = 'none';
         if (defaultValueTextarea) defaultValueTextarea.style.display = 'none';
+
+        if (dataTypeSelect) {
+            if (elementType === 'multiple-selections') {
+                if (!dataTypeSelect.dataset.previousType) dataTypeSelect.dataset.previousType = dataTypeSelect.value || 'string';
+                dataTypeSelect.value = 'json';
+                dataTypeSelect.disabled = true;
+            } else {
+                dataTypeSelect.disabled = false;
+                if (dataTypeSelect.dataset.previousType) {
+                    dataTypeSelect.value = dataTypeSelect.dataset.previousType;
+                    delete dataTypeSelect.dataset.previousType;
+                }
+            }
+        }
         
-        if (elementType === 'select') {
+        if (elementType === 'multiple-selections') {
+            if (multipleSelectionContainer) multipleSelectionContainer.style.display = 'block';
+        } else if (elementType === 'select') {
             if (defaultValueContainer) defaultValueContainer.style.display = 'block';
             if (selectValuesContainer) selectValuesContainer.style.display = 'block';
         } else if (elementType === 'textarea') {
@@ -7197,6 +7800,7 @@
             '<select id="df_element_type" onchange="toggleDefaultValueInput(); toggleCopySentencesConfig()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '<option value="input">Input</option>' +
             '<option value="select">Select</option>' +
+            '<option value="multiple-selections">Multiple selections</option>' +
             '<option value="textarea">Textarea</option>' +
             '<option value="date-time-input">Date & Time</option>' +
             '<option value="button">Button</option>' +
@@ -7227,6 +7831,13 @@
             '<button type="button" class="btn btn-secondary" onclick="addDefaultValue()">Add</button>' +
             '</div>' +
             '<div id="df_default_values_list" style="margin-top:8px;"></div>' +
+            '</div>' +
+            '<div class="form-group" id="df_multiple_selection_container" style="display:none;">' +
+            '<label>Multiple selections values</label>' +
+            '<textarea id="df_multiple_selection_text" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
+            '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addMultipleSelectionValues()">Add</button>' +
+            '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
+            '<div id="df_multiple_selection_values_list" style="margin-top:8px;"></div>' +
             '</div>' +
             '<div class="form-group" id="df_url_container" style="display:none;">' +
             '<label>Button URL (onclick value)</label>' +
@@ -7274,8 +7885,8 @@
             
             if (elementType === 'textarea') {
                 defaultValue = document.getElementById('df_default_value_textarea').value.trim();
-            } else if (elementType === 'select') {
-                // For select, we don't use defaultValue directly
+            } else if (elementType === 'select' || elementType === 'multiple-selections') {
+                // Select and multiple-selections use configured option lists, not a scalar default value.
             } else if (elementType === 'button') {
                 buttonUrl = document.getElementById('df_url_value').value.trim();
                 // ADD PROTOCOL IF MISSING
@@ -7302,7 +7913,7 @@
                 'field-name': key,
                 'field_type': 'individual',
                 'element_type': elementType,
-                'data_type': (document.getElementById('df_data_type') || {}).value || 'string',
+                'data_type': elementType === 'multiple-selections' ? 'json' : ((document.getElementById('df_data_type') || {}).value || 'string'),
                 'default_value': defaultValue,
                 'default_values': defaultValues,
                 'button_url': buttonUrl,
@@ -7337,7 +7948,7 @@
                                 sButtonUrl = 'https://' + sButtonUrl;
                             }
                         }
-                    } else if (se !== 'select') {
+                    } else if (se !== 'select' && se !== 'multiple-selections') {
                         var input = document.getElementById('sub_default_value_' + idx);
                         if (input) sDefaultValue = input.value.trim();
                     }
@@ -7348,7 +7959,7 @@
                             'field-name': sk,
                             'field_type': 'individual',
                             'element_type': se,
-                            'data_type': (document.getElementById('sub_data_type_' + idx) || {}).value || 'string',
+                            'data_type': se === 'multiple-selections' ? 'json' : ((document.getElementById('sub_data_type_' + idx) || {}).value || 'string'),
                             'default_value': sDefaultValue,
                             'default_values': sdv,
                             'button_url': sButtonUrl
@@ -7397,7 +8008,10 @@
     // ============================================================
 
     function openUserSearchDialog() {
-        document.getElementById('userSearchDialog').classList.add('active');
+        var userSearchDialog = document.getElementById('userSearchDialog');
+        moveSceneIQModalToBody(userSearchDialog);
+        lockSceneIQBackground(userSearchDialog);
+        userSearchDialog.classList.add('active');
         document.getElementById('userSearchInput').value = '';
         document.querySelectorAll('#userSearchResults .user-search-item').forEach(function(item) {
             item.style.display = 'block';
@@ -7406,7 +8020,11 @@
     }
 
     function closeUserSearchDialog() {
-        document.getElementById('userSearchDialog').classList.remove('active');
+        var userSearchDialog = document.getElementById('userSearchDialog');
+        if (!userSearchDialog) return;
+        userSearchDialog.classList.remove('active');
+        unlockSceneIQBackground(userSearchDialog);
+        restoreSceneIQModal(userSearchDialog);
     }
 
     function filterUserSearch() {
