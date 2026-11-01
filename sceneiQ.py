@@ -8847,8 +8847,19 @@ def video_producer_():
                 output_path,
                 fps=24,
                 codec="libx264",
-                audio_codec="aac" if audio_file_path else None,
-                preset="ultrafast",
+                audio_codec="aac",
+                audio_bitrate="320k",
+                preset="slow",
+                ffmpeg_params=[
+                    "-crf", "16",
+                    "-pix_fmt", "yuv420p",
+                    "-profile:v", "high",
+                    "-level", "4.1",
+                    "-movflags", "+faststart",
+                    "-color_primaries", "bt709",
+                    "-color_trc", "bt709",
+                    "-colorspace", "bt709",
+                ],
                 threads=max(2, min(8, os.cpu_count() or 2)),
                 logger="bar",
             )
@@ -11557,8 +11568,19 @@ def video_producer():
                 output_path,
                 fps=24,
                 codec="libx264",
-                audio_codec="aac" if audio_file_path else None,
-                preset="ultrafast",
+                audio_codec="aac",
+                audio_bitrate="320k",
+                preset="slow",
+                ffmpeg_params=[
+                    "-crf", "16",
+                    "-pix_fmt", "yuv420p",
+                    "-profile:v", "high",
+                    "-level", "4.1",
+                    "-movflags", "+faststart",
+                    "-color_primaries", "bt709",
+                    "-color_trc", "bt709",
+                    "-colorspace", "bt709",
+                ],
                 threads=max(2, min(8, os.cpu_count() or 2)),
                 logger="bar",
             )
@@ -11685,8 +11707,9 @@ if __name__ == "__main__":
     print("🚀 Starting Google Flow image generation...", flush=True)
 
     try:
-        generate_google_flow_images()
-        #video_producer()
+        #generate_google_flow_images()
+        
+        video_producer()
     except Exception as e:
         import traceback
         print(f"❌ FATAL ERROR: {e}", flush=True)
