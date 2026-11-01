@@ -11685,8 +11685,8 @@ if __name__ == "__main__":
     print("🚀 Starting Google Flow image generation...", flush=True)
 
     try:
-        #generate_google_flow_images()
-        video_producer()
+        generate_google_flow_images()
+        #video_producer()
     except Exception as e:
         import traceback
         print(f"❌ FATAL ERROR: {e}", flush=True)
