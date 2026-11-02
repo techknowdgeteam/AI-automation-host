@@ -4,6 +4,12 @@
     if (empty($_SESSION['password_csrf_token'])) {
         $_SESSION['password_csrf_token'] = bin2hex(random_bytes(32));
     }
+    if (empty($_SESSION['data_delete_csrf_token'])) {
+        $_SESSION['data_delete_csrf_token'] = bin2hex(random_bytes(32));
+    }
+    if (empty($_SESSION['entry_upload_csrf_token'])) {
+        $_SESSION['entry_upload_csrf_token'] = bin2hex(random_bytes(32));
+    }
 
     // Enable error reporting for debugging
     error_reporting(E_ALL);
@@ -81,36 +87,217 @@
         }
     }
 
-    function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs = null) {
-        $config = getUserConfig($pdo, $userId);
-        
-        if ($dynamicTabs === null) {
-            $dynamicTabs = [];
-        }
-        
-        // Ensure each tab has submit_tab property
-        foreach ($dynamicTabs as &$tab) {
-            if (!isset($tab['submit_tab'])) {
-                $tab['submit_tab'] = true; // Default to true
+    // JSON configuration is stored in LONGTEXT columns and written in small UTF-8-safe
+    // pieces. This avoids sending a huge SQL parameter in one request and prevents
+    // MySQL TEXT (64 KB) column-size errors when settings contain large entries.
+    function ensureSceneIQJsonColumnsLongText($pdo) {
+        static $checked = false;
+        if ($checked) return;
+
+        $requiredColumns = ['settings', 'dynamic_fields', 'dynamic_tabs'];
+        $columnRows = $pdo->query("SHOW COLUMNS FROM `sceneiq_config`")->fetchAll(PDO::FETCH_ASSOC);
+        $columnMap = [];
+        foreach ($columnRows as $row) {
+            if (isset($row['Field'])) {
+                $columnMap[strtolower($row['Field'])] = $row;
             }
         }
-        
-        if ($config) {
-            $stmt = $pdo->prepare("UPDATE sceneiq_config SET settings = :settings, dynamic_fields = :dynamic_fields, dynamic_tabs = :dynamic_tabs WHERE id = :id");
-            return $stmt->execute([
-                ':settings' => json_encode($settings),
-                ':dynamic_fields' => json_encode($dynamicFields),
-                ':dynamic_tabs' => json_encode($dynamicTabs),
-                ':id' => $config['id']
+
+        foreach ($requiredColumns as $columnName) {
+            if (!isset($columnMap[$columnName])) {
+                throw new RuntimeException('The sceneiq_config.' . $columnName . ' column could not be found.');
+            }
+
+            $currentType = strtolower((string)($columnMap[$columnName]['Type'] ?? ''));
+            if (strpos($currentType, 'longtext') !== false) {
+                continue;
+            }
+
+            $nullability = strtoupper((string)($columnMap[$columnName]['Null'] ?? 'YES')) === 'NO'
+                ? 'NOT NULL'
+                : 'NULL';
+
+            // Column names come only from the fixed whitelist above.
+            $pdo->exec('ALTER TABLE `sceneiq_config` MODIFY COLUMN `' . $columnName . '` LONGTEXT ' . $nullability);
+        }
+
+        $checked = true;
+    }
+
+    // Return a UTF-8-safe byte chunk. Chunks are concatenated by MySQL, so no JSON
+    // parsing occurs until the complete value has been written.
+    function getUtf8SafeJsonChunk($value, $offset, $maxBytes) {
+        $totalLength = strlen($value);
+        if ($offset >= $totalLength) return '';
+
+        $chunk = substr($value, $offset, min($maxBytes, $totalLength - $offset));
+        while ($chunk !== '' && preg_match('//u', $chunk) !== 1) {
+            $chunk = substr($chunk, 0, -1);
+        }
+
+        if ($chunk === '') {
+            throw new RuntimeException('Unable to split the saved JSON into valid UTF-8 chunks.');
+        }
+        return $chunk;
+    }
+
+    function appendJsonColumnRemainder($pdo, $rowId, $columnName, $jsonValue, $offset, $chunkBytes) {
+        $statement = $pdo->prepare(
+            'UPDATE `sceneiq_config` SET `' . $columnName . '` = CONCAT(COALESCE(`' . $columnName . '`, \'\'), :chunk) WHERE id = :id'
+        );
+
+        $totalLength = strlen($jsonValue);
+        while ($offset < $totalLength) {
+            $chunk = getUtf8SafeJsonChunk($jsonValue, $offset, $chunkBytes);
+            $statement->execute([
+                ':chunk' => $chunk,
+                ':id' => $rowId
             ]);
-        } else {
-            $stmt = $pdo->prepare("INSERT INTO sceneiq_config (user_id, settings, dynamic_fields, dynamic_tabs) VALUES (:user_id, :settings, :dynamic_fields, :dynamic_tabs)");
-            return $stmt->execute([
-                ':user_id' => $userId,
-                ':settings' => json_encode($settings),
-                ':dynamic_fields' => json_encode($dynamicFields),
-                ':dynamic_tabs' => json_encode($dynamicTabs)
-            ]);
+            $offset += strlen($chunk);
+        }
+    }
+
+    function encodeSceneIQJson($value, $label) {
+        try {
+            return json_encode(
+                $value,
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR
+            );
+        } catch (JsonException $e) {
+            throw new RuntimeException('Could not encode ' . $label . ' as JSON: ' . $e->getMessage(), 0, $e);
+        }
+    }
+
+function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs = null) {
+        $userId = (int)$userId;
+
+        if ($userId <= 0) {
+            throw new InvalidArgumentException('A valid account is required to save configuration.');
+        }
+
+        if (!is_array($settings)) {
+            $settings = [];
+        }
+        if (!is_array($dynamicFields)) {
+            $dynamicFields = [];
+        }
+        if ($dynamicTabs === null || !is_array($dynamicTabs)) {
+            $dynamicTabs = [];
+        }
+
+        // Preserve the existing submit-tab defaults.
+        foreach ($dynamicTabs as &$tab) {
+            if (is_array($tab) && !isset($tab['submit_tab'])) {
+                $tab['submit_tab'] = true;
+            }
+        }
+        unset($tab);
+
+        // Keep the existing columns as LONGTEXT. MariaDB may retain their
+        // JSON_VALID CHECK constraints, so each SQL write below sends a
+        // COMPLETE valid JSON document rather than an incomplete fragment.
+        ensureSceneIQJsonColumnsLongText($pdo);
+
+        $jsonColumns = [
+            'settings' => encodeSceneIQJson($settings, 'settings'),
+            'dynamic_fields' => encodeSceneIQJson($dynamicFields, 'dynamic fields'),
+            'dynamic_tabs' => encodeSceneIQJson($dynamicTabs, 'dynamic tabs')
+        ];
+
+        // Validate each complete document in PHP before sending it to MariaDB.
+        foreach ($jsonColumns as $columnName => $jsonValue) {
+            json_decode($jsonValue);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                throw new RuntimeException(
+                    'The complete ' . $columnName . ' JSON is invalid: ' . json_last_error_msg()
+                );
+            }
+        }
+
+        // A single prepared statement must fit within MariaDB's max_allowed_packet.
+        // The browser upload remains chunked; only the final database write is whole.
+        try {
+            $maxAllowedPacket = (int)$pdo->query('SELECT @@max_allowed_packet')->fetchColumn();
+        } catch (Throwable $packetError) {
+            $maxAllowedPacket = 0; // Let MariaDB report the packet error if the variable is unavailable.
+        }
+
+        $payloadBytes =
+            strlen($jsonColumns['settings']) +
+            strlen($jsonColumns['dynamic_fields']) +
+            strlen($jsonColumns['dynamic_tabs']) +
+            8192; // SQL and protocol overhead allowance.
+
+        if ($maxAllowedPacket > 0 && $payloadBytes > $maxAllowedPacket) {
+            $payloadMb = number_format($payloadBytes / 1048576, 2);
+            $limitMb = number_format($maxAllowedPacket / 1048576, 2);
+
+            throw new RuntimeException(
+                'The complete configuration is approximately ' . $payloadMb .
+                ' MB, but this database connection allows about ' . $limitMb .
+                ' MB per SQL packet. The browser upload completed, but the database packet limit must be increased or the entry storage must be moved to a separate chunk table.'
+            );
+        }
+
+        $config = getUserConfig($pdo, $userId);
+        $ownsTransaction = !$pdo->inTransaction();
+
+        try {
+            if ($ownsTransaction) {
+                $pdo->beginTransaction();
+            }
+
+            if ($config) {
+                $statement = $pdo->prepare(
+                    'UPDATE `sceneiq_config`
+                     SET `settings` = :settings,
+                         `dynamic_fields` = :dynamic_fields,
+                         `dynamic_tabs` = :dynamic_tabs
+                     WHERE `id` = :id'
+                );
+
+                $statement->bindValue(':settings', $jsonColumns['settings'], PDO::PARAM_STR);
+                $statement->bindValue(':dynamic_fields', $jsonColumns['dynamic_fields'], PDO::PARAM_STR);
+                $statement->bindValue(':dynamic_tabs', $jsonColumns['dynamic_tabs'], PDO::PARAM_STR);
+                $statement->bindValue(':id', (int)$config['id'], PDO::PARAM_INT);
+                $statement->execute();
+
+                if ($statement->rowCount() === 0) {
+                    // rowCount() may be zero when the exact same values already exist.
+                    $check = $pdo->prepare('SELECT `id` FROM `sceneiq_config` WHERE `id` = :id LIMIT 1');
+                    $check->execute([':id' => (int)$config['id']]);
+                    if (!$check->fetchColumn()) {
+                        throw new RuntimeException('The existing account configuration row could not be found.');
+                    }
+                }
+            } else {
+                $statement = $pdo->prepare(
+                    'INSERT INTO `sceneiq_config`
+                        (`user_id`, `settings`, `dynamic_fields`, `dynamic_tabs`)
+                     VALUES
+                        (:user_id, :settings, :dynamic_fields, :dynamic_tabs)'
+                );
+
+                $statement->bindValue(':user_id', $userId, PDO::PARAM_INT);
+                $statement->bindValue(':settings', $jsonColumns['settings'], PDO::PARAM_STR);
+                $statement->bindValue(':dynamic_fields', $jsonColumns['dynamic_fields'], PDO::PARAM_STR);
+                $statement->bindValue(':dynamic_tabs', $jsonColumns['dynamic_tabs'], PDO::PARAM_STR);
+                $statement->execute();
+            }
+
+            // MariaDB's existing JSON_VALID CHECK constraints validate the
+            // complete values during this one UPDATE/INSERT.
+            if ($ownsTransaction) {
+                $pdo->commit();
+            }
+
+            return true;
+
+        } catch (Throwable $e) {
+            if ($ownsTransaction && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
         }
     }
 
@@ -197,6 +384,281 @@
         }
         return empty($result) ? $settings : $result;
     }
+
+    // Build and save one New Project entry. Both the regular POST fallback and the
+    // chunked uploader use this exact path, keeping submit-tab filtering and types intact.
+    function addNewProjectEntry($pdo, $userId, $entryData) {
+        $userId = (int)$userId;
+        if ($userId <= 0 || !is_array($entryData) || empty($entryData)) {
+            throw new InvalidArgumentException('No valid entry data was received.');
+        }
+
+        $config = getUserConfig($pdo, $userId);
+        $globalDynamicFields = $config ? json_decode($config['dynamic_fields'] ?? '[]', true) : [];
+        if (!is_array($globalDynamicFields)) $globalDynamicFields = [];
+
+        $dynamicTabs = $config ? json_decode($config['dynamic_tabs'] ?? '[]', true) : [];
+        if (!is_array($dynamicTabs)) $dynamicTabs = [];
+
+        $submittedFieldKeys = [];
+        foreach ($dynamicTabs as $tab) {
+            if (!is_array($tab)) continue;
+            $submitTab = isset($tab['submit_tab']) ? (bool)$tab['submit_tab'] : true;
+            if (!$submitTab) continue;
+
+            $displayFields = $tab['dynamic_fields_display'] ?? [];
+            if (!is_array($displayFields)) continue;
+            foreach ($displayFields as $fieldKey) {
+                $submittedFieldKeys[(string)$fieldKey] = true;
+            }
+        }
+
+        $flatEntry = [];
+        foreach ($entryData as $key => $value) {
+            $key = (string)$key;
+            if (!isset($submittedFieldKeys[$key])) continue;
+
+            if (is_array($value) && isset($value['_object'])) {
+                $objectData = [];
+                $subFieldDefinitions = $globalDynamicFields[$key]['fieldkeyvalue'] ?? [];
+                if (!is_array($subFieldDefinitions)) $subFieldDefinitions = [];
+
+                foreach ($value as $subKey => $subValue) {
+                    if ($subKey === '_object') continue;
+                    $subType = $subFieldDefinitions[$subKey]['data_type'] ?? 'string';
+                    $objectData[$subKey] = castDynamicValueByType($subValue, $subType);
+                }
+                $flatEntry[$key] = $objectData;
+            } else {
+                $fieldType = $globalDynamicFields[$key]['data_type'] ?? 'string';
+                $flatEntry[$key] = castDynamicValueByType($value, $fieldType);
+            }
+        }
+
+        $settings = $config ? json_decode($config['settings'] ?? '[]', true) : [];
+        if (!is_array($settings)) $settings = [];
+        $settings = repairSettings($settings);
+
+        $newEntry = $flatEntry;
+        $newEntry['status'] = 'pending';
+        $newEntry['operation_status'] = 'entry_created: New Project added by admin';
+        $settings[] = $newEntry;
+
+        $dynamicFields = $config ? json_decode($config['dynamic_fields'] ?? '[]', true) : [];
+        if (!is_array($dynamicFields)) $dynamicFields = [];
+
+        if (!saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs)) {
+            throw new RuntimeException('The database did not confirm that the entry was saved.');
+        }
+
+        return count($flatEntry);
+    }
+
+    function sendEntryUploadJson($success, $message, $extra = [], $httpCode = 200) {
+        http_response_code($httpCode);
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        echo json_encode(array_merge([
+            'success' => (bool)$success,
+            'message' => (string)$message
+        ], is_array($extra) ? $extra : []), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        exit;
+    }
+
+    function getEntryUploadPath($uploadId) {
+        $safeSessionHash = hash('sha256', session_id());
+        $safeUploadId = preg_replace('/[^a-f0-9]/', '', strtolower((string)$uploadId));
+        return rtrim(sys_get_temp_dir(), DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR .
+            'sceneiq_entry_' . $safeSessionHash . '_' . $safeUploadId . '.tmp';
+    }
+
+    function removeEntryUpload($uploadId) {
+        if (!isset($_SESSION['entry_uploads'][$uploadId])) return;
+        $metadata = $_SESSION['entry_uploads'][$uploadId];
+        $path = $metadata['path'] ?? '';
+        if ($path && is_file($path)) {
+            @unlink($path);
+        }
+        unset($_SESSION['entry_uploads'][$uploadId]);
+        if (empty($_SESSION['entry_uploads'])) unset($_SESSION['entry_uploads']);
+    }
+
+    // AJAX upload endpoint: each request carries only a small file chunk, avoiding
+    // PHP post_max_size limits on large transcripts, scripts, and structured fields.
+    function handleEntryUploadRequests($pdo) {
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') return;
+
+        $actionKeys = ['entry_upload_start', 'entry_upload_chunk', 'entry_upload_finish', 'entry_upload_cancel'];
+        $action = null;
+        foreach ($actionKeys as $actionKey) {
+            if (isset($_POST[$actionKey])) {
+                $action = $actionKey;
+                break;
+            }
+        }
+        if ($action === null) return;
+
+        $providedToken = (string)($_POST['csrf_token'] ?? '');
+        $expectedToken = (string)($_SESSION['entry_upload_csrf_token'] ?? '');
+        if ($expectedToken === '' || $providedToken === '' || !hash_equals($expectedToken, $providedToken)) {
+            sendEntryUploadJson(false, 'Security check failed. Refresh the page and try again.', [], 403);
+        }
+
+        if (!isset($_SESSION['entry_uploads']) || !is_array($_SESSION['entry_uploads'])) {
+            $_SESSION['entry_uploads'] = [];
+        }
+
+        // Expire abandoned uploads belonging to this session.
+        foreach ($_SESSION['entry_uploads'] as $staleId => $metadata) {
+            if (time() - (int)($metadata['created_at'] ?? 0) > 1800) {
+                removeEntryUpload($staleId);
+            }
+        }
+
+        if ($action === 'entry_upload_start') {
+            $userId = (int)($_POST['user_id'] ?? 0);
+            $totalBytes = (int)($_POST['total_bytes'] ?? 0);
+            $totalChunks = (int)($_POST['total_chunks'] ?? 0);
+            $maxBytes = 64 * 1024 * 1024;
+
+            if ($userId <= 0 || $totalBytes <= 0 || $totalBytes > $maxBytes || $totalChunks <= 0) {
+                sendEntryUploadJson(false, 'Invalid upload size or account. The maximum entry size is 64 MB.', [], 400);
+            }
+
+            $selectedUserId = (int)($_SESSION['selected_user_id'] ?? 0);
+            if ($selectedUserId > 0 && $selectedUserId !== $userId) {
+                sendEntryUploadJson(false, 'The selected account changed. Refresh the page and try again.', [], 403);
+            }
+
+            if (count($_SESSION['entry_uploads']) >= 3) {
+                sendEntryUploadJson(false, 'There are already several active uploads. Cancel or finish one before starting another.', [], 429);
+            }
+
+            $uploadId = bin2hex(random_bytes(16));
+            $path = getEntryUploadPath($uploadId);
+            $handle = @fopen($path, 'xb');
+            if (!$handle) {
+                sendEntryUploadJson(false, 'The server could not create a temporary upload file. Check temporary-folder permissions.', [], 500);
+            }
+            fclose($handle);
+            @chmod($path, 0600);
+
+            $_SESSION['entry_uploads'][$uploadId] = [
+                'user_id' => $userId,
+                'path' => $path,
+                'total_bytes' => $totalBytes,
+                'total_chunks' => $totalChunks,
+                'received_bytes' => 0,
+                'next_chunk' => 0,
+                'created_at' => time()
+            ];
+
+            sendEntryUploadJson(true, 'Upload started.', [
+                'upload_id' => $uploadId,
+                'chunk_size' => 48 * 1024,
+                'total_chunks' => $totalChunks
+            ]);
+        }
+
+        $uploadId = strtolower((string)($_POST['upload_id'] ?? ''));
+        if (!preg_match('/^[a-f0-9]{32}$/', $uploadId) || !isset($_SESSION['entry_uploads'][$uploadId])) {
+            sendEntryUploadJson(false, 'This upload session is no longer available. Start the save again.', [], 404);
+        }
+
+        $metadata = $_SESSION['entry_uploads'][$uploadId];
+        if (time() - (int)($metadata['created_at'] ?? 0) > 1800) {
+            removeEntryUpload($uploadId);
+            sendEntryUploadJson(false, 'The upload expired. Please save the entry again.', [], 408);
+        }
+
+        if ($action === 'entry_upload_cancel') {
+            removeEntryUpload($uploadId);
+            sendEntryUploadJson(true, 'Upload cancelled.');
+        }
+
+        if ($action === 'entry_upload_chunk') {
+            $chunkIndex = (int)($_POST['chunk_index'] ?? -1);
+            if ($chunkIndex !== (int)$metadata['next_chunk']) {
+                sendEntryUploadJson(false, 'A chunk arrived out of order. Please restart the save.', [], 409);
+            }
+
+            if (!isset($_FILES['chunk_data']) || (int)($_FILES['chunk_data']['error'] ?? UPLOAD_ERR_NO_FILE) !== UPLOAD_ERR_OK) {
+                sendEntryUploadJson(false, 'The server did not receive an upload chunk. Please retry.', [], 400);
+            }
+
+            $temporaryFile = $_FILES['chunk_data']['tmp_name'] ?? '';
+            if (!$temporaryFile || !is_uploaded_file($temporaryFile)) {
+                sendEntryUploadJson(false, 'The uploaded chunk could not be verified.', [], 400);
+            }
+
+            $chunk = file_get_contents($temporaryFile);
+            if ($chunk === false || $chunk === '' || strlen($chunk) > 64 * 1024) {
+                sendEntryUploadJson(false, 'The uploaded chunk is empty or larger than the allowed chunk size.', [], 400);
+            }
+
+            $newReceivedBytes = (int)$metadata['received_bytes'] + strlen($chunk);
+            if ($newReceivedBytes > (int)$metadata['total_bytes']) {
+                removeEntryUpload($uploadId);
+                sendEntryUploadJson(false, 'The uploaded data exceeded the expected size. Please restart the save.', [], 400);
+            }
+
+            $written = file_put_contents($metadata['path'], $chunk, FILE_APPEND | LOCK_EX);
+            if ($written !== strlen($chunk)) {
+                removeEntryUpload($uploadId);
+                sendEntryUploadJson(false, 'The server could not store an upload chunk. Check temporary-folder space and permissions.', [], 500);
+            }
+
+            $_SESSION['entry_uploads'][$uploadId]['received_bytes'] = $newReceivedBytes;
+            $_SESSION['entry_uploads'][$uploadId]['next_chunk'] = $chunkIndex + 1;
+            $_SESSION['entry_uploads'][$uploadId]['created_at'] = time();
+
+            sendEntryUploadJson(true, 'Chunk received.', [
+                'received_bytes' => $newReceivedBytes,
+                'total_bytes' => (int)$metadata['total_bytes'],
+                'next_chunk' => $chunkIndex + 1
+            ]);
+        }
+
+        if ($action === 'entry_upload_finish') {
+            $expectedChunks = (int)($metadata['total_chunks'] ?? 0);
+            $receivedChunks = (int)($metadata['next_chunk'] ?? 0);
+            $expectedBytes = (int)($metadata['total_bytes'] ?? 0);
+            $receivedBytes = (int)($metadata['received_bytes'] ?? 0);
+            $path = (string)($metadata['path'] ?? '');
+
+            if ($receivedChunks !== $expectedChunks || $receivedBytes !== $expectedBytes || !is_file($path) || filesize($path) !== $expectedBytes) {
+                sendEntryUploadJson(false, 'The upload is incomplete. No entry was saved; please retry.', [], 400);
+            }
+
+            $rawEntryData = file_get_contents($path);
+            if ($rawEntryData === false) {
+                removeEntryUpload($uploadId);
+                sendEntryUploadJson(false, 'The server could not read the completed upload.', [], 500);
+            }
+
+            try {
+                @set_time_limit(0);
+                $entryData = json_decode($rawEntryData, true, 512, JSON_THROW_ON_ERROR);
+                if (!is_array($entryData) || empty($entryData)) {
+                    throw new InvalidArgumentException('The submitted entry did not contain any fields.');
+                }
+
+                $savedFieldCount = addNewProjectEntry($pdo, (int)$metadata['user_id'], $entryData);
+                removeEntryUpload($uploadId);
+                $_SESSION['flash_success'] = 'Entry added successfully! ' . $savedFieldCount . ' field(s) saved.';
+                sendEntryUploadJson(true, 'Entry saved successfully.', [
+                    'saved_fields' => $savedFieldCount
+                ]);
+            } catch (Throwable $e) {
+                error_log('SceneIQ chunked entry save failed for user ' . (int)$metadata['user_id'] . ': ' . $e->getMessage());
+                removeEntryUpload($uploadId);
+                sendEntryUploadJson(false, 'The entry could not be saved. ' . $e->getMessage(), [], 500);
+            }
+        }
+    }
+
+    // Process chunked upload requests before normal page POST handlers.
+    handleEntryUploadRequests($pdo);
 
     // ===== HANDLE POST REQUESTS WITH PRG PATTERN =====
     $redirect = false;
@@ -356,6 +818,78 @@
                 }
             }
         }
+        $redirect = true;
+    }
+
+    // Permanently delete the selected account's Dynamic Content and/or Dynamic Tabs.
+    // This endpoint is reached only after the user confirms in the custom warning modal.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_account_dynamic_data'])) {
+        $userId = intval($_POST['user_id'] ?? 0);
+        $deleteScope = (string)($_POST['delete_scope'] ?? '');
+        $postedToken = (string)($_POST['data_delete_csrf_token'] ?? '');
+
+        $deleteScopes = [
+            'dynamic_content' => [
+                'columns' => ['dynamic_fields'],
+                'label' => 'Dynamic content'
+            ],
+            'dynamic_tabs' => [
+                'columns' => ['dynamic_tabs'],
+                'label' => 'Dynamic tabs'
+            ],
+            'dynamic_both' => [
+                'columns' => ['dynamic_fields', 'dynamic_tabs'],
+                'label' => 'Dynamic contents and Dynamic tabs'
+            ]
+        ];
+
+        if (empty($_SESSION['data_delete_csrf_token']) ||
+            !hash_equals($_SESSION['data_delete_csrf_token'], $postedToken)) {
+            $_SESSION['flash_error'] = 'Security check failed. Please reopen the menu and try again.';
+        } elseif ($userId <= 0 || $userId !== intval($_SESSION['selected_user_id'] ?? 0)) {
+            $_SESSION['flash_error'] = 'The selected account could not be verified. No data was deleted.';
+        } elseif (!isset($deleteScopes[$deleteScope])) {
+            $_SESSION['flash_error'] = 'Invalid delete option. No data was deleted.';
+        } else {
+            try {
+                $config = getUserConfig($pdo, $userId);
+
+                if (!$config) {
+                    $_SESSION['flash_error'] = 'No saved configuration was found for this account.';
+                } else {
+                    $setParts = [];
+                    foreach ($deleteScopes[$deleteScope]['columns'] as $columnName) {
+                        // Column names are selected only from the fixed whitelist above.
+                        $setParts[] = '`' . $columnName . '` = :clear_' . $columnName;
+                    }
+
+                    $sql = 'UPDATE sceneiq_config SET ' . implode(', ', $setParts) .
+                           ' WHERE id = :config_id AND user_id = :user_id';
+                    $stmt = $pdo->prepare($sql);
+
+                    $parameters = [
+                        ':config_id' => (int)$config['id'],
+                        ':user_id' => $userId
+                    ];
+                    foreach ($deleteScopes[$deleteScope]['columns'] as $columnName) {
+                        $parameters[':clear_' . $columnName] = '[]';
+                    }
+
+                    if ($stmt->execute($parameters)) {
+                        $_SESSION['flash_success'] = $deleteScopes[$deleteScope]['label'] .
+                            ' deleted successfully for the selected account.';
+                    } else {
+                        $_SESSION['flash_error'] = 'Unable to delete the selected data. No other data was changed.';
+                    }
+                }
+            } catch (Throwable $e) {
+                error_log('Dynamic data deletion failed for user ' . $userId . ': ' . $e->getMessage());
+                $_SESSION['flash_error'] = 'An error occurred while deleting the selected data. Please try again.';
+            }
+        }
+
+        // Rotate the token after every destructive-operation attempt.
+        $_SESSION['data_delete_csrf_token'] = bin2hex(random_bytes(32));
         $redirect = true;
     }
 
@@ -632,79 +1166,28 @@
         $redirect = true;
     }
 
-    // Handle New Project for a user - UPDATED for submit tabs filtering
+    // Handle New Project for a user. Large entries use the chunked AJAX endpoint above;
+    // this regular POST handler remains available as a compatibility fallback.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['add_entry'])) {
-        $userId = intval($_POST['user_id'] ?? 0);
-        $entryData = isset($_POST['entry_data']) ? json_decode($_POST['entry_data'], true) : [];
-        
-        if ($userId > 0 && is_array($entryData) && !empty($entryData)) {
-            $config = getUserConfig($pdo, $userId);
-            $globalDynamicFields = $config ? (json_decode($config['dynamic_fields'], true) ?: []) : [];
-            
-            // Get dynamic tabs with submit_tab settings
-            $dynamicTabs = $config ? json_decode($config['dynamic_tabs'], true) : [];
-            if (!is_array($dynamicTabs)) $dynamicTabs = [];
-            
-            // Build list of field keys that should be submitted based on submit_tab settings
-            $submittedFieldKeys = [];
-            foreach ($dynamicTabs as $tab) {
-                $submitTab = isset($tab['submit_tab']) ? $tab['submit_tab'] : true;
-                if ($submitTab) {
-                    $displayFields = $tab['dynamic_fields_display'] ?? [];
-                    foreach ($displayFields as $fieldKey) {
-                        $submittedFieldKeys[] = $fieldKey;
-                    }
-                }
+        $userId = (int)($_POST['user_id'] ?? 0);
+        $rawEntryData = (string)($_POST['entry_data'] ?? '');
+
+        try {
+            if ($rawEntryData === '') {
+                throw new InvalidArgumentException('No entry data was provided.');
             }
-            
-            $flatEntry = [];
-            foreach ($entryData as $key => $value) {
-                if (is_array($value) && isset($value['_object'])) {
-                    if (in_array($key, $submittedFieldKeys)) {
-                        $objectData = [];
-                        $subFieldDefinitions = $globalDynamicFields[$key]['fieldkeyvalue'] ?? [];
-                        foreach ($value as $subKey => $subValue) {
-                            if ($subKey === '_object') {
-                                continue;
-                            }
-                            $subType = $subFieldDefinitions[$subKey]['data_type'] ?? 'string';
-                            $objectData[$subKey] = castDynamicValueByType($subValue, $subType);
-                        }
-                        $flatEntry[$key] = $objectData;
-                    }
-                } else {
-                    if (in_array($key, $submittedFieldKeys)) {
-                        $fieldType = $globalDynamicFields[$key]['data_type'] ?? 'string';
-                        $flatEntry[$key] = castDynamicValueByType($value, $fieldType);
-                    }
-                }
+            $entryData = json_decode($rawEntryData, true, 512, JSON_THROW_ON_ERROR);
+            if (!is_array($entryData) || empty($entryData)) {
+                throw new InvalidArgumentException('No valid entry fields were provided.');
             }
-            
-            if ($config) {
-                $settings = json_decode($config['settings'], true) ?: [];
-                if (!is_array($settings)) $settings = [];
-                $settings = repairSettings($settings);
-                
-                $newEntry = $flatEntry;
-                $newEntry['status'] = 'pending';
-                $newEntry['operation_status'] = 'entry_created: New Project added by admin';
-                $settings[] = $newEntry;
-                
-                $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
-                saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
-                $_SESSION['flash_success'] = 'Entry added successfully!';
-            } else {
-                $settings = [];
-                $newEntry = $flatEntry;
-                $newEntry['status'] = 'pending';
-                $newEntry['operation_status'] = 'entry_created: New Project added by admin';
-                $settings[] = $newEntry;
-                saveUserConfig($pdo, $userId, $settings, [], $dynamicTabs);
-                $_SESSION['flash_success'] = 'Entry added successfully!';
-            }
-        } else {
-            $_SESSION['flash_error'] = 'No entry data provided.';
+
+            $savedFieldCount = addNewProjectEntry($pdo, $userId, $entryData);
+            $_SESSION['flash_success'] = 'Entry added successfully! ' . $savedFieldCount . ' field(s) saved.';
+        } catch (Throwable $e) {
+            error_log('SceneIQ regular entry save failed for user ' . $userId . ': ' . $e->getMessage());
+            $_SESSION['flash_error'] = 'Entry could not be saved. ' . $e->getMessage();
         }
+
         $redirect = true;
     }
 
@@ -3922,6 +4405,15 @@
 .menu-account-email { color:#64748b; font-size:13px; }
 .menu-drawer-item { width:100%; text-align:left; padding:13px 12px; border:0; border-radius:8px; background:#fff; color:#1f2937; font-size:15px; cursor:pointer; }
 .menu-drawer-item:hover { background:#f1f5f9; color:#00695c; }
+.delete-data-toggle { display:flex; align-items:center; justify-content:space-between; gap:12px; color:#b91c1c; font-weight:700; }
+.delete-data-toggle:hover { background:#fef2f2; color:#991b1b; }
+.delete-data-chevron { display:inline-block; font-size:12px; transition:transform .18s ease; }
+.delete-data-toggle[aria-expanded="true"] .delete-data-chevron { transform:rotate(180deg); }
+.delete-data-options { display:none; flex-direction:column; gap:5px; margin: -3px 0 5px 10px; padding:5px 0 5px 10px; border-left:2px solid #fecaca; }
+.delete-data-options.open { display:flex; }
+.menu-drawer-subitem { width:100%; padding:10px 11px; border:0; border-radius:7px; background:#fff; color:#475569; text-align:left; font-size:13px; line-height:1.4; cursor:pointer; }
+.menu-drawer-subitem:hover { background:#fff1f2; color:#991b1b; }
+.menu-drawer { overflow-y:auto; overscroll-behavior:contain; }
 .change-password-form { padding:12px; margin:0 0 6px; background:#f8fafc; border:1px solid #e2e8f0; border-radius:10px; }
 .change-password-form label { display:block; margin:8px 0 5px; color:#334155; font-size:13px; font-weight:600; }
 .change-password-form input { display:block; width:100%; min-width:0; padding:10px; border:1px solid #cbd5e1; border-radius:7px; background:#fff; color:#0f172a; }
@@ -4278,6 +4770,20 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                 <button type="submit" class="menu-password-save">Save Password</button>
                 <p id="passwordFormMessage" class="password-form-message" aria-live="polite"></p>
             </form>
+            <button type="button" class="menu-drawer-item delete-data-toggle" id="deleteDataToggle" onclick="toggleDeleteDataOptions()" aria-expanded="false" aria-controls="deleteDataOptions">
+                <span>Delete Data</span><span class="delete-data-chevron" aria-hidden="true">▾</span>
+            </button>
+            <div class="delete-data-options" id="deleteDataOptions">
+                <button type="button" class="menu-drawer-subitem" onclick="requestDeleteData('dynamic_content')">Delete Dynamic content</button>
+                <button type="button" class="menu-drawer-subitem" onclick="requestDeleteData('dynamic_tabs')">Delete Dynamic tabs</button>
+                <button type="button" class="menu-drawer-subitem" onclick="requestDeleteData('dynamic_both')">Delete Dynamic contents and Dynamic tabs</button>
+            </div>
+            <form method="POST" id="deleteDataForm" style="display:none;">
+                <input type="hidden" name="delete_account_dynamic_data" value="1">
+                <input type="hidden" name="user_id" value="<?php echo (int)$selectedUser['id']; ?>">
+                <input type="hidden" name="delete_scope" id="deleteDataScope" value="">
+                <input type="hidden" name="data_delete_csrf_token" value="<?php echo htmlspecialchars($_SESSION['data_delete_csrf_token'], ENT_QUOTES, 'UTF-8'); ?>">
+            </form>
             <?php endif; ?>
             <button type="button" class="menu-drawer-item" onclick="goToDashboard()">Dashboard</button>
             <button type="button" class="menu-drawer-item" onclick="window.location.href='index.php'">Task</button>
@@ -4328,6 +4834,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
             <input type="hidden" name="add_entry" value="true">
             <input type="hidden" name="user_id" value="<?php echo $selectedUserId; ?>">
             <input type="hidden" name="entry_data" class="entryDataInput">
+            <input type="hidden" class="entryUploadCsrf" value="<?php echo htmlspecialchars($_SESSION['entry_upload_csrf_token'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
             
             <?php foreach ($dynamicFields as $key => $field): ?>
                 <?php if ($field['field_type'] === 'objects'): ?>
@@ -5189,6 +5696,49 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
             var input = document.getElementById('newPassword');
             if (input) input.focus();
         }
+    }
+
+    function toggleDeleteDataOptions() {
+        var options = document.getElementById('deleteDataOptions');
+        var toggle = document.getElementById('deleteDataToggle');
+        if (!options || !toggle) return;
+
+        var opening = !options.classList.contains('open');
+        options.classList.toggle('open', opening);
+        toggle.setAttribute('aria-expanded', opening ? 'true' : 'false');
+    }
+
+    function requestDeleteData(scope) {
+        var deleteLabels = {
+            dynamic_content: 'Dynamic content',
+            dynamic_tabs: 'Dynamic tabs',
+            dynamic_both: 'Dynamic contents and Dynamic tabs'
+        };
+        var selectedLabel = deleteLabels[scope];
+
+        if (!selectedLabel) {
+            showDialog('Invalid option', 'The selected delete option is not valid.');
+            return;
+        }
+
+        // Close the drawer before displaying the final custom confirmation modal.
+        closeMenuDrawer();
+
+        confirmAction(
+            'Final confirmation — Delete Data',
+            'WARNING: You are about to permanently delete ' + selectedLabel +
+                ' for this account. This action cannot be undone. Project entries, statuses, and other account settings will not be deleted. Do you want to continue?',
+            function() {
+                var form = document.getElementById('deleteDataForm');
+                var scopeInput = document.getElementById('deleteDataScope');
+                if (!form || !scopeInput) {
+                    showDialog('Unable to delete data', 'The delete form could not be found. No data was deleted.');
+                    return;
+                }
+                scopeInput.value = scope;
+                form.submit();
+            }
+        );
     }
 
     var changePasswordForm = document.getElementById('changePasswordForm');
@@ -6734,6 +7284,112 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         return String(value);
     }
 
+    async function postEntryUploadRequest(formData) {
+        var response = await fetch(window.location.href.split('#')[0], {
+            method: 'POST',
+            body: formData,
+            credentials: 'same-origin'
+        });
+
+        var responseText = await response.text();
+        var result;
+        try {
+            result = JSON.parse(responseText);
+        } catch (parseError) {
+            throw new Error('The server returned an invalid response while saving. Check PHP errors and hosting limits.');
+        }
+
+        if (!response.ok || !result || result.success !== true) {
+            throw new Error((result && result.message) ? result.message : 'The server rejected an upload request.');
+        }
+        return result;
+    }
+
+    async function uploadEntryInChunks(activeForm, jsonText, saveButton) {
+        if (activeForm.dataset.entryUploadRunning === '1') return;
+        activeForm.dataset.entryUploadRunning = '1';
+
+        var originalButtonText = saveButton ? saveButton.textContent : 'Save Entry';
+        if (saveButton) {
+            saveButton.disabled = true;
+            saveButton.textContent = 'Preparing upload...';
+        }
+        var uploadId = null;
+        var csrfInput = activeForm.querySelector('.entryUploadCsrf');
+        var userIdInput = activeForm.querySelector('input[name="user_id"]');
+        var csrfToken = csrfInput ? csrfInput.value : '';
+        var userId = userIdInput ? userIdInput.value : '';
+        var maxBytes = 64 * 1024 * 1024;
+
+        try {
+            if (!csrfToken || !userId) {
+                throw new Error('The upload security token or selected account is missing. Refresh the page and try again.');
+            }
+
+            var uploadBlob = new Blob([jsonText], { type: 'application/octet-stream' });
+            if (uploadBlob.size <= 0) throw new Error('There is no entry data to save.');
+            if (uploadBlob.size > maxBytes) throw new Error('This entry is larger than the 64 MB upload limit. Reduce the content and try again.');
+
+            var chunkSize = 48 * 1024;
+            var totalChunks = Math.ceil(uploadBlob.size / chunkSize);
+
+            var startData = new FormData();
+            startData.append('entry_upload_start', '1');
+            startData.append('user_id', userId);
+            startData.append('total_bytes', String(uploadBlob.size));
+            startData.append('total_chunks', String(totalChunks));
+            startData.append('csrf_token', csrfToken);
+
+            var started = await postEntryUploadRequest(startData);
+            uploadId = started.upload_id;
+            if (!uploadId) throw new Error('The server did not create an upload session.');
+
+            for (var chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
+                var startOffset = chunkIndex * chunkSize;
+                var endOffset = Math.min(startOffset + chunkSize, uploadBlob.size);
+                var chunkBlob = uploadBlob.slice(startOffset, endOffset);
+
+                var chunkData = new FormData();
+                chunkData.append('entry_upload_chunk', '1');
+                chunkData.append('upload_id', uploadId);
+                chunkData.append('chunk_index', String(chunkIndex));
+                chunkData.append('csrf_token', csrfToken);
+                chunkData.append('chunk_data', chunkBlob, 'entry-chunk.bin');
+
+                await postEntryUploadRequest(chunkData);
+
+                var percent = Math.round((endOffset / uploadBlob.size) * 100);
+                if (saveButton) saveButton.textContent = 'Saving ' + percent + '%...';
+            }
+
+            var finishData = new FormData();
+            finishData.append('entry_upload_finish', '1');
+            finishData.append('upload_id', uploadId);
+            finishData.append('csrf_token', csrfToken);
+            await postEntryUploadRequest(finishData);
+
+            if (saveButton) saveButton.textContent = 'Saved';
+            window.location.reload();
+        } catch (error) {
+            if (uploadId && csrfToken) {
+                try {
+                    var cancelData = new FormData();
+                    cancelData.append('entry_upload_cancel', '1');
+                    cancelData.append('upload_id', uploadId);
+                    cancelData.append('csrf_token', csrfToken);
+                    await postEntryUploadRequest(cancelData);
+                } catch (ignoreCancelError) {}
+            }
+
+            activeForm.dataset.entryUploadRunning = '0';
+            if (saveButton) {
+                saveButton.disabled = false;
+                saveButton.textContent = originalButtonText;
+            }
+            showDialog('Save failed', error && error.message ? error.message : 'The entry could not be saved. Please try again.');
+        }
+    }
+
     function submitUserEntry() {
         var context = getActiveNewProjectContext();
         var activeContent = context.rootContent;
@@ -6830,8 +7486,11 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
             showDialog('Error', 'The selected form is missing its entry data input.');
             return;
         }
-        entryDataInput.value = JSON.stringify(entryData);
-        activeForm.submit();
+        var serializedEntry = JSON.stringify(entryData);
+        // Keep the hidden field for compatibility, but upload the actual payload in
+        // 48 KB chunks so large transcripts do not exceed PHP's POST request limit.
+        entryDataInput.value = '';
+        uploadEntryInChunks(activeForm, serializedEntry, saveButton);
     }
 
     // Legacy renderer retained for compatibility with account-scoped field editor helpers.
