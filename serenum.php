@@ -3225,6 +3225,42 @@
         switchMainTab('pending');
     }
     
+    // Shorten long select-option labels for display only.
+    // The option's actual value remains untouched, so the full configured
+    // submit_as payload (including URLs and JSON) is still submitted.
+    function shortenSerenumSelectOptionLabel(label, maxWords = 2, maxChars = 48) {
+        const fullLabel = String(label === undefined || label === null ? '' : label)
+            .replace(/\s+/g, ' ')
+            .trim();
+
+        if (!fullLabel) return '';
+
+        const words = fullLabel.split(' ');
+        const exceedsWordLimit = words.length > maxWords;
+        const exceedsCharacterLimit = fullLabel.length > maxChars;
+
+        if (!exceedsWordLimit && !exceedsCharacterLimit) {
+            return fullLabel;
+        }
+
+        // Prefer the first two complete words. For a long token such as a URL,
+        // serialized JSON, or identifier, use a character limit instead.
+        let candidateWords = exceedsWordLimit ? words.slice(0, maxWords) : words;
+        const visibleLimit = Math.max(1, maxChars - 3);
+        let shortened = candidateWords.join(' ');
+
+        if (shortened.length > visibleLimit) {
+            // If two words do not fit, keep the first complete word where possible.
+            if (candidateWords.length > 1 && candidateWords[0].length <= visibleLimit) {
+                shortened = candidateWords[0];
+            } else {
+                shortened = shortened.slice(0, visibleLimit).trimEnd();
+            }
+        }
+
+        return shortened + '...';
+    }
+
     // ===== RENDER DYNAMIC FIELDS =====
     function renderDynamicFields() {
         const container = document.getElementById('dynamicFieldsContainer');
@@ -3526,8 +3562,14 @@
                 
                 sourceValues.forEach(({ key: optionKey, value: actualValue, display, submitData }) => {
                     const option = document.createElement('option');
+                    // IMPORTANT: keep the complete original submit payload here.
+                    // Only the visible option caption is shortened below.
                     option.value = submitData;
-                    option.textContent = display;
+
+                    const fullDisplayText = String(display === undefined || display === null ? '' : display);
+                    option.textContent = shortenSerenumSelectOptionLabel(fullDisplayText);
+                    option.title = fullDisplayText;
+                    option.dataset.fullDisplay = fullDisplayText;
                     option.dataset.key = optionKey;
                     option.dataset.value = actualValue;
                     option.dataset.submitAs = submitAs;
@@ -3538,22 +3580,32 @@
                     inputElement.appendChild(option);
                 });
                 
-                wrapper.appendChild(inputElement);
+                const selectElement = inputElement;
+                wrapper.appendChild(selectElement);
                 
                 const previewDiv = document.createElement('div');
                 previewDiv.className = 'submit-as-preview';
                 previewDiv.style.cssText = 'margin-top:5px; padding:6px 12px; background:#f8fafc; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#6b7280; font-family:monospace; word-break:break-all; max-height:100px; overflow-y:auto;';
-                previewDiv.textContent = 'Selected: ' + (inputElement.value || 'None');
-                wrapper.appendChild(previewDiv);
-                
-                inputElement.addEventListener('change', function() {
-                    const selectedOption = this.options[this.selectedIndex];
+
+                // Keep the on-screen preview compact too. The complete submitted
+                // payload remains in option.value and is available in the title.
+                const updateSelectPreview = () => {
+                    const selectedOption = selectElement.options[selectElement.selectedIndex];
                     if (selectedOption && selectedOption.value) {
-                        previewDiv.textContent = 'Selected: ' + selectedOption.value;
+                        const fullPreview = selectedOption.value;
+                        const displayPreview = selectedOption.dataset.fullDisplay || selectedOption.textContent;
+                        previewDiv.textContent = 'Selected: ' + shortenSerenumSelectOptionLabel(displayPreview);
+                        previewDiv.title = 'Full submitted value: ' + fullPreview;
                     } else {
                         previewDiv.textContent = 'Selected: None';
+                        previewDiv.removeAttribute('title');
                     }
-                });
+                };
+
+                updateSelectPreview();
+                wrapper.appendChild(previewDiv);
+                
+                selectElement.addEventListener('change', updateSelectPreview);
                 
                 inputElement = wrapper;
             } else {
