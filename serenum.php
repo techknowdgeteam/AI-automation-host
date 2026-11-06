@@ -56,6 +56,125 @@
         die("Connection failed: " . $e->getMessage());
     }
 
+    // Read the actual selected engine value from dynamic_values when older or
+    // customized forms do not send the separate root-level engine property.
+    function serenumExtractEngineValue($dynamicValues) {
+        if (!is_array($dynamicValues)) return '';
+        foreach ($dynamicValues as $key => $value) {
+            $normalizedKey = strtolower(preg_replace('/[^a-z0-9]/i', '', (string)$key));
+            if (strpos($normalizedKey, 'engine') === false) continue;
+            if (is_array($value)) {
+                foreach ($value as $nestedValue) {
+                    if (is_scalar($nestedValue) && trim((string)$nestedValue) !== '') return trim((string)$nestedValue);
+                }
+                continue;
+            }
+            if (is_string($value)) {
+                $decoded = json_decode($value, true);
+                if (is_array($decoded)) {
+                    foreach ($decoded as $nestedValue) {
+                        if (is_scalar($nestedValue) && trim((string)$nestedValue) !== '') return trim((string)$nestedValue);
+                    }
+                }
+            }
+            if (is_scalar($value) && trim((string)$value) !== '') return trim((string)$value);
+        }
+        return '';
+    }
+
+    // Handle Add/Edit Configuration. Persist the selected engine only when one
+    // was actually submitted; never invent an engine default.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_config'])) {
+        try {
+            $payload = json_decode($_POST['config_data'] ?? '', true);
+            if (!is_array($payload)) {
+                throw new RuntimeException('Invalid configuration data received.');
+            }
+            $dynamicValues = $payload['dynamic_values'] ?? [];
+            if (!is_array($dynamicValues)) $dynamicValues = [];
+            $author = trim((string)($payload['author'] ?? ''));
+            if ($author === '') {
+                foreach ($dynamicValues as $key => $value) {
+                    if (preg_match('/^author$/i', (string)$key) && is_scalar($value)) {
+                        $author = trim((string)$value);
+                        break;
+                    }
+                }
+            }
+            if ($author === '') throw new RuntimeException('Please provide an author/name value.');
+
+            $engine = trim((string)($payload['engine'] ?? ''));
+            if ($engine === '') $engine = serenumExtractEngineValue($dynamicValues);
+            $editIndex = isset($payload['edit_index']) && $payload['edit_index'] !== '' ? (int)$payload['edit_index'] : null;
+
+            // Serialize read/modify/write operations so simultaneous saves cannot
+            // overwrite one another's pending records.
+            $pdo->beginTransaction();
+            $stmt = $pdo->query("SELECT id, settings FROM serenum_config ORDER BY id DESC LIMIT 1 FOR UPDATE");
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row) throw new RuntimeException('Configuration storage is not initialized. Please save Setup first.');
+
+            $rawSettings = trim((string)($row['settings'] ?? '[]'));
+            if ($rawSettings === '') $rawSettings = '[]';
+            $settings = json_decode($rawSettings, true);
+            if (!is_array($settings)) {
+                throw new RuntimeException('Stored configuration records are invalid JSON. No records were changed.');
+            }
+            // Use the same canonical record ordering as the page renderer and
+            // the status/delete handlers. This keeps every action index aligned.
+            $settings = repairSettings($settings);
+
+            $newConfig = [
+                'author' => $author,
+                'status' => 'pending',
+                'dynamic_values' => $dynamicValues
+            ];
+            if ($engine !== '') $newConfig['engine'] = $engine;
+
+            // New submissions always append as independent records. Editing targets
+            // the exact original array index, never an author-name match (authors
+            // can repeat and must not cause one engine to overwrite another).
+            if ($editIndex !== null) {
+                if (!array_key_exists($editIndex, $settings) || !is_array($settings[$editIndex])) {
+                    throw new RuntimeException('The configuration being edited could not be found. Refresh and try again.');
+                }
+                $existing = $settings[$editIndex];
+                $newConfig['status'] = $existing['status'] ?? 'pending';
+                if (isset($existing['operation_status'])) {
+                    $newConfig['operation_status'] = $existing['operation_status'];
+                }
+                foreach ($existing as $k => $v) {
+                    // Form fields in dynamic_values are the canonical current values.
+                    // Do not retain an older flattened copy at the root, because that
+                    // legacy value could otherwise override the value just submitted.
+                    if (array_key_exists((string)$k, $dynamicValues)) continue;
+                    if (!in_array($k, ['author', 'status', 'dynamic_values', 'operation_status'], true)
+                        && ($k !== 'engine' || $engine === '')) {
+                        $newConfig[$k] = $v;
+                    }
+                }
+                $settings[$editIndex] = $newConfig;
+            } else {
+                $settings[] = $newConfig;
+            }
+
+            $stmt = $pdo->prepare("UPDATE serenum_config SET settings = :settings WHERE id = :id");
+            $stmt->execute([
+                ':settings' => json_encode(array_values($settings), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                ':id' => $row['id']
+            ]);
+            $pdo->commit();
+            header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+            exit;
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+            error_log('Save configuration failed: ' . $e->getMessage());
+            http_response_code(400);
+            echo 'Unable to save configuration: ' . htmlspecialchars($e->getMessage(), ENT_QUOTES, 'UTF-8');
+            exit;
+        }
+    }
+
     // ===== GET COPIED LINKS DATA FROM JPGSVAULT =====
     function getCopiedLinksData($pdo) {
         try {
@@ -126,84 +245,198 @@
         return $settings;
     }
 
-    // Handle Save All - Saves to respective columns
+    // Save only the dynamic-field order. Definitions are loaded from the database
+    // and rebuilt in the submitted order, without replacing pending records or
+    // unrelated Setup data.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_dynamic_fields_order'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        try {
+            $fieldOrder = json_decode(
+                (string)($_POST['field_order'] ?? ''),
+                true,
+                512,
+                JSON_THROW_ON_ERROR
+            );
+
+            if (!is_array($fieldOrder) || ($fieldOrder !== [] && array_keys($fieldOrder) !== range(0, count($fieldOrder) - 1))) {
+                throw new RuntimeException('Invalid dynamic-field order received.');
+            }
+
+            $fieldOrder = array_map(static function ($key) {
+                if (!is_string($key) && !is_int($key)) {
+                    throw new RuntimeException('A dynamic-field key is invalid.');
+                }
+                return (string)$key;
+            }, $fieldOrder);
+
+            if (count($fieldOrder) !== count(array_unique($fieldOrder))) {
+                throw new RuntimeException('The dynamic-field order contains duplicate keys.');
+            }
+
+            $pdo->beginTransaction();
+            $stmt = $pdo->query(
+                "SELECT id, settings_dynamic_fields
+                 FROM serenum_config
+                 ORDER BY id DESC
+                 LIMIT 1
+                 FOR UPDATE"
+            );
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+
+            if (!$row) {
+                throw new RuntimeException('Configuration storage was not found. Save Setup first.');
+            }
+
+            $currentFields = json_decode(
+                (string)($row['settings_dynamic_fields'] ?? '{}'),
+                true,
+                512,
+                JSON_THROW_ON_ERROR
+            );
+
+            if (!is_array($currentFields)) {
+                throw new RuntimeException('Stored dynamic-field definitions are invalid.');
+            }
+
+            $currentKeys = array_map('strval', array_keys($currentFields));
+            $submittedSorted = $fieldOrder;
+            $currentSorted = $currentKeys;
+            sort($submittedSorted, SORT_STRING);
+            sort($currentSorted, SORT_STRING);
+
+            // Refuse stale browser orders rather than dropping concurrently changed fields.
+            if ($submittedSorted !== $currentSorted) {
+                throw new RuntimeException(
+                    'The dynamic fields changed in another session. Refresh the page and try again.'
+                );
+            }
+
+            $orderedFields = [];
+            foreach ($fieldOrder as $fieldKey) {
+                if (!array_key_exists($fieldKey, $currentFields)) {
+                    throw new RuntimeException('A dynamic field in the requested order no longer exists.');
+                }
+                $orderedFields[$fieldKey] = $currentFields[$fieldKey];
+            }
+
+            $encodedFields = json_encode(
+                $orderedFields,
+                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR
+            );
+
+            $update = $pdo->prepare(
+                'UPDATE serenum_config
+                 SET settings_dynamic_fields = :dynamic_fields
+                 WHERE id = :id'
+            );
+            $update->execute([
+                ':dynamic_fields' => $encodedFields,
+                ':id' => (int)$row['id']
+            ]);
+
+            $pdo->commit();
+            echo json_encode([
+                'success' => true,
+                'message' => 'Dynamic-field order saved successfully.'
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            exit;
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            error_log('Serenum dynamic-field order save failed: ' . $e->getMessage());
+            http_response_code(400);
+            echo json_encode([
+                'success' => false,
+                'message' => $e->getMessage()
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+            exit;
+        }
+    }
+
+    // Handle Save All. Setup saves update setup columns only; pending/completed/aborted
+    // records are changed exclusively by the dedicated configuration/status handlers.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_all'])) {
         try {
-            // Decode all the POST data
-            $settingsData = isset($_POST['settings']) ? json_decode($_POST['settings'], true) : [];
-            $accountsData = isset($_POST['accounts']) ? json_decode($_POST['accounts'], true) : [];
-            $captionsData = isset($_POST['captions']) ? json_decode($_POST['captions'], true) : [];
-            $timeordersData = isset($_POST['timeorders']) ? json_decode($_POST['timeorders'], true) : [];
-            $filtersData = isset($_POST['filters']) ? json_decode($_POST['filters'], true) : [];
-            $dynamicFieldsData = isset($_POST['dynamic_fields']) ? json_decode($_POST['dynamic_fields'], true) : [];
-            $settingsData = cleanDynamicValues($settingsData);
-            
-            // Ensure data is properly formatted
-            if (!is_array($settingsData)) $settingsData = [];
+            $hasSettingsPayload = array_key_exists('settings', $_POST);
+
+            // A malformed settings payload must never silently become an empty list.
+            $settingsData = [];
+            if ($hasSettingsPayload) {
+                $settingsData = json_decode((string)$_POST['settings'], true);
+                if (!is_array($settingsData)) {
+                    throw new RuntimeException('Invalid settings data received. Pending records were not changed.');
+                }
+                $settingsData = cleanDynamicValues($settingsData);
+                $settingsData = normalizeSettings($settingsData);
+                $settingsData = repairSettings($settingsData);
+            }
+
+            $accountsData = json_decode((string)($_POST['accounts'] ?? '[]'), true);
+            $captionsData = json_decode((string)($_POST['captions'] ?? '[]'), true);
+            $timeordersData = json_decode((string)($_POST['timeorders'] ?? '[]'), true);
+            $filtersData = json_decode((string)($_POST['filters'] ?? '[]'), true);
+            $dynamicFieldsData = json_decode((string)($_POST['dynamic_fields'] ?? '[]'), true);
+
             if (!is_array($accountsData)) $accountsData = [];
             if (!is_array($captionsData)) $captionsData = [];
             if (!is_array($timeordersData)) $timeordersData = [];
             if (!is_array($filtersData)) $filtersData = [];
             if (!is_array($dynamicFieldsData)) $dynamicFieldsData = [];
-            
-            // ===== CRITICAL FIX: Normalize nested JSON strings =====
-            $settingsData = normalizeSettings($settingsData);
-            
-            // Auto-repair settings: ensure it's always an array of objects
-            $settingsData = repairSettings($settingsData);
-            
-            // Check if record exists
-            $stmt = $pdo->query("SELECT COUNT(*) FROM serenum_config");
-            $count = $stmt->fetchColumn();
-            
-            if ($count > 0) {
-                // Update existing record - get the latest ID first
-                $stmt = $pdo->query("SELECT id FROM serenum_config ORDER BY id DESC LIMIT 1");
-                $latestId = $stmt->fetchColumn();
-                
-                $stmt = $pdo->prepare("UPDATE serenum_config SET 
-                    settings = :settings, 
-                    accounts_url = :accounts_url, 
-                    captions = :captions, 
-                    time_orders = :time_orders, 
-                    filters = :filters,
-                    settings_dynamic_fields = :dynamic_fields
-                    WHERE id = :id");
-                
+
+            $pdo->beginTransaction();
+            $stmt = $pdo->query("SELECT id FROM serenum_config ORDER BY id DESC LIMIT 1 FOR UPDATE");
+            $latestId = $stmt->fetchColumn();
+
+            if ($latestId) {
+                $setParts = [];
                 $params = [
-                    ':settings' => json_encode($settingsData),
-                    ':accounts_url' => json_encode($accountsData),
-                    ':captions' => json_encode($captionsData),
-                    ':time_orders' => json_encode($timeordersData),
-                    ':filters' => json_encode($filtersData),
-                    ':dynamic_fields' => json_encode($dynamicFieldsData),
-                    ':id' => $latestId
+                    ':accounts_url' => json_encode($accountsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':captions' => json_encode($captionsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':time_orders' => json_encode($timeordersData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':filters' => json_encode($filtersData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':dynamic_fields' => json_encode($dynamicFieldsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':id' => (int)$latestId
                 ];
-                
+
+                // Only callers explicitly sending settings may replace the record list.
+                // The current Save Setup UI intentionally omits this field.
+                if ($hasSettingsPayload) {
+                    $setParts[] = 'settings = :settings';
+                    $params[':settings'] = json_encode($settingsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR);
+                }
+
+                $setParts[] = 'accounts_url = :accounts_url';
+                $setParts[] = 'captions = :captions';
+                $setParts[] = 'time_orders = :time_orders';
+                $setParts[] = 'filters = :filters';
+                $setParts[] = 'settings_dynamic_fields = :dynamic_fields';
+
+                $stmt = $pdo->prepare('UPDATE serenum_config SET ' . implode(', ', $setParts) . ' WHERE id = :id');
                 $stmt->execute($params);
-                
             } else {
-                // Insert new record
-                $stmt = $pdo->prepare("INSERT INTO serenum_config 
-                    (settings, accounts_url, captions, time_orders, filters, settings_dynamic_fields) 
-                    VALUES 
-                    (:settings, :accounts_url, :captions, :time_orders, :filters, :dynamic_fields)");
-                
-                $params = [
-                    ':settings' => json_encode($settingsData),
-                    ':accounts_url' => json_encode($accountsData),
-                    ':captions' => json_encode($captionsData),
-                    ':time_orders' => json_encode($timeordersData),
-                    ':filters' => json_encode($filtersData),
-                    ':dynamic_fields' => json_encode($dynamicFieldsData)
-                ];
-                
-                $stmt->execute($params);
+                // First-time setup initializes an empty record list. Later setup saves
+                // never transmit or replace settings/pending records.
+                $stmt = $pdo->prepare("INSERT INTO serenum_config
+                    (settings, accounts_url, captions, time_orders, filters, settings_dynamic_fields)
+                    VALUES (:settings, :accounts_url, :captions, :time_orders, :filters, :dynamic_fields)");
+                $stmt->execute([
+                    ':settings' => json_encode($hasSettingsPayload ? $settingsData : [], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':accounts_url' => json_encode($accountsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':captions' => json_encode($captionsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':time_orders' => json_encode($timeordersData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':filters' => json_encode($filtersData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                    ':dynamic_fields' => json_encode($dynamicFieldsData, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR)
+                ]);
             }
-            
-            echo json_encode(['success' => true, 'message' => 'All data saved successfully!']);
+
+            $pdo->commit();
+            echo json_encode(['success' => true, 'message' => 'All setup data saved successfully. Existing pending records were preserved.']);
             exit;
-        } catch(Exception $e) {
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+            error_log('Serenum setup save failed: ' . $e->getMessage());
+            http_response_code(400);
             echo json_encode(['success' => false, 'message' => 'Error saving data: ' . $e->getMessage()]);
             exit;
         }
@@ -286,162 +519,130 @@
         return $result;
     }
 
-    // Handle Update Status
-    // Handle Update Status
+    // Handle Update Status by exact array index (authors are not unique).
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_status'])) {
+        header('Content-Type: application/json; charset=utf-8');
         try {
-            $id = isset($_POST['id']) ? intval($_POST['id']) : 0;
-            $status = isset($_POST['status']) ? $_POST['status'] : '';
-            $author = isset($_POST['author']) ? $_POST['author'] : '';
-            
-            if ($id > 0 && $status && $author) {
-                // Get current data
-                $stmt = $pdo->prepare("SELECT settings FROM serenum_config WHERE id = :id");
-                $stmt->execute([':id' => $id]);
-                $row = $stmt->fetch(PDO::FETCH_ASSOC);
-                
-                if ($row) {
-                    $settings = json_decode($row['settings'], true) ?: [];
-                    if (!is_array($settings)) $settings = [];
-                    
-                    // Repair settings
-                    $settings = repairSettings($settings);
-                    
-                    // Find the configuration with matching author
-                    $found = false;
-                    foreach ($settings as &$config) {
-                        if (is_array($config) && isset($config['author']) && $config['author'] === $author) {
-                            $config['status'] = $status;
-                            // Add operation_status with function name
-                            $config['operation_status'] = "change_status: Status updated to '$status' for author '$author'";
-                            $found = true;
-                            break;
-                        }
-                    }
-                    
-                    if (!$found) {
-                        // If no config found, create a new one
-                        $newConfig = [
-                            'author' => $author,
-                            'engine' => 'automation',
-                            'page' => 'none',
-                            'group' => 'include',
-                            'processjpgfrom' => 'freshjpgs',
-                            'cardamount' => '1',
-                            'schedule_date' => '',
-                            'post_types' => '',
-                            'include_profile_link' => false,
-                            'captions_state' => 'fixed',
-                            'tag' => '',
-                            'type' => '',
-                            'group_types' => [],
-                            'group_switch' => 'no',
-                            'author_caption' => [],
-                            'author_account_url' => [],
-                            'status' => $status,
-                            'dynamic_values' => [],
-                            'operation_status' => "change_status: Status set to '$status' for new author '$author'"
-                        ];
-                        $settings[] = $newConfig;
-                    }
-                    
-                    // Update the database
-                    $stmt = $pdo->prepare("UPDATE serenum_config SET settings = :settings WHERE id = :id");
-                    $stmt->execute([
-                        ':settings' => json_encode($settings),
-                        ':id' => $id
-                    ]);
-                    
-                    echo json_encode(['success' => true, 'message' => 'Status updated successfully!']);
-                    exit;
-                }
+            $id = isset($_POST['id']) ? (int)$_POST['id'] : 0;
+            $index = isset($_POST['index']) ? (int)$_POST['index'] : -1;
+            $status = strtolower(trim((string)($_POST['status'] ?? '')));
+            $allowedStatuses = ['pending', 'completed', 'aborted'];
+            if ($id <= 0 || $index < 0 || !in_array($status, $allowedStatuses, true)) {
+                throw new RuntimeException('Invalid status update request.');
             }
-            
-            echo json_encode(['success' => false, 'message' => 'Invalid request - missing id, status, or author']);
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare("SELECT settings FROM serenum_config WHERE id = :id FOR UPDATE");
+            $stmt->execute([':id' => $id]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row) throw new RuntimeException('Configuration storage was not found.');
+            $settings = json_decode($row['settings'] ?? '[]', true);
+            if (!is_array($settings)) $settings = [];
+            // Match the exact normalization used to render the pending cards.
+            $settings = repairSettings($settings);
+            if (!isset($settings[$index]) || !is_array($settings[$index])) {
+                throw new RuntimeException('Configuration index no longer exists. Refresh and try again.');
+            }
+            $settings[$index]['status'] = $status;
+            $settings[$index]['operation_status'] = "change_status: Status updated to '$status'";
+            if (isset($settings[$index]['dynamic_values']) && is_array($settings[$index]['dynamic_values'])) {
+                unset($settings[$index]['dynamic_values']['status'], $settings[$index]['dynamic_values']['operation_status']);
+            }
+            $stmt = $pdo->prepare("UPDATE serenum_config SET settings = :settings WHERE id = :id");
+            $stmt->execute([
+                ':settings' => json_encode(array_values($settings), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                ':id' => $id
+            ]);
+            $pdo->commit();
+            echo json_encode(['success' => true, 'message' => 'Status updated successfully']);
             exit;
-        } catch(Exception $e) {
-            echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()]);
             exit;
         }
     }
 
-    // Handle Delete Configuration
+    // Handle Delete Configuration by exact array index. Author/name is not unique.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['delete_config'])) {
+        header('Content-Type: application/json; charset=utf-8');
         try {
-            $id = isset($_POST['id']) ? intval($_POST['id']) : 0;
-            $author = isset($_POST['author']) ? $_POST['author'] : '';
-            
-            if ($id > 0 && $author) {
-                // Get current data
-                $stmt = $pdo->prepare("SELECT settings FROM serenum_config WHERE id = :id");
-                $stmt->execute([':id' => $id]);
-                $row = $stmt->fetch(PDO::FETCH_ASSOC);
-                
-                if ($row) {
-                    $settings = json_decode($row['settings'], true) ?: [];
-                    if (!is_array($settings)) $settings = [];
-                    
-                    $settings = repairSettings($settings);
-                    
-                    // Filter out the config with matching author
-                    $settings = array_filter($settings, function($config) use ($author) {
-                        return !(is_array($config) && isset($config['author']) && $config['author'] === $author);
-                    });
-                    // Re-index array
-                    $settings = array_values($settings);
-                    
-                    // Update the database
-                    $stmt = $pdo->prepare("UPDATE serenum_config SET settings = :settings WHERE id = :id");
-                    $stmt->execute([
-                        ':settings' => json_encode($settings),
-                        ':id' => $id
-                    ]);
-                    
-                    echo json_encode(['success' => true, 'message' => 'Configuration deleted successfully!']);
-                    exit;
-                }
+            $id = isset($_POST['id']) ? (int)$_POST['id'] : 0;
+            $index = isset($_POST['index']) ? (int)$_POST['index'] : -1;
+            $expectedAuthor = trim((string)($_POST['expected_author'] ?? ''));
+            if ($id <= 0 || $index < 0 || $expectedAuthor === '') {
+                throw new RuntimeException('Invalid delete request. Refresh the page and try again.');
             }
-            
-            echo json_encode(['success' => false, 'message' => 'Invalid request']);
+
+            $pdo->beginTransaction();
+            $stmt = $pdo->prepare("SELECT settings FROM serenum_config WHERE id = :id FOR UPDATE");
+            $stmt->execute([':id' => $id]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row) throw new RuntimeException('Configuration storage was not found.');
+
+            $settings = json_decode($row['settings'] ?? '[]', true);
+            if (!is_array($settings)) $settings = [];
+            // Keep action indexes identical to the server-rendered card indexes.
+            $settings = repairSettings($settings);
+            if (!array_key_exists($index, $settings) || !is_array($settings[$index])) {
+                throw new RuntimeException('Configuration index no longer exists. Refresh and try again.');
+            }
+
+            // A stale/mismatched card must never delete a different author's record.
+            $actualAuthor = resolveSerenumAuthorLabel($settings[$index]);
+            if (!hash_equals($expectedAuthor, $actualAuthor)) {
+                throw new RuntimeException('The selected record no longer matches this card. No record was deleted. Refresh the page and try again.');
+            }
+
+            array_splice($settings, $index, 1);
+            $stmt = $pdo->prepare("UPDATE serenum_config SET settings = :settings WHERE id = :id");
+            $stmt->execute([
+                ':settings' => json_encode($settings, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_THROW_ON_ERROR),
+                ':id' => $id
+            ]);
+            $pdo->commit();
+            echo json_encode(['success' => true, 'message' => 'Configuration deleted successfully.']);
             exit;
-        } catch(Exception $e) {
-            echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+        } catch (Throwable $e) {
+            if (isset($pdo) && $pdo->inTransaction()) $pdo->rollBack();
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()]);
             exit;
         }
     }
 
-    // Handle Get Config for Editing
+    // Handle Get Config for Editing by exact index; author is only a legacy fallback.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['get_config'])) {
+        header('Content-Type: application/json; charset=utf-8');
         try {
-            $author = isset($_POST['author']) ? $_POST['author'] : '';
-            
-            if ($author) {
-                // Get current data
-                $stmt = $pdo->query("SELECT id, settings, accounts_url, captions, time_orders, filters, settings_dynamic_fields FROM serenum_config ORDER BY id DESC LIMIT 1");
-                if ($row = $stmt->fetch(PDO::FETCH_ASSOC)) {
-                    $settings = json_decode($row['settings'], true) ?: [];
-                    if (!is_array($settings)) $settings = [];
-                    $settings = repairSettings($settings);
-                    
-                    $foundConfig = null;
-                    foreach ($settings as $config) {
-                        if (is_array($config) && isset($config['author']) && $config['author'] === $author) {
-                            $foundConfig = $config;
-                            break;
-                        }
-                    }
-                    
-                    if ($foundConfig) {
-                        echo json_encode(['success' => true, 'config' => $foundConfig]);
-                        exit;
+            $index = isset($_POST['index']) && $_POST['index'] !== '' ? (int)$_POST['index'] : null;
+            $author = trim((string)($_POST['author'] ?? ''));
+            $stmt = $pdo->query("SELECT id, settings FROM serenum_config ORDER BY id DESC LIMIT 1");
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row) throw new RuntimeException('Configuration storage was not found.');
+            $settings = json_decode($row['settings'] ?? '[]', true);
+            if (!is_array($settings)) $settings = [];
+            // Keep the edit lookup index aligned with the page's card indexes.
+            $settings = repairSettings($settings);
+            $foundConfig = null;
+            if ($index !== null && isset($settings[$index]) && is_array($settings[$index])) {
+                $foundConfig = $settings[$index];
+            } elseif ($index === null && $author !== '') {
+                foreach ($settings as $config) {
+                    if (is_array($config) && ($config['author'] ?? '') === $author) {
+                        $foundConfig = $config;
+                        break;
                     }
                 }
             }
-            
-            echo json_encode(['success' => false, 'message' => 'Configuration not found']);
-            exit;
-        } catch(Exception $e) {
-            echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
+            if ($foundConfig !== null) {
+                echo json_encode(['success' => true, 'config' => $foundConfig, 'index' => $index]);
+                exit;
+            }
+            throw new RuntimeException('Configuration not found.');
+        } catch (Throwable $e) {
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()]);
             exit;
         }
     }
@@ -496,9 +697,6 @@
         if (!isset($config['status']) || empty($config['status'])) {
             $config['status'] = 'pending';
         }
-        if (!isset($config['engine']) || empty($config['engine'])) {
-            $config['engine'] = 'automation';
-        }
         if (!isset($config['author_caption']) || empty($config['author_caption'])) {
             $config['author_caption'] = [];
         }
@@ -520,6 +718,10 @@
             }
         }
     }
+    // IMPORTANT: break the reference before iterating this array again.
+    // Without this, the next foreach can overwrite the final record, causing
+    // a card's displayed author to differ from configData.settings at that index.
+    unset($config);
 
     // ===== GROUP CONFIGURATIONS BY STATUS (using root-level status) =====
     $grouped_configs = [
@@ -528,15 +730,24 @@
         'aborted' => []
     ];
 
-    foreach ($configurations as $index => $config) {
+    foreach ($configurations as $index => $configRecord) {
         // Get status from root level, NOT from dynamic_values
-        $status = isset($config['status']) ? strtolower($config['status']) : 'pending';
+        $status = isset($configRecord['status']) ? strtolower((string)$configRecord['status']) : 'pending';
         if (!isset($grouped_configs[$status])) {
             $grouped_configs[$status] = [];
         }
-        // Store the index with the config for later reference
-        $config['_index'] = $index;
-        $grouped_configs[$status][] = $config;
+        // Store the original canonical array index with the record.
+        $configRecord['_index'] = $index;
+        $grouped_configs[$status][] = $configRecord;
+    }
+
+    // Display newest submissions first in every status tab.
+    // `_index` remains the original position in the canonical settings array,
+    // so Copy, Edit, Delete and Status actions continue targeting the correct row.
+    foreach (array_keys($grouped_configs) as $statusKey) {
+        usort($grouped_configs[$statusKey], static function ($left, $right) {
+            return ((int)($right['_index'] ?? -1)) <=> ((int)($left['_index'] ?? -1));
+        });
     }
 
     // Status labels for display
@@ -567,7 +778,7 @@
             height: 100%; 
             overflow: hidden;
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; 
-            background: #ffffff;
+            background: #f8fafc;
         }
         
         input, select, textarea {
@@ -581,18 +792,18 @@
             left: 0;
             right: 0;
             z-index: 1000;
-            background: linear-gradient(135deg, #2ecc71 0%, #1abc9c 50%, #3498db 100%);
+            background: linear-gradient(135deg, #00695c 0%, #00897b 50%, #26a69a 100%);
             color: white;
-            padding: 15px 30px;
+            padding: 12px 20px;
+            box-shadow: 0 4px 20px rgba(0,105,92,0.3);
+            height: 60px;
             display: flex;
             justify-content: space-between;
             align-items: center;
-            box-shadow: 0 4px 20px rgba(46,204,113,0.3);
-            height: 65px;
         }
         
         .main-header h1 { 
-            font-size: 22px; 
+            font-size: 20px; 
             font-weight: 600; 
             text-shadow: 0 2px 4px rgba(0,0,0,0.1);
         }
@@ -601,78 +812,191 @@
             display: flex;
             gap: 10px;
             align-items: center;
-            margin-right: -15px;
         }
         
-        .main-header .header-back {
-            background: rgba(255,255,255,0.25);
+        .main-header .header-btn {
+            background: rgba(255,255,255,0.2);
             border: 1px solid rgba(255,255,255,0.2);
             color: white;
-            padding: 8px 20px;
-            border-radius: 8px 0 0 8px;
+            padding: 6px 16px;
+            border-radius: 8px;
             cursor: pointer;
-            font-size: 14px;
+            font-size: 13px;
             transition: all 0.3s;
             backdrop-filter: blur(5px);
-            margin-right: 5px;
-            height: auto;
+            white-space: nowrap;
         }
         
-        .main-header .header-back:hover {
-            background: rgba(255,255,255,0.4);
+        .main-header .header-btn:hover {
+            background: rgba(255,255,255,0.35);
             transform: translateY(-2px);
         }
         
-        /* ===== TABS ===== */
-        .tabs {
+        /* ===== MAIN TABS - HORIZONTAL SCROLL ===== */
+        .main-tabs {
             position: fixed;
-            top: 65px;
+            top: 60px;
             left: 0;
             right: 0;
             z-index: 999;
-            display: none;
-            background: rgba(255,255,255,0.95);
-            border-bottom: 2px solid #e0f0e8;
-            box-shadow: 0 2px 15px rgba(46,204,113,0.1);
-            backdrop-filter: blur(10px);
-            padding: 10px 0;
+            background: white;
+            border-bottom: 2px solid #e5e7eb;
+            display: flex;
+            overflow-x: auto;
+            overflow-y: hidden;
+            white-space: nowrap;
+            scrollbar-width: thin;
+            -webkit-overflow-scrolling: touch;
+            align-items: stretch;
+            min-height: 60px;
+            height: 60px;
+            flex-wrap: nowrap;
+            padding: 0 10px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
         }
         
-        .tabs.visible {
+        .main-tabs::-webkit-scrollbar {
+            height: 3px;
+        }
+        
+        .main-tabs::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
+        }
+        
+        .main-tabs::-webkit-scrollbar-thumb {
+            background: #00695c;
+            border-radius: 10px;
+        }
+        
+        .main-tabs::-webkit-scrollbar-thumb:hover {
+            background: #004d40;
+        }
+        
+        .main-tab-btn {
+            padding: 10px 20px;
+            background: none;
+            border: none;
+            font-size: 14px;
+            font-weight: 500;
+            color: #6b7280;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-bottom: 3px solid transparent;
+            margin-bottom: -2px;
+            white-space: nowrap;
+            flex-shrink: 0;
+            min-height: 60px;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .main-tab-btn:hover {
+            color: #1a1a2e;
+            background: #f3f4f6;
+        }
+        
+        .main-tab-btn.active {
+            color: #00695c;
+            border-bottom-color: #00695c;
+        }
+        
+        .main-tab-btn .badge {
+            display: inline-block;
+            background: #e5e7eb;
+            color: #4b5563;
+            padding: 1px 8px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .main-tab-btn.active .badge {
+            background: #00695c;
+            color: white;
+        }
+        
+        .main-tab-btn .status-dot {
+            display: inline-block;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            margin-right: 4px;
+            flex-shrink: 0;
+        }
+        
+        /* ===== SUB TABS (for Setup Config) ===== */
+        .sub-tabs {
+            display: none;
+            background: #f8fafc;
+            border-bottom: 1px solid #e5e7eb;
+            padding: 0 10px;
+            overflow-x: auto;
+            overflow-y: hidden;
+            white-space: nowrap;
+            scrollbar-width: thin;
+            -webkit-overflow-scrolling: touch;
+            align-items: stretch;
+            height: 60px;
+            flex-wrap: nowrap;
+            position: sticky;
+            top: 108px;
+            z-index: 100;
+        }
+        
+        .sub-tabs.visible {
             display: flex;
         }
         
-        .tab-btn { 
-            padding: 16px 25px;
-            background: none; 
-            border: none; 
-            font-size: 15px; 
-            font-weight: 500; 
-            color: #5a7a8a; 
-            cursor: pointer; 
-            transition: all 0.3s; 
-            border-bottom: 3px solid transparent;
-            flex: 1;
-            text-align: center;
-            margin: 6px 0;
+        .sub-tabs::-webkit-scrollbar {
+            height: 2px;
         }
         
-        .tab-btn:hover { 
-            background: rgba(46,204,113,0.05); 
-            color: #2ecc71;
-            border-radius: 8px 8px 0 0;
+        .sub-tabs::-webkit-scrollbar-track {
+            background: #f1f1f1;
+            border-radius: 10px;
         }
-        .tab-btn.active { 
-            color: #2ecc71; 
-            border-bottom-color: #2ecc71; 
-            background: rgba(46,204,113,0.08);
-            border-radius: 8px 8px 0 0;
+        
+        .sub-tabs::-webkit-scrollbar-thumb {
+            background: #00695c;
+            border-radius: 10px;
+        }
+        
+        .sub-tab-btn {
+            margin-top: 10px;
+            padding: 8px 16px;
+            background: none;
+            border: none;
+            font-size: 13px;
+            font-weight: 500;
+            color: #6b7280;
+            cursor: pointer;
+            transition: all 0.3s;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -1px;
+            white-space: nowrap;
+            flex-shrink: 0;
+            height: 60px;
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+        }
+        
+        .sub-tab-btn:hover {
+            color: #1a1a2e;
+            background: rgba(0,105,92,0.05);
+        }
+        
+        .sub-tab-btn.active {
+            color: #00695c;
+            border-bottom-color: #00695c;
         }
         
         /* ===== SCROLLABLE BODY ===== */
         .scroll-body {
             position: fixed;
-            top: 65px;
+            top: 108px;
             left: 0;
             right: 0;
             bottom: 0;
@@ -681,10 +1005,11 @@
             padding: 20px;
             padding-bottom: 100px;
             scroll-behavior: smooth;
+            background: #f8fafc;
         }
         
-        .scroll-body.tabs-visible {
-            top: 145px;
+        .scroll-body.setup-visible {
+            top: 148px;
         }
         
         .scroll-body::-webkit-scrollbar {
@@ -697,200 +1022,784 @@
         }
         
         .scroll-body::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, #2ecc71, #3498db);
+            background: linear-gradient(135deg, #00695c, #26a69a);
             border-radius: 10px;
         }
         
         .scroll-body::-webkit-scrollbar-thumb:hover {
-            background: linear-gradient(135deg, #27ae60, #2980b9);
+            background: linear-gradient(135deg, #004d40, #00897b);
         }
         
-        /* ===== MAIN DASHBOARD ===== */
-        .dashboard-container {
-            max-width: 1400px;
+        /* ===== CONTENT AREAS ===== */
+        .tab-content-area {
+            display: none;
+            max-width: 1120px;
+            width: 100%;
             margin: 0 auto;
         }
         
-        .dashboard-title {
-            font-size: 28px;
-            font-weight: 700;
-            color: #2c3e50;
-            margin-bottom: 30px;
-            display: flex;
-            align-items: center;
-            gap: 12px;
+        .tab-content-area.active {
+            display: block;
         }
         
-        .dashboard-title .subtitle {
-            font-size: 16px;
-            font-weight: 400;
-            color: #5a7a8a;
-            margin-left: 10px;
-        }
-        
-        .config-grid {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 20px;
-            margin-top: 20px;
-        }
-        
-        /* ===== ALL CARDS SAME BACKGROUND ===== */
-        .config-card {
-            background: linear-gradient(145deg, #ffffff, #f0faf5);
-            border-radius: 20px;
-            padding: 30px 25px;
-            box-shadow: 0 8px 32px rgba(13, 14, 14, 0.08), 0 2px 8px rgba(0,0,0,0.04);
-            cursor: pointer;
-            transition: all 0.4s cubic-bezier(0.165, 0.84, 0.44, 1);
-            min-height: 160px;
+        /* ===== CONFIG LIST ITEMS ===== */
+        .config-list {
             display: flex;
             flex-direction: column;
-            justify-content: center;
+            gap: 10px;
+            width: 100%;
+            max-width: 1000px;
+            margin: 0 auto;
+        }
+        
+        .config-item {
+            width: 100%;
+            min-width: 0;
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 14px 16px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.05);
+            border-left: 4px solid #00695c;
+            transition: box-shadow 0.2s ease, transform 0.2s ease;
+            border-top: 1px solid rgba(0,0,0,0.04);
+            border-right: 1px solid rgba(0,0,0,0.04);
+            border-bottom: 1px solid rgba(0,0,0,0.04);
+        }
+        
+        .config-item:hover {
+            box-shadow: 0 4px 14px rgba(0,0,0,0.07);
+            transform: translateX(2px);
+        }
+        
+        .config-item .item-header {
+            display: flex;
+            justify-content: space-between;
             align-items: center;
-            text-align: center;
-            position: relative;
-            overflow: hidden;
-            border: 1px solid rgba(46,204,113,0.08);
-        }
-        
-        .config-card::before {
-            content: '';
-            position: absolute;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: linear-gradient(135deg, rgba(46,204,113,0.03), rgba(52,152,219,0.03));
-            opacity: 0;
-            transition: opacity 0.4s ease;
-            border-radius: 20px;
-        }
-        
-        .config-card:hover {
-            transform: translateY(-6px);
-            box-shadow: 0 12px 40px rgba(46,204,113,0.15), 0 4px 12px rgba(0,0,0,0.06);
-            border-color: rgba(46,204,113,0.15);
-        }
-        
-        .config-card:hover::before {
-            opacity: 1;
-        }
-        
-        /* ===== ADD NEW CARD - SAME BACKGROUND ===== */
-        .config-card.add-new {
-            background: linear-gradient(145deg, #ffffff, #f0faf5);
-            color: #2c3e50;
-            min-height: 160px;
-            padding: 30px 25px;
-            border: 1px solid rgba(46,204,113,0.08);
-        }
-        
-        .config-card.add-new .card-icon {
-            font-size: 40px;
             margin-bottom: 8px;
-            color: #2ecc71;
+            flex-wrap: wrap;
+            gap: 7px;
         }
         
-        .config-card.add-new .card-title {
-            font-size: 20px;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-        
-        .config-card.add-new .card-subtitle {
+        .config-item .item-author {
+            min-width: 0;
             font-size: 14px;
-            opacity: 0.7;
-            margin-top: 5px;
-            color: #5a7a8a;
+            font-weight: 650;
+            color: #1a1a2e;
+            overflow-wrap: anywhere;
         }
         
-        /* ===== SETUP CARD - SAME BACKGROUND ===== */
-        .config-card.setup-card {
-            background: linear-gradient(145deg, #ffffff, #f0faf5);
-            color: #2c3e50;
-            min-height: 160px;
-            padding: 30px 25px;
-            border: 1px solid rgba(46,204,113,0.08);
-        }
-        
-        .config-card.setup-card .card-icon {
-            font-size: 40px;
-            margin-bottom: 8px;
-            color: #3498db;
-        }
-        
-        .config-card.setup-card .card-title {
-            font-size: 20px;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-        
-        .config-card.setup-card .card-subtitle {
-            font-size: 14px;
-            opacity: 0.7;
-            margin-top: 5px;
-            color: #5a7a8a;
-        }
-        
-        /* ===== STATUS CARDS - SAME BACKGROUND ===== */
-        .config-card.status-card {
-            padding: 30px 25px;
-            min-height: 160px;
-            background: linear-gradient(145deg, #ffffff, #f0faf5);
-        }
-        
-        .config-card.status-card .card-icon {
-            font-size: 32px;
-            margin-bottom: 8px;
-        }
-        
-        .config-card.status-card .card-title {
-            font-size: 18px;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-        
-        .config-card.status-card .card-count {
-            font-size: 14px;
-            color: #5a7a8a;
-            margin-top: 5px;
-        }
-        
-        .config-card.status-card .card-status-badge {
-            position: absolute;
-            top: 12px;
-            right: 12px;
-            padding: 3px 14px;
+        .config-item .item-status {
+            padding: 3px 10px;
             border-radius: 20px;
             font-size: 11px;
             font-weight: 600;
             color: white;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
+            white-space: nowrap;
         }
         
-        .config-card.status-card.pending .card-status-badge {
-            background: linear-gradient(135deg, #f39c12, #e67e22);
+        /* ===== STATUS ENTRY DETAILS ===== */
+        .status-copy-toolbar {
+            display: flex;
+            justify-content: flex-end;
+            align-items: center;
+            gap: 8px;
+            flex-wrap: wrap;
+            width: 100%;
+            max-width: 1000px;
+            margin: 0 auto 10px;
         }
-        .config-card.status-card.completed .card-status-badge {
-            background: linear-gradient(135deg, #2ecc71, #27ae60);
+
+        .status-copy-button {
+            border: 1px solid #d1d5db;
+            background: #ffffff;
+            color: #374151;
+            border-radius: 7px;
+            padding: 6px 10px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: background .2s ease, border-color .2s ease, transform .2s ease;
+            white-space: nowrap;
         }
-        .config-card.status-card.aborted .card-status-badge {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
+
+        .status-copy-button:hover {
+            background: #f0fdfa;
+            border-color: #0f766e;
+            color: #0f766e;
         }
-        .config-card.status-card.incomplete .card-status-badge {
-            background: linear-gradient(135deg, #95a5a6, #7f8c8d);
+
+        .status-copy-button:active {
+            transform: translateY(1px);
+        }
+
+        .copy-button-copied {
+            background: #ecfdf5 !important;
+            border-color: #86efac !important;
+            color: #047857 !important;
+        }
+
+        .config-item .item-details {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(min(100%, 205px), 1fr));
+            gap: 8px;
+            margin-top: 8px;
+            width: 100%;
+        }
+
+        .config-item .item-details .detail-field {
+            min-width: 0;
+            max-width: 100%;
+            padding: 8px 9px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            background: #f9fbfc;
+        }
+
+        .config-item .item-details .detail-label {
+            min-width: 0;
+            margin-bottom: 5px;
+            color: #64748b;
+            font-size: 10px;
+            font-weight: 700;
+            letter-spacing: .4px;
+            line-height: 1.35;
+            text-transform: uppercase;
+            overflow-wrap: anywhere;
+        }
+
+        .config-item .item-details .detail-value {
+            display: block;
+            width: 100%;
+            min-width: 0;
+            color: #1e293b;
+            font-size: 12px;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            max-width: 100%;
+            max-height: 88px;
+            overflow-y: auto;
+            overflow-x: auto;
+            padding: 6px 8px;
+            margin: 0;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            background: #ffffff;
+            white-space: pre-wrap;
+        }
+
+        /* Long text and JSON stay inside compact, independently scrollable fields. */
+        .config-item .item-details .detail-value.json-value {
+            max-height: 128px;
+            overflow: auto;
+            color: #334155;
+            font-family: Consolas, Monaco, 'Courier New', monospace;
+            font-size: 10.5px;
+            line-height: 1.4;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            tab-size: 2;
+        }
+
+        .config-item .item-details .detail-value::-webkit-scrollbar {
+            width: 5px;
+            height: 5px;
+        }
+
+        .config-item .item-details .detail-value::-webkit-scrollbar-track {
+            background: rgba(0,0,0,0.05);
+            border-radius: 5px;
+        }
+
+        .config-item .item-details .detail-value::-webkit-scrollbar-thumb {
+            background: linear-gradient(135deg, #00695c, #26a69a);
+            border-radius: 5px;
+        }
+
+        .config-item .operation-status-panel {
+            margin-top: 9px;
+            padding: 9px 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            background: #f8fafc;
+        }
+
+        .config-item .operation-status-panel .detail-value {
+            display: block;
+            width: 100%;
+            min-width: 0;
+            margin-top: 4px;
+            color: #334155;
+            font-size: 11px;
+            line-height: 1.45;
+            overflow-wrap: anywhere;
+            word-break: break-word;
+            max-height: 88px;
+            overflow-y: auto;
+            overflow-x: auto;
+            padding: 6px 8px;
+            border: 1px solid #e2e8f0;
+            border-radius: 6px;
+            background: #ffffff;
+            white-space: pre-wrap;
+        }
+
+        .config-item .item-actions {
+            display: flex;
+            align-items: center;
+            gap: 7px;
+            margin-top: 10px;
+            flex-wrap: wrap;
         }
         
-        /* ===== DETAIL VIEW ===== */
-        .detail-view {
+        .config-item .item-actions .btn {
+            padding: 6px 10px;
+            border: none;
+            border-radius: 7px;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+
+        .status-select-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            margin-left: auto;
+            color: #64748b;
+            font-size: 11px;
+            font-weight: 600;
+        }
+
+        .config-item .status-select {
+            min-width: 112px;
+            padding: 6px 24px 6px 9px;
+            border: 1px solid #d1d5db;
+            border-radius: 7px;
+            background: #ffffff;
+            color: #334155;
+            font-size: 11px;
+            font-weight: 600;
+            cursor: pointer;
+        }
+
+        .config-item .status-select:focus {
+            outline: none;
+            border-color: #0f766e;
+            box-shadow: 0 0 0 2px rgba(15,118,110,.12);
+        }
+        
+        .config-item .item-actions .btn-edit {
+            background: linear-gradient(135deg, #3498db, #2ecc71);
+            color: white;
+            box-shadow: 0 2px 10px rgba(46,204,113,0.2);
+        }
+        
+        .config-item .item-actions .btn-edit:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(46,204,113,0.3);
+        }
+        
+        .config-item .item-actions .btn-delete {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+            box-shadow: 0 2px 10px rgba(239,68,68,0.2);
+        }
+        
+        .config-item .item-actions .btn-delete:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 16px rgba(239,68,68,0.3);
+        }
+        
+        .config-item .item-actions .btn-status {
+            background: linear-gradient(135deg, #f3f4f6, #e5e7eb);
+            color: #1a1a2e;
+        }
+        
+        .config-item .item-actions .btn-status:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+        }
+        
+        .operation-status-badge {
+            display: inline-block;
+            padding: 2px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        
+        .operation-status-badge.running {
+            background: #48bb78;
+            color: white;
+        }
+        
+        .operation-status-badge.paused {
+            background: #f6ad55;
+            color: white;
+        }
+        
+        .operation-status-badge.stopped {
+            background: #fc8181;
+            color: white;
+        }
+        
+        .operation-status-badge.completed {
+            background: #4299e1;
+            color: white;
+        }
+        
+        .operation-status-badge.failed {
+            background: #e53e3e;
+            color: white;
+        }
+        
+        /* ===== EMPTY STATE ===== */
+        .empty-state {
+            text-align: center;
+            padding: 60px 20px;
+            color: #6b7280;
+        }
+        
+        .empty-state .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        
+        .empty-state h3 {
+            font-size: 20px;
+            color: #1a1a2e;
+            margin-bottom: 8px;
+        }
+        
+        /* ===== SETUP CONTAINER ===== */
+        .setup-container {
+            background: #ffffff;
+            border-radius: 16px;
+            padding: 24px;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.06);
+            border: 1px solid rgba(0,0,0,0.04);
+        }
+        
+        .setup-container .section-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+            gap: 10px;
+        }
+        
+        .setup-container .section-header h2 {
+            font-size: 20px;
+            color: #1a1a2e;
+        }
+        
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+        
+        .btn-primary {
+            background: linear-gradient(135deg, #00695c, #26a69a);
+            color: white;
+            box-shadow: 0 4px 20px rgba(0,105,92,0.25);
+        }
+        
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(0,105,92,0.35);
+        }
+        
+        .btn-success {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+            box-shadow: 0 4px 20px rgba(16,185,129,0.25);
+        }
+        
+        .btn-success:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(16,185,129,0.35);
+        }
+        
+        .btn-danger {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
+            color: white;
+            box-shadow: 0 4px 20px rgba(239,68,68,0.2);
+        }
+        
+        .btn-danger:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(239,68,68,0.3);
+        }
+        
+        .btn-secondary {
+            background: #f3f4f6;
+            color: #1a1a2e;
+            border: 1px solid #e5e7eb;
+        }
+        
+        .btn-secondary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 4px 12px rgba(0,0,0,0.06);
+        }
+        
+        .btn-warning {
+            background: linear-gradient(135deg, #f59e0b, #d97706);
+            color: white;
+            box-shadow: 0 4px 20px rgba(245,158,11,0.25);
+        }
+        
+        .btn-warning:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 30px rgba(245,158,11,0.35);
+        }
+        
+        .btn-sm {
+            padding: 6px 14px;
+            font-size: 12px;
+        }
+        
+        /* ===== FORM GROUPS ===== */
+        .form-group {
+            margin-bottom: 18px;
+        }
+        
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 500;
+            color: #1a1a2e;
+            font-size: 14px;
+        }
+        
+        .form-group input,
+        .form-group select,
+        .form-group textarea {
+            width: 100%;
+            padding: 10px 14px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s;
+            background: #fafafa;
+            box-sizing: border-box;
+        }
+        
+        .form-group input:focus,
+        .form-group select:focus,
+        .form-group textarea:focus {
+            border-color: #00695c;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(0,105,92,0.1);
+            background: white;
+        }
+        
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 20px;
+        }
+        
+        .form-row-3 {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 20px;
+        }
+        
+        .form-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+            flex-wrap: wrap;
+        }
+        
+        /* ===== ITEM ROWS ===== */
+        .item-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 12px 15px;
+            border-bottom: 1px solid #e8f0ec;
+        }
+        
+        .item-row:last-child {
+            border-bottom: none;
+        }
+        
+        .item-row .item-info {
+            display: flex;
+            gap: 20px;
+            align-items: center;
+            flex: 1;
+            flex-wrap: wrap;
+        }
+        
+        .item-row .item-info .key {
+            font-weight: 600;
+            color: #1a1a2e;
+            min-width: 120px;
+        }
+        
+        .item-row .item-info .value {
+            color: #6b7280;
+            word-break: break-word;
+            overflow-wrap: break-word;
+            flex: 1;
+        }
+        
+        /* ===== CAPTION ITEMS ===== */
+        .caption-item {
+            background: #f8fafc;
+            padding: 12px 15px;
+            border-radius: 10px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border: 1px solid #e5e7eb;
+        }
+        
+        .caption-item:hover {
+            background: #f0faf5;
+            border-color: #00695c;
+        }
+        
+        .caption-item .caption-content {
+            flex: 1;
+        }
+        
+        .caption-item .caption-author {
+            font-weight: 600;
+            color: #00695c;
+            margin-right: 15px;
+        }
+        
+        /* ===== TIME ORDER ITEMS ===== */
+        .timeorder-item {
+            background: #f8fafc;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            border: 1px solid #e5e7eb;
+        }
+        
+        .timeorder-item .timeorder-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+        
+        .timeorder-item .timeorder-header .key {
+            font-weight: 600;
+            color: #1a1a2e;
+            font-size: 16px;
+        }
+        
+        .timeorder-item .time-list {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 5px;
+            margin-top: 10px;
+        }
+        
+        .timeorder-item .time-list .time-badge {
+            background: white;
+            padding: 8px 12px;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            font-size: 14px;
+            text-align: center;
+            color: #1a1a2e;
+        }
+        
+        .timeorder-item .time-list .time-badge.header {
+            background: linear-gradient(135deg, #00695c, #26a69a);
+            color: white;
+            font-weight: 600;
+            border: none;
+        }
+        
+        .timeorder-item .add-time-area {
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #e5e7eb;
+        }
+        
+        /* ===== DYNAMIC FIELD ITEMS ===== */
+        .dynamic-field-item {
+            background: #f8fafc;
+            padding: 15px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            border: 1px solid #e5e7eb;
+            transition: all 0.3s;
+        }
+        
+        .dynamic-field-item:hover {
+            border-color: #00695c;
+            box-shadow: 0 2px 12px rgba(0,105,92,0.08);
+        }
+        
+        .dynamic-field-item .field-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 10px;
+        }
+
+        .dynamic-field-reorder-controls {
+            display: inline-flex;
+            align-items: center;
+            gap: 5px;
+            flex-shrink: 0;
+        }
+
+        .dynamic-field-position {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 25px;
+            height: 25px;
+            padding: 0 6px;
+            border-radius: 7px;
+            background: #e8f5f3;
+            color: #00695c;
+            font-size: 11px;
+            font-weight: 700;
+        }
+
+        .dynamic-field-move-button {
+            min-width: 29px;
+            height: 29px;
+            padding: 3px 7px;
+            border: 1px solid #d1d5db;
+            border-radius: 7px;
+            background: #ffffff;
+            color: #334155;
+            font-size: 15px;
+            line-height: 1;
+            cursor: pointer;
+        }
+
+        .dynamic-field-move-button:hover:not(:disabled) {
+            border-color: #0f766e;
+            background: #f0fdfa;
+            color: #0f766e;
+        }
+
+        .dynamic-field-move-button:disabled {
+            opacity: .35;
+            cursor: not-allowed;
+        }
+
+        #dynamic_fields_list.is-saving-order {
+            opacity: .65;
+            pointer-events: none;
+        }
+        
+        .dynamic-field-item .field-name {
+            font-weight: 600;
+            color: #1a1a2e;
+            font-size: 16px;
+        }
+        
+        .dynamic-field-item .field-type-badge {
+            background: linear-gradient(135deg, #00695c, #26a69a);
+            color: white;
+            padding: 2px 12px;
+            border-radius: 12px;
+            font-size: 12px;
+            font-weight: 500;
+        }
+        
+        .dynamic-field-item .default-values {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 5px;
+            margin-top: 8px;
+        }
+        
+        .dynamic-field-item .default-values .value-tag {
+            background: white;
+            padding: 4px 12px;
+            border-radius: 12px;
+            border: 1px solid #e5e7eb;
+            font-size: 13px;
+            color: #1a1a2e;
+        }
+        
+        /* ===== GROUP ITEMS ===== */
+        .group-item {
+            background: linear-gradient(135deg, #e8f4f8, #d4e9f0);
+            padding: 8px 15px;
+            border-radius: 20px;
+            display: inline-block;
+            margin: 5px;
+            color: #1a1a2e;
+        }
+        
+        .group-item .remove-group {
+            cursor: pointer;
+            margin-left: 8px;
+            color: #ef4444;
+            font-weight: 600;
+        }
+        
+        /* ===== FLOATING ACTION BUTTON ===== */
+        .fab {
+            position: fixed;
+            bottom: 30px;
+            right: 30px;
+            z-index: 999;
+            width: 60px;
+            height: 60px;
+            border-radius: 50%;
+            background: linear-gradient(135deg, #00695c, #26a69a);
+            color: white;
+            border: none;
+            font-size: 32px;
+            font-weight: 300;
+            cursor: pointer;
+            box-shadow: 0 6px 24px rgba(0,105,92,0.4);
+            transition: all 0.3s cubic-bezier(0.165, 0.84, 0.44, 1);
             display: none;
-            max-width: 1200px;
-            margin: 0 auto;
-            padding: 0 0 20px 0;
+            align-items: center;
+            justify-content: center;
         }
         
-        .detail-view.active {
+        .fab.visible {
+            display: flex;
+        }
+        
+        .fab:hover {
+            transform: scale(1.1) rotate(90deg);
+            box-shadow: 0 8px 32px rgba(0,105,92,0.5);
+        }
+        
+        .fab:active {
+            transform: scale(0.95);
+        }
+        
+        /* ===== ADD CONFIG VIEW ===== */
+        #addConfigView {
+            display: none;
+            max-width: 900px;
+            margin: 0 auto;
+        }
+        
+        #addConfigView.active {
             display: block;
         }
         
@@ -904,12 +1813,12 @@
         
         .btn-back {
             padding: 10px 25px;
-            background: linear-gradient(135deg, #e8f4f8, #d4e9f0);
-            border: none;
+            background: white;
+            border: 1px solid #e5e7eb;
             border-radius: 10px;
             font-size: 16px;
             font-weight: 500;
-            color: #2c3e50;
+            color: #1a1a2e;
             cursor: pointer;
             transition: all 0.3s;
             display: flex;
@@ -918,342 +1827,22 @@
         }
         
         .btn-back:hover {
-            background: linear-gradient(135deg, #d4e9f0, #b8dce8);
-            transform: translateX(-3px);
-            box-shadow: 0 4px 12px rgba(46,204,113,0.15);
-        }
-        
-        .detail-title {
-            font-size: 24px;
-            font-weight: 700;
-            color: #2c3e50;
-        }
-        
-        .detail-title .count {
-            font-size: 16px;
-            font-weight: 400;
-            color: #5a7a8a;
-            margin-left: 10px;
-        }
-        
-        .config-list {
-            display: flex;
-            flex-direction: column;
-            gap: 20px;
-        }
-        
-        .config-item {
-            background: linear-gradient(145deg, #ffffff, #f8fcf9);
-            border-radius: 16px;
-            padding: 25px;
-            box-shadow: 0 4px 20px rgba(0,0,0,0.05);
-            border-left: 5px solid #2ecc71;
-            transition: all 0.3s;
-        }
-        
-        .config-item:hover {
-            box-shadow: 0 8px 30px rgba(46,204,113,0.1);
-            transform: translateX(5px);
-        }
-        
-        .config-item .item-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-            flex-wrap: wrap;
-            gap: 10px;
-        }
-        
-        .config-item .item-author {
-            font-size: 18px;
-            font-weight: 600;
-            color: #2c3e50;
-        }
-        
-        .config-item .item-status {
-            padding: 4px 14px;
-            border-radius: 20px;
-            font-size: 13px;
-            font-weight: 600;
-            color: white;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
-        }
-        
-        .config-item .item-details {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 10px 20px;
-            margin-top: 10px;
-        }
-        
-        .config-item .item-details .detail-label {
-            font-size: 12px;
-            color: #8aa8b8;
-            text-transform: uppercase;
-            font-weight: 600;
-            letter-spacing: 0.5px;
-        }
-        
-        /* ===== CONFIG ITEM DETAILS - SCROLLABLE FIELDS ===== */
-        .config-item .item-details .detail-value {
-            font-size: 14px;
-            color: #2c3e50;
-            word-break: break-word;
-            overflow-wrap: break-word;
-            max-width: 100%;
-            line-height: 1.5;
-            max-height: 120px;
-            overflow-y: auto;
-            padding-right: 5px;
-        }
-
-        /* Custom scrollbar for detail values */
-        .config-item .item-details .detail-value::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .config-item .item-details .detail-value::-webkit-scrollbar-track {
-            background: rgba(0,0,0,0.05);
-            border-radius: 4px;
-        }
-
-        .config-item .item-details .detail-value::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, #2ecc71, #3498db);
-            border-radius: 4px;
-        }
-
-        .config-item .item-details .detail-value::-webkit-scrollbar-thumb:hover {
-            background: linear-gradient(135deg, #27ae60, #2980b9);
-        }
-
-        /* For Firefox */
-        .config-item .item-details .detail-value {
-            scrollbar-width: thin;
-            scrollbar-color: #2ecc71 rgba(0,0,0,0.05);
-        }
-
-        /* Ensure the field container doesn't overflow */
-        .config-item .item-details {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 10px 20px;
-            margin-top: 10px;
-            max-width: 100%;
-            overflow: hidden;
-        }
-
-        /* Make sure long JSON strings wrap properly */
-        .config-item .item-details .detail-value pre,
-        .config-item .item-details .detail-value code {
-            white-space: pre-wrap;
-            word-wrap: break-word;
-            max-width: 100%;
-            font-family: monospace;
-            font-size: 12px;
-            background: #f8fcf9;
-            padding: 4px 8px;
-            border-radius: 4px;
-            margin: 0;
-        }
-
-        /* Optional: Add a subtle gradient fade for long content */
-        .config-item .item-details .detail-value.long-content {
-            position: relative;
-        }
-
-        .config-item .item-details .detail-value.long-content::after {
-            content: '';
-            position: absolute;
-            bottom: 0;
-            left: 0;
-            right: 0;
-            height: 30px;
-            background: linear-gradient(to bottom, transparent, #f8fcf9);
-            pointer-events: none;
-            display: none;
-        }
-
-        .config-item .item-details .detail-value.long-content.has-scroll::after {
-            display: block;
-        }
-        
-        .config-item .item-actions {
-            display: flex;
-            gap: 10px;
-            margin-top: 15px;
-            flex-wrap: wrap;
-        }
-        
-        .config-item .item-actions .btn {
-            padding: 8px 18px;
-            border: none;
-            border-radius: 8px;
-            font-size: 13px;
-            font-weight: 500;
-            cursor: pointer;
-            transition: all 0.3s;
-        }
-        
-        .config-item .item-actions .btn-edit-config {
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            color: white;
-            box-shadow: 0 2px 10px rgba(46,204,113,0.2);
-        }
-        
-        .config-item .item-actions .btn-edit-config:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 16px rgba(46,204,113,0.3);
-        }
-        
-        .config-item .item-actions .btn-delete {
-            background: linear-gradient(135deg, #e74c3c, #c0392b);
-            color: white;
-            box-shadow: 0 2px 10px rgba(231,76,60,0.2);
-        }
-        
-        .config-item .item-actions .btn-delete:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 16px rgba(231,76,60,0.3);
-        }
-        
-        .config-item .item-actions .btn-status {
-            background: linear-gradient(135deg, #ecf0f1, #e0e8e5);
-            color: #2c3e50;
-        }
-        
-        .config-item .item-actions .btn-status:hover {
-            background: linear-gradient(135deg, #d4e9f0, #b8dce8);
-            transform: translateY(-2px);
-        }
-        
-        /* ===== ADD NEW CONFIG ===== */
-        .add-config-view {
-            display: none;
-        }
-        
-        .add-config-view.active {
-            display: block;
-        }
-        
-        /* ===== SETUP VIEW ===== */
-        .setup-view {
-            display: none;
-        }
-        
-        .setup-view.active {
-            display: block;
-        }
-        
-        .setup-view .container { 
-            max-width: 1400px; 
-            margin: 0 auto; 
-            background: linear-gradient(145deg, #ffffff, #f5fcf8);
-            border-radius: 16px;
-            box-shadow: 0 4px 30px rgba(46,204,113,0.06);
-            overflow: hidden;
-            border: 1px solid rgba(46,204,113,0.06);
-        }
-        
-        .setup-view .tab-content { display: none; padding: 30px; }
-        .setup-view .tab-content.active { display: block; }
-        
-        .container { 
-            max-width: 1400px; 
-            margin: 0 auto; 
-            background: linear-gradient(145deg, #ffffff, #f5fcf8);
-            border-radius: 16px;
-            box-shadow: 0 4px 30px rgba(46,204,113,0.06);
-            overflow: hidden;
-            padding: 30px;
-            border: 1px solid rgba(46,204,113,0.06);
-        }
-        
-        .tab-content { display: none; padding: 30px; }
-        .tab-content.active { display: block; }
-        
-        .form-group { margin-bottom: 20px; }
-        .form-group label { display: block; margin-bottom: 8px; font-weight: 600; color: #2c3e50; }
-        .form-group input, .form-group select { 
-            width: 100%; 
-            padding: 12px 16px; 
-            border: 2px solid #e0ece8; 
-            border-radius: 10px; 
-            font-size: 14px; 
-            transition: all 0.3s; 
-            box-sizing: border-box;
-            background: #fafdfc;
-        }
-        .form-group input:focus, .form-group select:focus { 
-            border-color: #2ecc71; 
-            outline: none; 
-            box-shadow: 0 0 0 4px rgba(46,204,113,0.1);
-            background: white;
-        }
-        
-        .form-row { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-        .form-row-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px; }
-        
-        .btn { 
-            padding: 10px 15px; 
-            margin: 0px 20px;
-            border: none; 
-            border-radius: 10px; 
-            font-size: 14px; 
-            font-weight: 600; 
-            cursor: pointer; 
-            transition: all 0.3s; 
-        }
-        .btn-primary { 
-            background: linear-gradient(135deg, #2ecc71, #1abc9c); 
-            color: white; 
-            box-shadow: 0 2px 12px rgba(46,204,113,0.25);
-        }
-        .btn-primary:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 6px 20px rgba(46,204,113,0.35);
-        }
-        .btn-success { 
-            background: linear-gradient(135deg, #2ecc71, #27ae60); 
-            color: white; 
-            box-shadow: 0 2px 12px rgba(46,204,113,0.25);
-        }
-        .btn-success:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 6px 20px rgba(46,204,113,0.35);
-        }
-        .btn-danger { 
-            background: linear-gradient(135deg, #e74c3c, #c0392b); 
-            color: white; 
-            box-shadow: 0 2px 12px rgba(231,76,60,0.2);
-        }
-        .btn-danger:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 6px 20px rgba(231,76,60,0.3);
-        }
-        .btn-secondary { 
-            background: linear-gradient(135deg, #ecf0f1, #d4e9f0); 
-            color: #2c3e50; 
-        }
-        .btn-secondary:hover { 
-            transform: translateY(-2px); 
+            background: #f3f4f6;
             box-shadow: 0 4px 12px rgba(0,0,0,0.06);
-        }
-        .btn-warning { 
-            background: linear-gradient(135deg, #f39c12, #e67e22); 
-            color: white; 
-            box-shadow: 0 2px 12px rgba(243,156,18,0.25);
-            margin: 10px 5px;
-        }
-        .btn-warning:hover { 
-            transform: translateY(-2px); 
-            box-shadow: 0 6px 20px rgba(243,156,18,0.35);
+            transform: translateX(-3px);
         }
         
-        /* Edit mode banner */
+        .form-container {
+            background: #ffffff;
+            border-radius: 20px;
+            padding: 30px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.06);
+            border: 1px solid rgba(0,0,0,0.05);
+        }
+        
         .edit-mode-banner {
             display: none;
-            background: linear-gradient(135deg, #2ecc71, #1abc9c);
+            background: linear-gradient(135deg, #00695c, #26a69a);
             color: white;
             padding: 15px 25px;
             border-radius: 12px;
@@ -1262,7 +1851,7 @@
             justify-content: space-between;
             flex-wrap: wrap;
             gap: 15px;
-            box-shadow: 0 4px 20px rgba(46,204,113,0.25);
+            box-shadow: 0 4px 20px rgba(0,105,92,0.25);
         }
         
         .edit-mode-banner.visible {
@@ -1297,634 +1886,109 @@
             transform: translateY(-2px);
         }
         
-        .toggle-switch { 
-            position: relative; 
-            display: inline-block; 
-            width: 50px; 
-            height: 26px; 
-        }
-        .toggle-switch input { opacity: 0; width: 0; height: 0; }
-        .toggle-slider { 
-            position: absolute; 
-            cursor: pointer; 
-            top: 0; 
-            left: 0; 
-            right: 0; 
-            bottom: 0; 
-            background: #ddd; 
-            transition: .4s; 
-            border-radius: 26px; 
-        }
-        .toggle-slider:before { 
-            position: absolute; 
-            content: ""; 
-            height: 20px; 
-            width: 20px; 
-            left: 3px; 
-            bottom: 3px; 
-            background: white; 
-            transition: .4s; 
-            border-radius: 50%; 
-        }
-        .toggle-switch input:checked + .toggle-slider { background: linear-gradient(135deg, #2ecc71, #1abc9c); }
-        .toggle-switch input:checked + .toggle-slider:before { transform: translateX(24px); }
-        
-        .toggle-wrapper { display: flex; align-items: center; gap: 10px; }
-        .toggle-wrapper span { font-size: 14px; color: #5a7a8a; }
-        
-        .item-row { 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            padding: 12px 15px; 
-            border-bottom: 1px solid #e8f0ec; 
-        }
-        .item-row:last-child { border-bottom: none; }
-        .item-row .item-info { display: flex; gap: 20px; align-items: center; flex: 1; flex-wrap: wrap; }
-        .item-row .item-info .key { font-weight: 600; color: #2c3e50; min-width: 120px; }
-        .item-row .item-info .value { 
-            color: #5a7a8a; 
-            word-break: break-word;
-            overflow-wrap: break-word;
-            max-width: 100%;
-            flex: 1;
-        }
-        
-        .group-input-container { display: flex; gap: 10px; margin-top: 10px; }
-        .group-input-container input { flex: 1; }
-        
-        .group-item { 
-            background: linear-gradient(135deg, #e8f4f8, #d4e9f0); 
-            padding: 8px 15px; 
-            border-radius: 20px; 
-            display: inline-block; 
-            margin: 5px; 
-            color: #2c3e50;
-        }
-        .group-item .remove-group { cursor: pointer; margin-left: 8px; color: #e74c3c; font-weight: 600; }
-        
-        .time-input-group { display: flex; gap: 10px; align-items: center; margin-top: 10px; flex-wrap: wrap; }
-        .time-input-group input[type="number"] { width: 80px; padding: 10px; }
-        .time-input-group select { width: 100px; padding: 10px; }
-        
-        .caption-item { 
-            background: #f5fcf8; 
-            padding: 12px 15px; 
-            border-radius: 10px; 
-            margin-bottom: 10px; 
-            display: flex; 
-            justify-content: space-between; 
-            align-items: center; 
-            border: 1px solid #e0ece8;
-        }
-        .caption-item:hover { background: #e8f4f0; border-color: #2ecc71; }
-        .caption-item .caption-content { flex: 1; }
-        .caption-item .caption-author { font-weight: 600; color: #2ecc71; margin-right: 15px; }
-        
-        .caption-entry {
-            background: #f5fcf8;
-            padding: 12px;
-            border-radius: 10px;
-            margin-bottom: 10px;
-            border-left: 4px solid #2ecc71;
-            border: 1px solid #e0ece8;
-        }
-        .caption-entry .caption-id {
-            font-weight: 600;
-            color: #2ecc71;
-            margin-right: 10px;
-        }
-        
-        /* ===== SAVE BUTTONS ===== */
-        .save-btn-container { 
-            position: fixed; 
-            bottom: 30px; 
-            right: 30px; 
-            z-index: 1000; 
-            display: none;
-            gap: 15px;
-        }
-        
-        .save-btn-container.visible {
-            display: flex;
-            flex-direction: column;
-            align-items: flex-end;
-        }
-        
-        .save-btn-container .btn { 
-            padding: 15px 40px; 
-            font-size: 18px; 
-            border-radius: 12px;
-            margin: 0;
-            width: 100%;
-            min-width: 200px;
-        }
-        
-        .save-btn-container .btn-save-setup {
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            color: white;
-            box-shadow: 0 4px 30px rgba(52,152,219,0.4);
-        }
-        
-        .save-btn-container .btn-save-setup:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 40px rgba(52,152,219,0.5);
-        }
-        
-        .save-btn-container .btn-save-config {
-            background: linear-gradient(135deg, #2ecc71, #1abc9c);
-            color: white;
-            box-shadow: 0 4px 30px rgba(46,204,113,0.4);
-        }
-        
-        .save-btn-container .btn-save-config:hover {
-            transform: translateY(-3px);
-            box-shadow: 0 8px 40px rgba(46,204,113,0.5);
-        }
-        
-        .schedule-time-group { 
-            display: flex; 
-            gap: 10px; 
-            align-items: center; 
-            flex-wrap: wrap; 
-        }
-        .schedule-time-group input[type="number"] { width: 60px; }
-        .schedule-time-group select { width: 80px; }
-        
-        .time-display-24h { 
-            background: linear-gradient(135deg, #e8f4f8, #d4e9f0); 
-            padding: 8px 15px; 
-            border-radius: 8px; 
-            border: 1px solid #2ecc71; 
-            color: #2ecc71; 
-            font-weight: 600; 
-            min-width: 80px; 
-            text-align: center; 
-        }
-        
-        .timeorder-item {
-            background: #f5fcf8;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 15px;
-            border: 1px solid #e0ece8;
-        }
-        .timeorder-item .timeorder-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-        }
-        .timeorder-item .timeorder-header .key {
-            font-weight: 600;
-            color: #2c3e50;
-            font-size: 16px;
-        }
-        .timeorder-item .time-list {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 5px;
-            margin-top: 10px;
-        }
-        .timeorder-item .time-list .time-badge {
-            background: white;
-            padding: 8px 12px;
-            border-radius: 8px;
-            border: 1px solid #e0ece8;
-            font-size: 14px;
-            text-align: center;
-            color: #2c3e50;
-        }
-        .timeorder-item .time-list .time-badge.header {
-            background: linear-gradient(135deg, #2ecc71, #1abc9c);
-            color: white;
-            font-weight: 600;
-            border: none;
-        }
-        .timeorder-item .add-time-area {
-            margin-top: 15px;
-            padding-top: 15px;
-            border-top: 1px solid #e0ece8;
-        }
-        
-        .schedule-date-input {
-            width: 100% !important;
-            max-width: 100% !important;
-            box-sizing: border-box !important;
-            -webkit-appearance: none;
-            appearance: none;
-        }
-        
-        /* ===== MODAL ===== */
-        .modal-overlay {
-            display: none;
-            position: fixed;
-            top: 0;
-            left: 0;
-            right: 0;
-            bottom: 0;
-            background: rgba(0,0,0,0.5);
-            z-index: 9999;
-            justify-content: center;
-            align-items: center;
-            backdrop-filter: blur(5px);
-        }
-        
-        .modal-overlay.active {
-            display: flex;
-        }
-        
-        .modal-box {
-            background: white;
-            border-radius: 16px;
-            padding: 30px;
-            max-width: 600px;
-            width: 90%;
-            max-height: 80vh;
-            overflow-y: auto;
-            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-            animation: modalSlideIn 0.3s ease;
-            border: 1px solid rgba(46,204,113,0.1);
-        }
-        
-        @keyframes modalSlideIn {
-            from {
-                transform: translateY(-50px) scale(0.95);
-                opacity: 0;
-            }
-            to {
-                transform: translateY(0) scale(1);
-                opacity: 1;
-            }
-        }
-        
-        .modal-box .modal-title {
-            font-size: 20px;
-            font-weight: 700;
-            margin-bottom: 15px;
-            color: #2c3e50;
-        }
-        
-        .modal-box .modal-message {
-            font-size: 16px;
-            color: #5a7a8a;
-            margin-bottom: 20px;
-            line-height: 1.6;
-            word-wrap: break-word;
-        }
-        
-        .modal-box .modal-content {
-            margin-bottom: 20px;
-        }
-        
-        .modal-box .modal-buttons {
-            display: flex;
-            gap: 10px;
-            justify-content: flex-end;
-            flex-wrap: wrap;
-        }
-        
-        .modal-box .modal-buttons .btn {
-            min-width: 80px;
-            border-radius: 10px;
-        }
-        
-        .modal-box textarea {
-            width: 100%;
-            padding: 12px;
-            border: 2px solid #e0ece8;
-            border-radius: 10px;
-            font-size: 14px;
-            resize: vertical;
-            min-height: 80px;
-            transition: border-color 0.3s;
-            background: #fafdfc;
-        }
-        
-        .modal-box textarea:focus {
-            border-color: #2ecc71;
-            outline: none;
-            box-shadow: 0 0 0 4px rgba(46,204,113,0.1);
-        }
-        
-        /* ===== DYNAMIC FIELDS ===== */
-        .dynamic-field-item {
-            background: #f5fcf8;
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 15px;
-            border: 1px solid #e0ece8;
-            transition: all 0.3s;
-        }
-        
-        .dynamic-field-item:hover {
-            border-color: #2ecc71;
-            box-shadow: 0 2px 12px rgba(46,204,113,0.08);
-        }
-        
-        .dynamic-field-item .field-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 10px;
-        }
-        
-        .dynamic-field-item .field-name {
-            font-weight: 600;
-            color: #2c3e50;
-            font-size: 16px;
-        }
-        
-        .dynamic-field-item .field-type-badge {
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            color: white;
-            padding: 2px 12px;
-            border-radius: 12px;
-            font-size: 12px;
-            font-weight: 500;
-        }
-        
-        .dynamic-field-item .default-values {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 5px;
-            margin-top: 8px;
-        }
-        
-        .dynamic-field-item .default-values .value-tag {
-            background: white;
-            padding: 4px 12px;
-            border-radius: 12px;
-            border: 1px solid #e0ece8;
-            font-size: 13px;
-            color: #2c3e50;
-        }
-        
-        /* ===== DATE-TIME INPUT STYLES ===== */
+        /* ===== DATE-TIME INPUT ===== */
         .datetime-group {
             display: flex;
             flex-direction: column;
             gap: 10px;
-            width: 100% !important;
-            max-width: 100% !important;
-            min-width: 0 !important;
-            box-sizing: border-box !important;
-            overflow: hidden !important;
+            width: 100%;
+            box-sizing: border-box;
         }
-
+        
         .datetime-group .date-input {
-            width: 100% !important;
-            max-width: 100% !important;
-            min-width: 0 !important;
-            padding: 12px 16px !important;
-            border: 2px solid #e0ece8 !important;
-            border-radius: 10px !important;
-            font-size: 14px !important;
-            transition: all 0.3s !important;
-            box-sizing: border-box !important;
-            background: #fafdfc !important;
-            display: block !important;
-            -webkit-appearance: none !important;
-            appearance: none !important;
-            height: 50px;
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e5e7eb;
+            border-radius: 10px;
+            font-size: 14px;
+            transition: all 0.3s;
+            box-sizing: border-box;
+            background: #fafafa;
         }
-
+        
         .datetime-group .date-input:focus {
-            border-color: #2ecc71 !important;
-            outline: none !important;
-            box-shadow: 0 0 0 4px rgba(46,204,113,0.1) !important;
-            background: white !important;
+            border-color: #00695c;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(0,105,92,0.1);
+            background: white;
         }
-
+        
         .datetime-group .time-group {
             display: flex;
             gap: 10px;
             align-items: center;
             flex-wrap: wrap;
-            width: 100% !important;
-            max-width: 100% !important;
-            box-sizing: border-box !important;
-        }
-
-        .datetime-group .time-group input[type="number"] {
-            width: 60px !important;
-            min-width: 45px !important;
-            max-width: 80px !important;
-            padding: 10px !important;
-            border: 2px solid #e0ece8 !important;
-            border-radius: 10px !important;
-            font-size: 14px !important;
-            transition: all 0.3s !important;
-            background: #fafdfc !important;
-            box-sizing: border-box !important;
-        }
-
-        .datetime-group .time-group input[type="number"]:focus {
-            border-color: #2ecc71 !important;
-            outline: none !important;
-            box-shadow: 0 0 0 4px rgba(46,204,113,0.1) !important;
-            background: white !important;
-        }
-
-        .datetime-group .time-group select {
-            padding: 10px !important;
-            border: 2px solid #e0ece8 !important;
-            border-radius: 10px !important;
-            font-size: 14px !important;
-            transition: all 0.3s !important;
-            background: #fafdfc !important;
-            width: 80px !important;
-            min-width: 70px !important;
-            box-sizing: border-box !important;
-        }
-
-        .datetime-group .time-group select:focus {
-            border-color: #2ecc71 !important;
-            outline: none !important;
-            box-shadow: 0 0 0 4px rgba(46,204,113,0.1) !important;
-            background: white !important;
-        }
-        /* ===== RESPONSIVE ===== */
-        @media (max-width: 768px) {
-            .config-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .form-row, .form-row-3 { grid-template-columns: 1fr; }
-            .tab-btn { 
-                padding: 12px 15px; 
-                font-size: 13px; 
-            }
-            .schedule-time-group { flex-direction: column; align-items: stretch; }
-            .main-header h1 { font-size: 17px; }
-            .main-header { padding: 10px 15px; height: 55px; }
-            .main-header .header-back {
-                padding: 8px 15px;
-                margin-right: 5px;
-                height: auto;
-            }
-            .scroll-body { top: 55px; }
-            .scroll-body.tabs-visible { top: 125px; }
-            .tabs { 
-                top: 55px;
-                padding: 6px 0;
-            }
-            .schedule-date-input { max-width: 100%; }
-            .timeorder-item .time-list {
-                grid-template-columns: 1fr;
-            }
-            .modal-box { max-width: 95%; padding: 20px; }
-            .time-input-group input[type="number"] { width: 60px; }
-            .time-input-group select { width: 80px; }
-            .dashboard-title { font-size: 22px; flex-direction: column; align-items: flex-start; }
-            .config-item .item-details {
-                grid-template-columns: 1fr;
-            }
-            .config-item .item-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .detail-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .save-btn-container { 
-                bottom: 15px; 
-                right: 15px;
-                gap: 10px;
-            }
-            .save-btn-container .btn { 
-                padding: 12px 25px; 
-                font-size: 15px;
-                min-width: 150px;
-            }
-            .edit-mode-banner {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .container {
-                padding: 15px;
-            }
-            .item-row .item-info {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 5px;
-            }
-            .item-row .item-info .key {
-                min-width: auto;
-            }
-            
-            .datetime-group {
-                width: 100% !important;
-                max-width: 100% !important;
-                overflow: hidden !important;
-            }
-            
-            .datetime-group .date-input {
-                width: 100% !important;
-                max-width: 100% !important;
-                min-width: 0 !important;
-                font-size: 16px !important;
-                padding: 12px 14px !important;
-                box-sizing: border-box !important;
-            }
-            
-            .datetime-group .time-group {
-                width: 100% !important;
-                max-width: 100% !important;
-                flex-wrap: wrap !important;
-                gap: 8px !important;
-            }
-            
-            .datetime-group .time-group input[type="number"] {
-                width: 50px !important;
-                min-width: 40px !important;
-                padding: 8px !important;
-                font-size: 14px !important;
-                flex: 0 1 auto !important;
-            }
-            
-            .datetime-group .time-group select {
-                width: 70px !important;
-                min-width: 60px !important;
-                padding: 8px !important;
-                font-size: 14px !important;
-            }
-            
-            .submit-as-select {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            
-            .submit-as-select select {
-                width: 100%;
-                min-width: unset;
-            }
-        }
-
-        @media (max-width: 480px) {
-            .config-card {
-                min-height: 130px;
-                padding: 20px !important;
-            }
-            .config-card .card-icon { font-size: 28px; }
-            .config-card .card-title { font-size: 17px; }
-            .save-btn-container .btn { 
-                padding: 10px 20px; 
-                font-size: 13px;
-                min-width: 120px;
-            }
-            
-            .datetime-group {
-                width: 100% !important;
-                max-width: 100% !important;
-                overflow: hidden !important;
-            }
-            
-            .datetime-group .date-input {
-                width: 100% !important;
-                max-width: 100% !important;
-                min-width: 0 !important;
-                font-size: 16px !important;
-                padding: 10px 12px !important;
-                box-sizing: border-box !important;
-            }
-            
-            .datetime-group .time-group {
-                width: 100% !important;
-                max-width: 100% !important;
-                gap: 6px !important;
-                flex-wrap: wrap !important;
-                justify-content: flex-start !important;
-            }
-            
-            .datetime-group .time-group input[type="number"] {
-                width: 45px !important;
-                min-width: 35px !important;
-                padding: 8px !important;
-                font-size: 14px !important;
-                flex: 0 1 auto !important;
-            }
-            
-            .datetime-group .time-group select {
-                width: 60px !important;
-                min-width: 55px !important;
-                padding: 8px !important;
-                font-size: 14px !important;
-            }
-            
-            .time-format-select {
-                flex-wrap: wrap !important;
-                gap: 8px !important;
-            }
-            
-            .time-format-select select {
-                width: 100% !important;
-                min-width: unset !important;
-            }
+            width: 100%;
+            box-sizing: border-box;
         }
         
-        /* ===== LIST INPUT STYLES ===== */
+        .datetime-group .time-group input[type="number"] {
+            width: 60px;
+            padding: 10px;
+            border: 2px solid #e5e7eb;
+            border-radius: 10px;
+            font-size: 14px;
+            background: #fafafa;
+            box-sizing: border-box;
+        }
+        
+        .datetime-group .time-group input[type="number"]:focus {
+            border-color: #00695c;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(0,105,92,0.1);
+            background: white;
+        }
+        
+        .datetime-group .time-group select {
+            padding: 10px;
+            border: 2px solid #e5e7eb;
+            border-radius: 10px;
+            font-size: 14px;
+            background: #fafafa;
+            width: 80px;
+            box-sizing: border-box;
+        }
+        
+        .datetime-group .time-group select:focus {
+            border-color: #00695c;
+            outline: none;
+        }
+        
+        .time-format-select {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            margin-top: 8px;
+            padding: 8px 12px;
+            background: #f8fafc;
+            border-radius: 8px;
+            border: 1px solid #e5e7eb;
+            flex-wrap: wrap;
+        }
+        
+        .time-format-select label {
+            margin-bottom: 0 !important;
+            font-weight: 500 !important;
+            color: #1a1a2e;
+            font-size: 14px;
+        }
+        
+        .time-format-select select {
+            padding: 6px 12px;
+            border: 2px solid #e5e7eb;
+            border-radius: 6px;
+            font-size: 14px;
+            background: #fafafa;
+            width: auto;
+            min-width: 80px;
+        }
+        
+        .time-format-select select:focus {
+            border-color: #00695c;
+            outline: none;
+        }
+        
+        /* ===== LIST INPUT ===== */
         .list-input-container {
             display: flex;
             gap: 10px;
@@ -1952,960 +2016,495 @@
             align-items: center;
             gap: 6px;
             font-size: 13px;
-            color: #2c3e50;
+            color: #1a1a2e;
             border: 1px solid #c8dce8;
         }
         
         .list-values .value-tag .remove-value {
             cursor: pointer;
-            color: #e74c3c;
+            color: #ef4444;
             font-weight: 600;
             font-size: 14px;
             line-height: 1;
         }
         
         .list-values .value-tag .remove-value:hover {
-            color: #c0392b;
+            color: #dc2626;
         }
         
-        /* ===== SOURCE SELECT ===== */
-        .source-select-container {
-            margin-top: 10px;
-        }
-        
-        .source-select-container select {
-            width: 100%;
-            padding: 10px 14px;
-            border: 2px solid #e0ece8;
-            border-radius: 10px;
-            font-size: 14px;
-            background: #fafdfc;
-        }
-        
-        .source-select-container select:focus {
-            border-color: #2ecc71;
-            outline: none;
-            box-shadow: 0 0 0 4px rgba(46,204,113,0.1);
-        }
-        
-        
-        /* ===== TIME FORMAT SELECT ===== */
-        .time-format-select {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-top: 8px;
-            padding: 8px 12px;
-            background: #f8fcf9;
-            border-radius: 8px;
-            border: 1px solid #e0ece8;
-        }
-        
-        .time-format-select label {
-            margin-bottom: 0 !important;
-            font-weight: 500 !important;
-            color: #2c3e50;
-            font-size: 14px;
-        }
-        
-        .time-format-select select {
-            padding: 6px 12px;
-            border: 2px solid #e0ece8;
-            border-radius: 6px;
-            font-size: 14px;
-            background: #fafdfc;
-            width: auto;
-            min-width: 80px;
-        }
-        
-        .time-format-select select:focus {
-            border-color: #2ecc71;
-            outline: none;
-        }
-
-        /* ===== SUBMIT AS SELECT ===== */
-        .submit-as-select {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            margin-top: 8px;
-            padding: 8px 12px;
-            background: #f0faf5;
-            border-radius: 8px;
-            border: 1px solid #c8e0d8;
-        }
-        
-        .submit-as-select label {
-            margin-bottom: 0 !important;
-            font-weight: 500 !important;
-            color: #2c3e50;
-            font-size: 14px;
-        }
-        
-        .submit-as-select select {
-            padding: 6px 12px;
-            border: 2px solid #c8e0d8;
-            border-radius: 6px;
-            font-size: 14px;
-            background: #fafdfc;
-            width: auto;
-            min-width: 180px;
-        }
-        
-        .submit-as-select select:focus {
-            border-color: #2ecc71;
-            outline: none;
-        }
-        
+        /* ===== SUBMIT AS PREVIEW ===== */
         .submit-as-preview {
             margin-top: 5px;
             padding: 6px 12px;
-            background: #f8fcf9;
+            background: #f8fafc;
             border-radius: 6px;
             border: 1px dashed #c8e0d8;
             font-size: 12px;
-            color: #5a7a8a;
+            color: #6b7280;
             font-family: monospace;
             word-break: break-all;
             max-height: 100px;
             overflow-y: auto;
         }
         
-        /* ===== OPERATION STATUS BADGE ===== */
-        .operation-status-badge {
-            display: inline-block;
-            padding: 2px 10px;
-            border-radius: 12px;
-            font-size: 11px;
-            font-weight: 600;
-            margin-left: 10px;
-        }
-        
-        .operation-status-badge.running {
-            background: #48bb78;
-            color: white;
-        }
-        
-        .operation-status-badge.paused {
-            background: #f6ad55;
-            color: white;
-        }
-        
-        .operation-status-badge.stopped {
-            background: #fc8181;
-            color: white;
-        }
-        
-        .operation-status-badge.completed {
-            background: #4299e1;
-            color: white;
-        }
-        
-        .operation-status-badge.failed {
-            background: #e53e3e;
-            color: white;
-        }
-        
-        /* ===== RESPONSIVE ===== */
-        @media (max-width: 768px) {
-            .config-grid {
-                grid-template-columns: 1fr;
-            }
-            
-            .form-row, .form-row-3 { grid-template-columns: 1fr; }
-            .tab-btn { 
-                padding: 12px 15px; 
-                font-size: 13px; 
-            }
-            .schedule-time-group { flex-direction: column; align-items: stretch; }
-            .main-header h1 { font-size: 17px; }
-            .main-header { padding: 10px 15px; height: 55px; }
-            .main-header .header-back {
-                padding: 8px 15px;
-                margin-right: 5px;
-                height: auto;
-            }
-            .scroll-body { top: 55px; }
-            .scroll-body.tabs-visible { top: 125px; }
-            .tabs { 
-                top: 55px;
-                padding: 6px 0;
-            }
-            .schedule-date-input { max-width: 100%; }
-            .timeorder-item .time-list {
-                grid-template-columns: 1fr;
-            }
-            .modal-box { max-width: 95%; padding: 20px; }
-            .time-input-group input[type="number"] { width: 60px; }
-            .time-input-group select { width: 80px; }
-            .dashboard-title { font-size: 22px; flex-direction: column; align-items: flex-start; }
-            .config-item .item-details {
-                grid-template-columns: 1fr;
-            }
-            .config-item .item-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .detail-header {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .save-btn-container { 
-                bottom: 15px; 
-                right: 15px;
-                gap: 10px;
-            }
-            .save-btn-container .btn { 
-                padding: 12px 25px; 
-                font-size: 15px;
-                min-width: 150px;
-            }
-            .edit-mode-banner {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            .container {
-                padding: 15px;
-            }
-            .item-row .item-info {
-                flex-direction: column;
-                align-items: flex-start;
-                gap: 5px;
-            }
-            .item-row .item-info .key {
-                min-width: auto;
-            }
-            
-            .datetime-group .time-group {
-                flex-direction: row;
-                flex-wrap: wrap;
-            }
-            
-            .datetime-group .time-group input[type="number"] {
-                width: 50px;
-            }
-            .datetime-group .time-group select {
-                width: 70px;
-            }
-            
-            .submit-as-select {
-                flex-direction: column;
-                align-items: flex-start;
-            }
-            
-            .submit-as-select select {
-                width: 100%;
-                min-width: unset;
-            }
-        }
-        
-        @media (max-width: 480px) {
-            .config-card {
-                min-height: 130px;
-                padding: 20px !important;
-            }
-            .config-card .card-icon { font-size: 28px; }
-            .config-card .card-title { font-size: 17px; }
-            .save-btn-container .btn { 
-                padding: 10px 20px; 
-                font-size: 13px;
-                min-width: 120px;
-            }
-            
-            .datetime-group .time-group input[type="number"] {
-                width: 50px;
-            }
-            .datetime-group .time-group select {
-                width: 70px;
-            }
-        }
-        /* ===== FLOATING HELP BUTTON ===== */
-        .help-floating-btn {
+        /* ===== SAVE BUTTONS ===== */
+        .save-btn-container {
             position: fixed;
             bottom: 100px;
             right: 30px;
-            z-index: 999;
-            width: 50px;
-            height: 50px;
-            border-radius: 50%;
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            color: white;
-            border: none;
-            font-size: 24px;
-            font-weight: 700;
-            cursor: pointer;
-            box-shadow: 0 4px 20px rgba(52,152,219,0.4);
-            transition: all 0.3s ease;
+            z-index: 1000;
             display: none;
-            align-items: center;
-            justify-content: center;
+            flex-direction: column;
+            gap: 10px;
         }
-
-        .help-floating-btn:hover {
-            transform: scale(1.1);
-            box-shadow: 0 6px 30px rgba(52,152,219,0.6);
-        }
-
-        .help-floating-btn.visible {
+        
+        .save-btn-container.visible {
             display: flex;
         }
-
-        /* ===== HELP MODAL ===== */
-        .help-modal-overlay {
+        
+        .save-btn-container .btn {
+            padding: 12px 30px;
+            font-size: 15px;
+            border-radius: 10px;
+            margin: 0;
+            min-width: 180px;
+            justify-content: center;
+        }
+        
+        .save-btn-container .btn-save-config {
+            background: linear-gradient(135deg, #00695c, #26a69a);
+            color: white;
+            box-shadow: 0 4px 30px rgba(0,105,92,0.4);
+        }
+        
+        .save-btn-container .btn-save-config:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 40px rgba(0,105,92,0.5);
+        }
+        
+        .save-btn-container .btn-save-setup {
+            background: linear-gradient(135deg, #10b981, #059669);
+            color: white;
+            box-shadow: 0 4px 30px rgba(16,185,129,0.4);
+        }
+        
+        .save-btn-container .btn-save-setup:hover {
+            transform: translateY(-3px);
+            box-shadow: 0 8px 40px rgba(16,185,129,0.5);
+        }
+        
+        /* ===== MODAL ===== */
+        .modal-overlay {
             display: none;
             position: fixed;
             top: 0;
             left: 0;
             right: 0;
             bottom: 0;
-            background: rgba(0,0,0,0.6);
-            z-index: 10000;
+            background: rgba(0,0,0,0.5);
+            z-index: 9999;
             justify-content: center;
             align-items: center;
-            backdrop-filter: blur(8px);
+            backdrop-filter: blur(5px);
             padding: 20px;
         }
-
-        .help-modal-overlay.active {
+        
+        .modal-overlay.active {
             display: flex;
         }
-
-        .help-modal-box {
+        
+        .modal-box {
             background: white;
             border-radius: 16px;
-            padding: 25px;
-            max-width: 520px;
+            padding: 30px;
+            max-width: 600px;
             width: 100%;
             max-height: 85vh;
             overflow-y: auto;
             box-shadow: 0 20px 60px rgba(0,0,0,0.3);
             animation: modalSlideIn 0.3s ease;
-            display: flex;
-            flex-direction: column;
-            box-sizing: border-box;
-            margin: auto;
+            border: 1px solid rgba(0,105,92,0.1);
         }
-
-        /* Scrollbar styling for the modal itself */
-        .help-modal-box::-webkit-scrollbar {
-            width: 5px;
+        
+        @keyframes modalSlideIn {
+            from {
+                transform: translateY(-50px) scale(0.95);
+                opacity: 0;
+            }
+            to {
+                transform: translateY(0) scale(1);
+                opacity: 1;
+            }
         }
-
-        .help-modal-box::-webkit-scrollbar-track {
-            background: rgba(0,0,0,0.05);
-            border-radius: 8px;
-        }
-
-        .help-modal-box::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, #2ecc71, #3498db);
-            border-radius: 8px;
-        }
-
-        .help-modal-box::-webkit-scrollbar-thumb:hover {
-            background: linear-gradient(135deg, #27ae60, #2980b9);
-        }
-
-        .help-modal-box .help-modal-title {
+        
+        .modal-box .modal-title {
             font-size: 20px;
             font-weight: 700;
-            color: #2c3e50;
-            margin-bottom: 6px;
-            display: flex;
-            align-items: center;
-            gap: 10px;
-            flex-shrink: 0;
+            margin-bottom: 10px;
+            color: #1a1a2e;
         }
-
-        .help-modal-box .help-modal-title .icon {
-            font-size: 24px;
-        }
-
-        .help-modal-box .help-subtitle {
-            font-size: 13px;
-            color: #5a7a8a;
-            margin-bottom: 16px;
-            line-height: 1.5;
-            flex-shrink: 0;
-        }
-
-        .help-modal-box .help-section {
-            margin-bottom: 14px;
-            padding: 14px;
-            background: #f8fcf9;
-            border-radius: 10px;
-            border: 1px solid #e0ece8;
-            flex-shrink: 0;
-            width: 100%;
-            box-sizing: border-box;
-        }
-
-        .help-modal-box .help-section:last-of-type {
-            flex-shrink: 1;
-            overflow: hidden;
-        }
-
-        .help-modal-box .help-section .section-label {
-            font-size: 13px;
-            font-weight: 600;
-            color: #2c3e50;
-            margin-bottom: 6px;
-            display: flex;
-            align-items: center;
-            gap: 6px;
-            flex-wrap: wrap;
-        }
-
-        .help-modal-box .help-section .section-label .badge {
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            color: white;
-            padding: 1px 8px;
-            border-radius: 10px;
-            font-size: 10px;
-            font-weight: 500;
-            white-space: nowrap;
-        }
-
-        .help-modal-box .help-section input[type="date"] {
-            width: 100%;
-            padding: 10px 14px;
-            border: 2px solid #e0ece8;
-            border-radius: 8px;
-            font-size: 14px;
-            background: white;
-            transition: all 0.3s;
-            box-sizing: border-box;
-            -webkit-appearance: none;
-            appearance: none;
-        }
-
-        .help-modal-box .help-section input[type="date"]:focus {
-            border-color: #2ecc71;
-            outline: none;
-            box-shadow: 0 0 0 3px rgba(46,204,113,0.1);
-        }
-
-        .help-modal-box .help-section select {
-            width: 100%;
-            padding: 10px 14px;
-            border: 2px solid #e0ece8;
-            border-radius: 8px;
-            font-size: 14px;
-            background: white;
-            transition: all 0.3s;
-            box-sizing: border-box;
-            -webkit-appearance: none;
-            appearance: none;
-            background-image: url("data:image/svg+xml;charset=UTF-8,%3csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='%232c3e50' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3e%3cpolyline points='6 9 12 15 18 9'%3e%3c/polyline%3e%3c/svg%3e");
-            background-repeat: no-repeat;
-            background-position: right 10px center;
-            background-size: 14px;
-            padding-right: 36px;
-        }
-
-        .help-modal-box .help-section select:focus {
-            border-color: #2ecc71;
-            outline: none;
-            box-shadow: 0 0 0 3px rgba(46,204,113,0.1);
-        }
-
-        /* ===== TIME LIST DISPLAY WITH MAX HEIGHT AND SCROLLING ===== */
-        .help-modal-box .help-section .time-list-display-wrapper {
-            max-height: 150px;
-            overflow-y: auto;
-            margin-top: 8px;
-            border-radius: 6px;
-            border: 1px solid #e0ece8;
-            background: white;
-            box-sizing: border-box;
-            width: 100%;
-        }
-
-        .help-modal-box .help-section .time-list-display-wrapper::-webkit-scrollbar {
-            width: 4px;
-        }
-
-        .help-modal-box .help-section .time-list-display-wrapper::-webkit-scrollbar-track {
-            background: rgba(0,0,0,0.03);
-            border-radius: 6px;
-        }
-
-        .help-modal-box .help-section .time-list-display-wrapper::-webkit-scrollbar-thumb {
-            background: linear-gradient(135deg, #2ecc71, #3498db);
-            border-radius: 6px;
-        }
-
-        .help-modal-box .help-section .time-list-display {
-            display: grid;
-            grid-template-columns: 1fr 1fr;
-            gap: 3px;
-            padding: 4px;
-            width: 100%;
-            box-sizing: border-box;
-        }
-
-        .help-modal-box .help-section .time-list-display .time-item {
-            background: white;
-            padding: 6px 10px;
-            border-radius: 4px;
-            border: 1px solid #e8f0ec;
-            text-align: center;
-            font-size: 12px;
-            color: #2c3e50;
-            box-sizing: border-box;
-        }
-
-        .help-modal-box .help-section .time-list-display .time-item.header {
-            background: linear-gradient(135deg, #2ecc71, #1abc9c);
-            color: white;
-            font-weight: 600;
-            border: none;
-            position: sticky;
-            top: 0;
-            z-index: 2;
-        }
-
-        .help-modal-box .help-section .no-times {
-            color: #999;
-            font-size: 13px;
-            text-align: center;
-            padding: 12px 0;
-        }
-
-        /* ===== CALCULATION RESULT ===== */
-        .help-modal-box .help-section .calculation-result {
-            margin-top: 10px;
-            padding: 12px;
-            background: linear-gradient(135deg, #e8f4f8, #d4e9f0);
-            border-radius: 8px;
-            border: 2px solid #2ecc71;
-            box-sizing: border-box;
-            width: 100%;
-        }
-
-        .help-modal-box .help-section .calculation-result .result-row {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            padding: 3px 0;
-            font-size: 14px;
-        }
-
-        .help-modal-box .help-section .calculation-result .result-row .label {
-            color: #5a7a8a;
-        }
-
-        .help-modal-box .help-section .calculation-result .result-row .value {
-            font-weight: 700;
-            color: #2c3e50;
+        
+        .modal-box .modal-message {
             font-size: 16px;
+            color: #6b7280;
+            margin-bottom: 20px;
+            line-height: 1.6;
+            word-wrap: break-word;
         }
-
-        .help-modal-box .help-section .calculation-result .result-row .value.highlight {
-            color: #2ecc71;
-            font-size: 20px;
+        
+        .modal-box .modal-content {
+            margin-bottom: 15px;
         }
-
-        .help-modal-box .help-section .calculation-result .calc-note {
-            margin-top: 8px;
-            padding-top: 8px;
-            border-top: 1px dashed #c8e0d8;
-            font-size: 11px;
-            color: #5a7a8a;
+        
+        .modal-box .modal-content .form-group {
+            margin-bottom: 15px;
         }
-
-        /* ===== MODAL ACTIONS - FIXED BUTTON WIDTH ===== */
-        .help-modal-box .help-modal-actions {
+        
+        .modal-box .modal-content .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-weight: 600;
+            color: #1a1a2e;
+            font-size: 14px;
+        }
+        
+        .modal-box .modal-content .form-group input,
+        .modal-box .modal-content .form-group select,
+        .modal-box .modal-content .form-group textarea {
+            width: 100%;
+            padding: 10px 14px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 14px;
+            background: #fafafa;
+            box-sizing: border-box;
+        }
+        
+        .modal-box .modal-content .form-group input:focus,
+        .modal-box .modal-content .form-group select:focus,
+        .modal-box .modal-content .form-group textarea:focus {
+            border-color: #00695c;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(0,105,92,0.1);
+            background: white;
+        }
+        
+        .modal-box .modal-buttons {
             display: flex;
             gap: 10px;
             justify-content: flex-end;
-            margin-top: 14px;
-            flex-shrink: 0;
-            padding-top: 12px;
-            border-top: 1px solid #e0ece8;
             flex-wrap: wrap;
-            width: 100%;
-            box-sizing: border-box;
         }
-
-        .help-modal-box .help-modal-actions .btn {
-            padding: 9px 24px;
-            border-radius: 8px;
-            font-weight: 600;
-            font-size: 13px;
-            cursor: pointer;
-            transition: all 0.3s;
-            border: none;
-            min-width: 100px;
-            flex: 0 1 auto;
-            text-align: center;
-            white-space: nowrap;
-            box-sizing: border-box;
+        
+        .modal-box .modal-buttons .btn {
+            min-width: 80px;
+            border-radius: 10px;
         }
-
-        .help-modal-box .help-modal-actions .btn-close-help {
-            background: linear-gradient(135deg, #2ecc71, #1abc9c);
+        
+        .modal-box .modal-buttons .btn-confirm {
+            background: linear-gradient(135deg, #ef4444, #dc2626);
             color: white;
-            box-shadow: 0 2px 12px rgba(46,204,113,0.25);
         }
-
-        .help-modal-box .help-modal-actions .btn-close-help:hover {
+        
+        .modal-box .modal-buttons .btn-confirm:hover {
             transform: translateY(-2px);
-            box-shadow: 0 4px 20px rgba(46,204,113,0.35);
+            box-shadow: 0 4px 20px rgba(239,68,68,0.3);
         }
-
-        .help-modal-box .help-modal-actions .btn-calc {
-            background: linear-gradient(135deg, #3498db, #2ecc71);
-            color: white;
-            box-shadow: 0 2px 12px rgba(52,152,219,0.25);
-        }
-
-        .help-modal-box .help-modal-actions .btn-calc:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 4px 20px rgba(52,152,219,0.35);
-        }
-
-        /* ===== RESPONSIVE - MOBILE/PORTRAIT ===== */
+        
+        /* ===== RESPONSIVE ===== */
         @media (max-width: 768px) {
-            .help-modal-overlay {
-                padding: 10px;
-                align-items: center;
+            .form-row, .form-row-3 {
+                grid-template-columns: 1fr;
             }
             
-            .help-modal-box {
-                padding: 18px;
-                max-height: 92vh;
-                max-width: 100%;
-                border-radius: 14px;
-                margin: 10px;
-                width: calc(100% - 20px);
-                box-sizing: border-box;
+            .main-header h1 {
+                font-size: 17px;
             }
             
-            .help-modal-box .help-modal-title {
-                font-size: 18px;
+            .main-header {
+                padding: 10px 15px;
+                height: 55px;
             }
             
-            .help-modal-box .help-modal-title .icon {
-                font-size: 22px;
+            .main-tabs {
+                top: 55px;
+                min-height: 42px;
+                padding: 0 5px;
             }
             
-            .help-modal-box .help-subtitle {
-                font-size: 12px;
-                margin-bottom: 12px;
-            }
-            
-            .help-modal-box .help-section {
-                padding: 12px;
-                margin-bottom: 10px;
-            }
-            
-            .help-modal-box .help-section .section-label {
-                font-size: 12px;
-            }
-            
-            .help-modal-box .help-section input[type="date"] {
-                padding: 9px 12px;
-                font-size: 16px !important;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section select {
-                padding: 9px 12px;
-                font-size: 16px !important;
-                padding-right: 32px;
-                background-size: 12px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .time-list-display-wrapper {
-                max-height: 120px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .time-list-display {
-                grid-template-columns: 1fr 1fr;
-                gap: 2px;
-                padding: 3px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .time-list-display .time-item {
-                padding: 5px 8px;
-                font-size: 11px;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .calculation-result {
-                padding: 10px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .calculation-result .result-row {
+            .main-tab-btn {
+                padding: 8px 14px;
                 font-size: 13px;
+                min-height: 40px;
             }
             
-            .help-modal-box .help-section .calculation-result .result-row .value {
-                font-size: 15px;
+            .sub-tabs {
+                top: 97px;
+                min-height: 36px;
+                padding: 0 5px;
             }
             
-            .help-modal-box .help-section .calculation-result .result-row .value.highlight {
-                font-size: 18px;
+            .sub-tab-btn {
+                padding: 6px 12px;
+                font-size: 12px;
+                min-height: 34px;
             }
             
-            .help-modal-box .help-modal-actions {
+            .scroll-body {
+                top: 97px;
+                padding: 15px;
+                padding-bottom: 80px;
+            }
+            
+            .scroll-body.setup-visible {
+                top: 133px;
+            }
+            
+            .config-item .item-details {
+                grid-template-columns: 1fr;
+            }
+            
+            .config-item .item-header {
                 flex-direction: column;
-                gap: 8px;
-                margin-top: 12px;
-                padding-top: 10px;
-                width: 100%;
-                box-sizing: border-box;
+                align-items: flex-start;
             }
             
-            .help-modal-box .help-modal-actions .btn {
-                width: 100%;
-                padding: 10px 16px;
-                font-size: 14px;
-                min-width: unset;
-                flex: 1 1 100%;
-                white-space: normal;
-                box-sizing: border-box;
+            .detail-header {
+                flex-direction: column;
+                align-items: flex-start;
             }
             
-            .help-floating-btn {
-                bottom: 85px;
+            .form-container {
+                padding: 20px;
+            }
+            
+            .setup-container {
+                padding: 18px;
+            }
+            
+            .fab {
+                width: 50px;
+                height: 50px;
+                font-size: 28px;
+                bottom: 20px;
                 right: 20px;
-                width: 45px;
-                height: 45px;
-                font-size: 20px;
-            }
-        }
-
-        @media (max-width: 480px) {
-            .help-modal-overlay {
-                padding: 5px;
             }
             
-            .help-modal-box {
-                padding: 14px;
-                max-height: 95vh;
-                border-radius: 12px;
-                margin: 5px;
-                width: calc(100% - 10px);
-                box-sizing: border-box;
+            .save-btn-container {
+                bottom: 80px;
+                right: 20px;
             }
             
-            .help-modal-box .help-modal-title {
-                font-size: 16px;
-                gap: 6px;
-            }
-            
-            .help-modal-box .help-modal-title .icon {
-                font-size: 18px;
-            }
-            
-            .help-modal-box .help-subtitle {
-                font-size: 11px;
-                margin-bottom: 10px;
-            }
-            
-            .help-modal-box .help-section {
-                padding: 10px;
-                margin-bottom: 8px;
-                border-radius: 8px;
-            }
-            
-            .help-modal-box .help-section .section-label {
-                font-size: 11px;
-                gap: 4px;
-            }
-            
-            .help-modal-box .help-section .section-label .badge {
-                font-size: 9px;
-                padding: 1px 6px;
-            }
-            
-            .help-modal-box .help-section input[type="date"] {
-                padding: 8px 10px;
-                font-size: 16px !important;
-                border-radius: 6px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section select {
-                padding: 8px 10px;
-                font-size: 16px !important;
-                border-radius: 6px;
-                padding-right: 28px;
-                background-size: 10px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .time-list-display-wrapper {
-                max-height: 100px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .time-list-display {
-                grid-template-columns: 1fr 1fr;
-                gap: 2px;
-                padding: 2px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .time-list-display .time-item {
-                padding: 4px 6px;
-                font-size: 10px;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .calculation-result {
-                padding: 8px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section .calculation-result .result-row {
-                font-size: 12px;
-                padding: 2px 0;
-            }
-            
-            .help-modal-box .help-section .calculation-result .result-row .value {
-                font-size: 14px;
-            }
-            
-            .help-modal-box .help-section .calculation-result .result-row .value.highlight {
-                font-size: 16px;
-            }
-            
-            .help-modal-box .help-section .calculation-result .calc-note {
-                font-size: 10px;
-                margin-top: 6px;
-                padding-top: 6px;
-            }
-            
-            .help-modal-box .help-modal-actions {
-                gap: 6px;
-                margin-top: 10px;
-                padding-top: 8px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-modal-actions .btn {
-                padding: 8px 12px;
+            .save-btn-container .btn {
+                padding: 10px 20px;
                 font-size: 13px;
-                border-radius: 6px;
-                width: 100%;
-                flex: 1 1 100%;
-                box-sizing: border-box;
-                white-space: normal;
+                min-width: 140px;
             }
             
-            .help-floating-btn {
-                bottom: 75px;
-                right: 15px;
-                width: 40px;
-                height: 40px;
-                font-size: 18px;
+            .timeorder-item .time-list {
+                grid-template-columns: 1fr;
+            }
+            
+            .item-row .item-info {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 5px;
+            }
+            
+            .item-row .item-info .key {
+                min-width: auto;
+            }
+            
+            .caption-item {
+                flex-direction: column;
+                align-items: flex-start;
+                gap: 10px;
             }
         }
-
-        /* ===== LANDSCAPE PHONES ===== */
-        @media (max-height: 600px) and (orientation: landscape) {
-            .help-modal-overlay {
-                padding: 10px;
-                align-items: center;
-            }
-            
-            .help-modal-box {
-                max-height: 90vh;
-                padding: 14px 18px;
-                box-sizing: border-box;
-                border-radius: 12px;
-                max-width: 500px;
-                margin: 10px;
-            }
-            
-            .help-modal-box .help-section {
-                padding: 8px;
-                margin-bottom: 8px;
-            }
-            
-            .help-modal-box .help-section .time-list-display-wrapper {
-                max-height: 70px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-modal-title {
-                font-size: 16px;
-                margin-bottom: 4px;
-            }
-            
-            .help-modal-box .help-modal-title .icon {
-                font-size: 18px;
-            }
-            
-            .help-modal-box .help-subtitle {
-                font-size: 11px;
-                margin-bottom: 8px;
-            }
-            
-            .help-modal-box .help-modal-actions {
-                flex-direction: row;
-                margin-top: 8px;
-                padding-top: 8px;
-                width: 100%;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-modal-actions .btn {
-                padding: 6px 16px;
-                font-size: 12px;
-                min-width: 70px;
-                flex: 1 1 auto;
-                white-space: nowrap;
-                box-sizing: border-box;
-            }
-            
-            .help-modal-box .help-section input[type="date"],
-            .help-modal-box .help-section select {
+        
+        @media (max-width: 480px) {
+            .main-tab-btn {
                 padding: 6px 10px;
-                font-size: 14px !important;
-            }
-        }
-
-        /* ===== LARGE SCREENS - OPTIMIZATION ===== */
-        @media (min-width: 1200px) {
-            .help-modal-box {
-                max-width: 560px;
-                padding: 30px;
+                font-size: 12px;
+                min-height: 36px;
             }
             
-            .help-modal-box .help-modal-actions .btn {
-                padding: 10px 30px;
-                font-size: 14px;
-                min-width: 120px;
+            .sub-tab-btn {
+                padding: 4px 10px;
+                font-size: 11px;
+                min-height: 30px;
+            }
+            
+            .config-item {
+                padding: 11px 12px;
+            }
+
+            .config-item .item-details {
+                grid-template-columns: 1fr;
+            }
+
+            .status-select-label {
+                margin-left: 0;
+            }
+            
+            .modal-box {
+                padding: 20px;
+                max-width: 95%;
+            }
+            
+            .datetime-group .time-group input[type="number"] {
+                width: 50px;
+            }
+            
+            .datetime-group .time-group select {
+                width: 70px;
             }
         }
-        .calculate-and-close-div{
-            display: flex;
-            justify-content: center;
-            padding: 5px;
+        
+        /* ===== OBJECT FIELD CONTAINER ===== */
+        .object-field-container {
+            background: #f8fafc;
+            border-radius: 16px;
+            padding: 24px;
+            margin-bottom: 24px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.04);
+            border: 1px solid rgba(0,0,0,0.04);
         }
-        .calculate-and-close-div button{
-            background: linear-gradient(135deg, #3498db, #2ecc71);
+        
+        .object-field-container .object-title {
+            color: #00695c;
+            margin-bottom: 20px;
+            font-size: 17px;
+            font-weight: 600;
+            padding-bottom: 12px;
+            border-bottom: 2px solid rgba(0,105,92,0.1);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        
+        .sub-field-group {
+            background: #ffffff;
+            border-radius: 12px;
+            padding: 18px 20px;
+            margin-bottom: 16px;
+            box-shadow: 0 1px 4px rgba(0,0,0,0.04);
+            border: 1px solid rgba(0,0,0,0.04);
+        }
+        
+        .sub-field-group:last-child {
+            margin-bottom: 0;
+        }
+        
+        .sub-field-group label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #1a1a2e;
+            font-size: 14px;
+        }
+        
+        .sub-field-group input,
+        .sub-field-group select,
+        .sub-field-group textarea {
             width: 100%;
-            color: white;
+            padding: 10px 14px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 14px;
+            transition: all 0.3s;
+            background: #fafafa;
+            box-sizing: border-box;
+        }
+        
+        .sub-field-group input:focus,
+        .sub-field-group select:focus,
+        .sub-field-group textarea:focus {
+            border-color: #00695c;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(0,105,92,0.08);
+            background: white;
+        }
+        
+        .sub-field-group .datetime-group {
+            width: 100%;
+        }
+        
+        .sub-field-group .datetime-group .date-input {
+            width: 100%;
+            padding: 10px 14px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 14px;
+            background: #fafafa;
+            box-sizing: border-box;
+        }
+        
+        .sub-field-group .datetime-group .date-input:focus {
+            border-color: #00695c;
+            outline: none;
+            box-shadow: 0 0 0 4px rgba(0,105,92,0.08);
+            background: white;
+        }
+        
+        .sub-field-group .datetime-group .time-group {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            margin-top: 8px;
+        }
+        
+        .sub-field-group .datetime-group .time-group input[type="number"],
+        .sub-field-group .datetime-group .time-group select {
+            padding: 8px 12px;
+            border: 2px solid #e5e7eb;
+            border-radius: 8px;
+            font-size: 14px;
+            background: #fafafa;
+        }
+        
+        .sub-field-group .datetime-group .time-group input[type="number"]:focus,
+        .sub-field-group .datetime-group .time-group select:focus {
+            border-color: #00695c;
+            outline: none;
+        }
+        
+        .no-fields-message {
+            text-align: center;
+            padding: 40px;
+            color: #6b7280;
+        }
+        
+        .no-fields-message .icon {
+            font-size: 48px;
+            margin-bottom: 15px;
+        }
+        
+        .no-fields-message h3 {
+            font-size: 20px;
+            color: #1a1a2e;
+            margin-bottom: 8px;
+        }
+        
+        /* ===== FLASH MESSAGES ===== */
+        .flash-message {
+            padding: 12px 18px;
+            border-radius: 10px;
+            margin-bottom: 15px;
+            font-size: 14px;
+        }
+        
+        .flash-message.success {
+            background: #d1fae5;
+            color: #065f46;
+            border: 1px solid #a7f3d0;
+        }
+        
+        .flash-message.error {
+            background: #fee2e2;
+            color: #991b1b;
+            border: 1px solid #fca5a5;
         }
     </style>
 </head>
@@ -2913,122 +2512,73 @@
     <!-- ===== HEADER ===== -->
     <div class="main-header" id="mainHeader">
         <div style="display:flex; align-items:center; gap:15px;">
-            <button class="header-back" id="backToDashboardBtn" onclick="location.href='serenum.php'" style="display:none; background:rgba(255,255,255,0.25); border:1px solid rgba(255,255,255,0.2); color:white; padding:8px 20px; border-radius:8px; cursor:pointer; font-size:14px; transition:all 0.3s; backdrop-filter:blur(5px);">
-                ← Back to Dashboard
-            </button>
-            <h1 style="font-size:22px; font-weight:600; text-shadow:0 2px 4px rgba(0,0,0,0.1);">Serenum Configuration</h1>
+            <h1>Serenum</h1>
         </div>
-        <div class="header-actions" style="display:flex; gap:10px; align-items:center;">
-            <button onclick="logout()" style="padding:8px 20px; background:linear-gradient(135deg, #e74c3c, #c0392b); color:white; border:none; border-radius:8px; font-size:14px; font-weight:600; cursor:pointer; transition:all 0.3s; box-shadow:0 2px 10px rgba(231,76,60,0.3);">
-                Logout
-            </button>
+        <div class="header-actions">
+            <button class="header-btn" onclick="window.location.href='index.php'">← Tasks</button>
         </div>
     </div>
     
-    <!-- ===== TABS ===== -->
-    <div class="tabs" id="configTabs">
-        <button class="tab-btn active" onclick="switchTab('accounts', this)">Accounts URL</button>
-        <button class="tab-btn" onclick="switchTab('captions', this)">Captions</button>
-        <button class="tab-btn" onclick="switchTab('timeorders', this)">Time Orders</button>
-        <button class="tab-btn" onclick="switchTab('filters', this)">Filters</button>
-        <button class="tab-btn" onclick="switchTab('dynamicfields', this)">Dynamic Fields</button>
+    <!-- ===== MAIN TABS ===== -->
+    <div class="main-tabs" id="mainTabs">
+        <button class="main-tab-btn" data-tab="pending" onclick="switchMainTab('pending')">
+            <span class="status-dot" style="background:#f59e0b;"></span>Pending
+            <span class="badge"><?php echo count($grouped_configs['pending'] ?? []); ?></span>
+        </button>
+        <button class="main-tab-btn" data-tab="completed" onclick="switchMainTab('completed')">
+            <span class="status-dot" style="background:#10b981;"></span>Completed
+            <span class="badge"><?php echo count($grouped_configs['completed'] ?? []); ?></span>
+        </button>
+        <button class="main-tab-btn" data-tab="aborted" onclick="switchMainTab('aborted')">
+            <span class="status-dot" style="background:#ef4444;"></span>Aborted
+            <span class="badge"><?php echo count($grouped_configs['aborted'] ?? []); ?></span>
+        </button>
+        <button class="main-tab-btn" data-tab="setup" onclick="switchMainTab('setup')">
+            ⚙️ Setup Config
+        </button>
+        <button class="main-tab-btn" data-tab="jpgsvault" onclick="switchMainTab('jpgsvault')">
+            🖼️ JPGS Vault
+        </button>
+    </div>
+    
+    <!-- ===== SUB TABS (for Setup Config) ===== -->
+    <div class="sub-tabs" id="subTabs">
+        <button class="sub-tab-btn active" data-subtab="accounts" onclick="switchSubTab('accounts')">Accounts URL</button>
+        <button class="sub-tab-btn" data-subtab="captions" onclick="switchSubTab('captions')">Captions</button>
+        <button class="sub-tab-btn" data-subtab="timeorders" onclick="switchSubTab('timeorders')">Time Orders</button>
+        <button class="sub-tab-btn" data-subtab="filters" onclick="switchSubTab('filters')">Filters</button>
+        <button class="sub-tab-btn" data-subtab="dynamicfields" onclick="switchSubTab('dynamicfields')">Dynamic Fields</button>
     </div>
     
     <!-- ===== SCROLLABLE BODY ===== -->
     <div class="scroll-body" id="scrollBody">
         
-        <!-- ===== MAIN DASHBOARD ===== -->
-        <div id="dashboardView" class="dashboard-container">
-            <div class="dashboard-title">
-                Configuration Dashboard
-                <span class="subtitle">Manage your automation configurations</span>
-            </div>
-            
-            <div class="config-grid">
-                <!-- JPGS Vault Card -->
-                <div class="config-card vault-card" onclick="location.href='jpgsvault.php'" style="background: linear-gradient(145deg, #ffffff, #f0faf5); color: #2c3e50; min-height: 160px; padding: 30px 25px; border: 1px solid rgba(46,204,113,0.08); cursor: pointer; transition: all 0.4s cubic-bezier(0.165, 0.84, 0.44, 1); border-radius: 20px; display: flex; flex-direction: column; justify-content: center; align-items: center; text-align: center; position: relative; overflow: hidden;">
-                    <div style="position:absolute; top:12px; right:12px; padding:3px 14px; border-radius:20px; font-size:11px; font-weight:600; color:white; background: linear-gradient(135deg, #6366f1, #8b5cf6); box-shadow:0 2px 8px rgba(99,102,241,0.3);">Live</div>
-                    <div style="font-size:40px; margin-bottom:8px; color: #6366f1;">🖼️</div>
-                    <div style="font-size:20px; font-weight:600; color:#2c3e50;">JPGS Vault</div>
-                    <div style="font-size:14px; opacity:0.7; margin-top:5px; color:#5a7a8a;">Secure image gallery with bulk upload and folder management</div>
-                </div>
-                
-                <!-- Setup Config Card -->
-                <div class="config-card setup-card" onclick="showSetupView()">
-                    <div class="card-icon">⚙️</div>
-                    <div class="card-title">Setup Config</div>
-                    <div class="card-subtitle">Configure accounts, captions & time orders</div>
-                </div>
-                
-                <!-- Add New Config Card -->
-                <div class="config-card add-new" onclick="showAddConfig()">
-                    <div class="card-icon">+</div>
-                    <div class="card-title">Add New Configuration</div>
-                    <div class="card-subtitle">Create a new automation setup</div>
-                </div>
-                
-                <!-- Status Cards -->
-                <?php foreach (['pending', 'completed', 'aborted'] as $status): ?>
-                    <?php 
-                        $count = count($grouped_configs[$status] ?? []);
-                        $label = $status_labels[$status] ?? ucfirst($status);
-                        $color = $status_colors[$status] ?? '#a0aec0';
-                        $icon = ($status == 'pending') ? '⏳' : (($status == 'completed') ? '✅' : '❌');
-                    ?>
-                    <div class="config-card status-card <?php echo $status; ?>" onclick="showDetailView('<?php echo $status; ?>')">
-                        <div class="card-status-badge"><?php echo ucfirst($status); ?></div>
-                        <div class="card-icon"><?php echo $icon; ?></div>
-                        <div class="card-title"><?php echo $label; ?></div>
-                        <div class="card-count"><?php echo $count; ?> configuration(s)</div>
-                    </div>
-                <?php endforeach; ?>
-            </div>
+        <!-- ===== PENDING TAB ===== -->
+        <div id="tabContentPending" class="tab-content-area">
+            <?php renderTabContent('pending', $grouped_configs['pending'] ?? []); ?>
         </div>
         
-        <!-- ===== DETAIL VIEW ===== -->
-        <div id="detailView" class="detail-view">
-            <div class="detail-header">
-                <button class="btn-back" onclick="showDashboard()">← Back</button>
-                <div class="detail-title" id="detailTitle">Pending Operations <span class="count" id="detailCount"></span></div>
-            </div>
-            <div class="config-list" id="detailList"></div>
+        <!-- ===== COMPLETED TAB ===== -->
+        <div id="tabContentCompleted" class="tab-content-area">
+            <?php renderTabContent('completed', $grouped_configs['completed'] ?? []); ?>
         </div>
         
-        <!-- ===== ADD NEW CONFIG ===== -->
-        <div id="addConfigView" class="add-config-view">
-            <!-- Edit Mode Banner -->
-            <div class="edit-mode-banner" id="editModeBanner">
-                <div class="edit-info">
-                    <span>✏️</span>
-                    <span>Editing: <strong id="editAuthorNameDisplay"></strong></span>
-                </div>
-                <button class="btn-cancel-edit" onclick="cancelEditMode()">Cancel Editing</button>
-            </div>
-            
-            <div class="container">
-                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px;">
-                    <h2 style="color: #333;" id="settingsTabTitle">Set Configuration</h2>
-                </div>
-                
-                
-                <!-- ===== DYNAMIC FIELDS RENDER AREA ===== -->
-                <div id="dynamicFieldsRenderArea">
-                    <div id="dynamicFieldsContainer"></div>
-                </div>
-            </div>
+        <!-- ===== ABORTED TAB ===== -->
+        <div id="tabContentAborted" class="tab-content-area">
+            <?php renderTabContent('aborted', $grouped_configs['aborted'] ?? []); ?>
         </div>
         
-        <!-- ===== SETUP VIEW ===== -->
-        <div id="setupView" class="setup-view">
-            <div class="container">
-                <!-- Accounts URL Tab -->
-                <div id="accounts-tab" class="tab-content active">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <h2 style="color: #333;">Accounts URL</h2>
+        <!-- ===== SETUP CONFIG TAB ===== -->
+        <div id="tabContentSetup" class="tab-content-area">
+            <div class="setup-container">
+                <!-- Accounts URL Sub-tab -->
+                <div id="accounts-tab" class="sub-tab-content">
+                    <div class="section-header">
+                        <h2>Accounts URL</h2>
                         <button class="btn btn-primary" onclick="showAddAccount()">Add New Account</button>
                     </div>
                     
-                    <div id="add_account_form" style="display: none; background: #f8f9fa; padding: 20px; border-radius: 6px; margin-bottom: 20px;">
+                    <div id="add_account_form" style="display: none; background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
                         <div class="form-row">
                             <div class="form-group">
                                 <label>Account Name</label>
@@ -3039,21 +2589,23 @@
                                 <input type="url" id="new_account_url" placeholder="Enter account URL...">
                             </div>
                         </div>
-                        <button class="btn btn-success" onclick="addAccount()">Add Account</button>
-                        <button class="btn btn-secondary" onclick="hideAddAccount()" style="margin-left: 10px;">Cancel</button>
+                        <div class="form-actions">
+                            <button class="btn btn-success" onclick="addAccount()">Add Account</button>
+                            <button class="btn btn-secondary" onclick="hideAddAccount()">Cancel</button>
+                        </div>
                     </div>
                     
                     <div id="accounts_list"></div>
                 </div>
                 
-                <!-- Captions Tab -->
-                <div id="captions-tab" class="tab-content">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <h2 style="color: #333;">Captions</h2>
+                <!-- Captions Sub-tab -->
+                <div id="captions-tab" class="sub-tab-content" style="display:none;">
+                    <div class="section-header">
+                        <h2>Captions</h2>
                         <button class="btn btn-primary" onclick="showAddCaption()">Add New Author Captions</button>
                     </div>
                     
-                    <div id="add_caption_form" style="display: none; background: #f8f9fa; padding: 20px; border-radius: 6px; margin-bottom: 20px;">
+                    <div id="add_caption_form" style="display: none; background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;">
                         <div class="form-group">
                             <label>Select Author</label>
                             <select id="caption_author_select">
@@ -3064,32 +2616,34 @@
                             <label>Caption Text</label>
                             <textarea id="new_caption_text" rows="3" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px; resize:vertical;" placeholder="Enter caption text..."></textarea>
                         </div>
-                        <button class="btn btn-success" onclick="addCaption()">Add Caption</button>
-                        <button class="btn btn-secondary" onclick="hideAddCaption()" style="margin-left: 10px;">Cancel</button>
+                        <div class="form-actions">
+                            <button class="btn btn-success" onclick="addCaption()">Add Caption</button>
+                            <button class="btn btn-secondary" onclick="hideAddCaption()">Cancel</button>
+                        </div>
                     </div>
                     
                     <div id="captions_list"></div>
                 </div>
                 
-                <!-- Time Orders Tab -->
-                <div id="timeorders-tab" class="tab-content">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <h2 style="color: #333;">Time Orders</h2>
+                <!-- Time Orders Sub-tab -->
+                <div id="timeorders-tab" class="sub-tab-content" style="display:none;">
+                    <div class="section-header">
+                        <h2>Time Orders</h2>
                         <button class="btn btn-primary" onclick="showAddTimeOrder()">Add New Time Order</button>
                     </div>
                     
                     <div id="timeorders_list"></div>
                 </div>
-            
-                <!-- Filters Tab -->
-                <div id="filters-tab" class="tab-content">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <h2 style="color: #333;">Filters</h2>
+                
+                <!-- Filters Sub-tab -->
+                <div id="filters-tab" class="sub-tab-content" style="display:none;">
+                    <div class="section-header">
+                        <h2>Filters</h2>
                     </div>
                     
                     <div class="form-group">
                         <label>Add Filter</label>
-                        <div class="group-input-container">
+                        <div class="list-input-container">
                             <input type="text" id="filter_input" placeholder="Enter filter name...">
                             <button class="btn btn-primary" onclick="addFilter()">Add</button>
                         </div>
@@ -3097,26 +2651,70 @@
                     </div>
                 </div>
                 
-                <!-- Dynamic Fields Tab -->
-                <div id="dynamicfields-tab" class="tab-content">
-                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
-                        <h2 style="color: #333;">Dynamic Fields</h2>
+                <!-- Dynamic Fields Sub-tab -->
+                <div id="dynamicfields-tab" class="sub-tab-content" style="display:none;">
+                    <div class="section-header">
+                        <h2>Dynamic Fields</h2>
                         <button class="btn btn-primary" onclick="showAddDynamicFieldModal()">Add New Field</button>
                     </div>
+                    <p style="color:#64748b;font-size:12px;margin:-10px 0 14px;">Use the ↑ and ↓ arrows to reposition any field. The new order saves automatically and is used the next time the Add/Edit Configuration form opens.</p>
                     
                     <div id="dynamic_fields_list"></div>
                 </div>
             </div>
         </div>
+        
+        <!-- ===== JPGS VAULT TAB ===== -->
+        <div id="tabContentJpgsvault" class="tab-content-area">
+            <div style="text-align: center; padding: 60px 20px;">
+                <div style="font-size: 64px; margin-bottom: 20px;">🖼️</div>
+                <h2 style="font-size: 24px; color: #1a1a2e; margin-bottom: 10px;">JPGS Vault</h2>
+                <p style="color: #6b7280; font-size: 16px; margin-bottom: 30px;">Manage your image gallery with bulk upload and folder organization</p>
+                <button class="btn btn-primary" onclick="window.location.href='jpgsvault.php'" style="padding: 14px 40px; font-size: 16px;">
+                    Open JPGS Vault →
+                </button>
+            </div>
+        </div>
+        
+        <!-- ===== ADD CONFIG VIEW ===== -->
+        <div id="addConfigView">
+            <div class="detail-header">
+                <button class="btn-back" onclick="closeAddConfig()">← Back</button>
+                <div class="detail-title" id="settingsTabTitle">New Configuration</div>
+            </div>
+            
+            <!-- Edit Mode Banner -->
+            <div class="edit-mode-banner" id="editModeBanner">
+                <div class="edit-info">
+                    <span>✏️</span>
+                    <span>Editing: <strong id="editAuthorNameDisplay"></strong></span>
+                </div>
+                <button class="btn-cancel-edit" onclick="cancelEditMode()">Cancel Editing</button>
+            </div>
+            
+            <div class="form-container">
+                <form method="POST" id="configForm" onsubmit="submitConfig(event)">
+                    <input type="hidden" name="save_config" value="true">
+                    <input type="hidden" name="config_data" id="configDataInput">
+                    <div id="dynamicFieldsContainer"></div>
+                    <div class="form-actions">
+                        <button type="submit" class="btn btn-success">💾 Submit Configuration</button>
+                        <button type="button" class="btn btn-secondary" onclick="closeAddConfig()">Cancel</button>
+                    </div>
+                </form>
+            </div>
+        </div>
+        
     </div>
+    
+    <!-- ===== FLOATING ACTION BUTTON ===== -->
+    <button class="fab" id="fabButton" onclick="openAddConfig()" title="Add New Configuration">+</button>
     
     <!-- ===== SAVE BUTTONS ===== -->
     <div class="save-btn-container" id="saveBtnContainer">
         <button class="btn btn-save-config" id="saveConfigBtn" onclick="saveConfig()" style="display:none;">💾 Save Configuration</button>
         <button class="btn btn-save-setup" id="saveSetupBtn" onclick="saveSetup()" style="display:none;">💾 Save Setup</button>
     </div>
-    <!-- ===== FLOATING HELP BUTTON ===== -->
-    <button class="help-floating-btn" id="helpFloatingBtn" onclick="openHelpModal()">?</button>
     
     <!-- ===== MODAL ===== -->
     <div class="modal-overlay" id="customModal">
@@ -3129,77 +2727,236 @@
             </div>
         </div>
     </div>
-    <!-- ===== HELP MODAL ===== -->
-    <div class="help-modal-overlay" id="helpModal">
-        <div class="help-modal-box">
-            <div class="help-modal-title">
-                <span class="icon">📊</span>
-                Calculate Images Needed
-            </div>
-            <div class="help-subtitle">
-                Enter the date range to calculate how many images/cards are needed based on the selected time order.
-            </div>
-            
-            <div class="help-section">
-                <div class="section-label">
-                    📅 From Date
-                    <span class="badge">Start</span>
-                </div>
-                <input type="date" id="helpFromDate">
-            </div>
-            
-            <div class="help-section">
-                <div class="section-label">
-                    📅 To Date
-                    <span class="badge">End</span>
-                </div>
-                <input type="date" id="helpToDate">
-            </div>
-            
-            <div class="help-section">
-                <div class="section-label">
-                    ⏰ Time Order
-                    <span class="badge" id="helpTimeOrderName">Select a time order</span>
-                </div>
-                <select id="helpTimeOrderSelect">
-                    <option value="">-- Select Time Order --</option>
-                </select>
-                <div class="time-list-display-wrapper" id="helpTimeListWrapper">
-                    <div id="helpTimeListDisplay">
-                        <div class="no-times">Select a time order to see the times</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="help-section" id="helpResultSection" style="display:none;">
-                <div class="calculation-result">
-                    <div class="result-row">
-                        <span class="label">📅 Total Days:</span>
-                        <span class="value" id="helpTotalDays">0</span>
-                    </div>
-                    <div class="result-row">
-                        <span class="label">⏰ Times Per Day:</span>
-                        <span class="value" id="helpTimesPerDay">0</span>
-                    </div>
-                    <div class="result-row">
-                        <span class="label">🖼️ Total Images Needed:</span>
-                        <span class="value highlight" id="helpTotalImages">0</span>
-                    </div>
-                    <div style="margin-top:10px; padding-top:10px; border-top:1px dashed #c8e0d8; font-size:12px; color:#5a7a8a;">
-                        Calculation: Days × Times Per Day = Total Images
-                    </div>
-                </div>
-            </div>
-            
-            <div class="calculate-and-close-div">
-                <button class="btn btn-calc" onclick="calculateHelp()">🧮 Calculate</button>
-            </div>
-            
-            <div class="calculate-and-close-div">
-                <button class="btn btn-close-help" onclick="closeHelpModal()">Close</button>
-            </div>
-        </div>
-    </div>
+
+<?php
+    // Convert stored keys such as account_url or key-name into readable labels.
+    function formatSerenumFieldLabel($key) {
+        $label = preg_replace('/[_-]+/', ' ', (string)$key);
+        return ucwords(trim($label));
+    }
+
+    // Recover a readable author label from older records where a select field's
+    // Submit-As JSON payload was accidentally stored as the author name.
+    function resolveSerenumAuthorLabel($config) {
+        $candidates = [];
+        if (is_array($config)) {
+            if (isset($config['author'])) $candidates[] = $config['author'];
+            if (isset($config['dynamic_values']) && is_array($config['dynamic_values']) && isset($config['dynamic_values']['author'])) {
+                $candidates[] = $config['dynamic_values']['author'];
+            }
+        }
+
+        foreach ($candidates as $candidate) {
+            if (!is_scalar($candidate)) continue;
+            $label = trim((string)$candidate);
+            if ($label === '') continue;
+
+            $trimmed = $label;
+            if ($trimmed[0] === '{' || $trimmed[0] === '[') {
+                $decoded = json_decode($trimmed, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                    $decodedKeys = array_keys($decoded);
+                    $isList = ($decoded === [] || $decodedKeys === range(0, count($decoded) - 1));
+                    if ($isList && isset($decoded[0]) && is_array($decoded[0]) && !empty($decoded[0]['key-name'])) {
+                        return (string)$decoded[0]['key-name'];
+                    }
+                    if (!$isList && count($decoded) === 1) {
+                        $firstKey = array_key_first($decoded);
+                        if (is_scalar($firstKey) && (string)$firstKey !== '') return (string)$firstKey;
+                    }
+                }
+            }
+            return $label;
+        }
+
+        return 'Unknown Author';
+    }
+
+    // Decode JSON text stored inside string fields (for example jpgsurl,
+    // author_caption, account_url and time_order_type). Decode recursively so
+    // nested JSON is displayed as real, indented JSON instead of one long line.
+    function normalizeSerenumValueForDisplay($value) {
+        if (is_array($value)) {
+            foreach ($value as $key => $childValue) {
+                $value[$key] = normalizeSerenumValueForDisplay($childValue);
+            }
+            return $value;
+        }
+
+        if (is_object($value)) {
+            foreach ($value as $key => $childValue) {
+                $value->{$key} = normalizeSerenumValueForDisplay($childValue);
+            }
+            return $value;
+        }
+
+        if (is_string($value)) {
+            $trimmed = trim($value);
+            if ($trimmed !== '' && ($trimmed[0] === '{' || $trimmed[0] === '[')) {
+                $decoded = json_decode($trimmed, true, 512, JSON_BIGINT_AS_STRING);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                    return normalizeSerenumValueForDisplay($decoded);
+                }
+            }
+        }
+
+        return $value;
+    }
+
+    // Render one compact field. Values that contain objects/arrays are shown as
+    // indented JSON; CSS keeps long content inside a fixed-height scroll area.
+    // Copy controls are intentionally limited to the whole entry and status tab.
+    function renderSerenumDetailField($key, $value) {
+        $label = formatSerenumFieldLabel($key);
+        $value = normalizeSerenumValueForDisplay($value);
+        $isStructured = is_array($value) || is_object($value);
+
+        if ($isStructured) {
+            $displayText = json_encode(
+                $value,
+                JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE
+            );
+            if ($displayText === false) $displayText = '[]';
+            $valueClass = 'detail-value json-value';
+        } elseif (is_bool($value)) {
+            $displayText = $value ? 'true' : 'false';
+            $valueClass = 'detail-value';
+        } elseif ($value === null) {
+            $displayText = 'null';
+            $valueClass = 'detail-value';
+        } else {
+            $displayText = (string)$value;
+            $valueClass = 'detail-value';
+        }
+
+        $safeLabel = htmlspecialchars($label, ENT_QUOTES, 'UTF-8');
+        $safeDisplay = htmlspecialchars($displayText, ENT_QUOTES, 'UTF-8');
+
+        echo '<div class="detail-field">';
+        echo '<div class="detail-label">' . $safeLabel . '</div>';
+        if ($isStructured) {
+            echo '<pre class="' . $valueClass . '">' . $safeDisplay . '</pre>';
+        } else {
+            echo '<div class="' . $valueClass . '">' . ($safeDisplay === '' ? '<span style="color:#94a3b8;">(empty)</span>' : $safeDisplay) . '</div>';
+        }
+        echo '</div>';
+    }
+
+    // Helper function to render tab content.
+    // Each status tab gets a global Copy All control, including when it is empty.
+    function renderTabContent($tab, $entries) {
+        $statusNames = [
+            'pending' => 'Pending',
+            'completed' => 'Completed',
+            'aborted' => 'Aborted'
+        ];
+        $statusName = $statusNames[$tab] ?? ucfirst($tab);
+
+        echo '<div class="status-copy-toolbar">';
+        echo '<button type="button" class="status-copy-button" onclick="copyAllStatusEntries(\'' . htmlspecialchars($tab, ENT_QUOTES, 'UTF-8') . '\', this)">📋 Copy All ' . htmlspecialchars($statusName, ENT_QUOTES, 'UTF-8') . ' Data</button>';
+        echo '</div>';
+
+        if (empty($entries)) {
+            $messages = [
+                'pending' => 'No pending configurations.',
+                'completed' => 'No completed configurations.',
+                'aborted' => 'No aborted configurations.'
+            ];
+            echo '<div class="empty-state">';
+            echo '<div class="icon">📋</div>';
+            echo '<h3>' . htmlspecialchars($messages[$tab] ?? 'No entries found.', ENT_QUOTES, 'UTF-8') . '</h3>';
+            echo '<p>Create a new configuration using the + button.</p>';
+            echo '</div>';
+            return;
+        }
+
+        $statusColors = [
+            'pending' => '#f59e0b',
+            'completed' => '#10b981',
+            'aborted' => '#ef4444'
+        ];
+        $statusLabels = [
+            'pending' => 'Pending',
+            'completed' => 'Completed',
+            'aborted' => 'Aborted'
+        ];
+
+        echo '<div class="config-list">';
+        foreach ($entries as $config) {
+            $index = isset($config['_index']) ? (int)$config['_index'] : 0;
+            $status = isset($config['status']) ? strtolower((string)$config['status']) : 'pending';
+            $statusColor = $statusColors[$status] ?? '#6b7280';
+            $statusLabel = $statusLabels[$status] ?? ucfirst($status);
+
+            // Use a clean author label even for records created by the old
+            // Submit-As select handling that stored a JSON wrapper as the name.
+            $author = resolveSerenumAuthorLabel($config);
+
+            // dynamic_values is the canonical source for submitted form values.
+            // Legacy flattened root-level values are included only when a field is
+            // absent from dynamic_values, never allowed to mask a recent edit.
+            $displayValues = [];
+            if (isset($config['dynamic_values']) && is_array($config['dynamic_values'])) {
+                foreach ($config['dynamic_values'] as $dynamicKey => $dynamicValue) {
+                    if (in_array((string)$dynamicKey, ['_object', 'status', 'operation_status'], true)) continue;
+                    $displayValues[$dynamicKey] = $dynamicValue;
+                }
+            }
+            foreach ($config as $key => $value) {
+                if (in_array((string)$key, ['author', 'status', 'operation_status', '_index', '_object', '_user', '_user_id', 'dynamic_values'], true)) {
+                    continue;
+                }
+                if (!array_key_exists($key, $displayValues)) {
+                    $displayValues[$key] = $value;
+                }
+            }
+
+            echo '<div class="config-item" style="border-left-color:' . $statusColor . ';">';
+            echo '<div class="item-header">';
+            echo '<span class="item-author">' . htmlspecialchars($author, ENT_QUOTES, 'UTF-8') . '</span>';
+            echo '<span class="item-status" style="background:' . $statusColor . ';">' . htmlspecialchars($statusLabel, ENT_QUOTES, 'UTF-8') . '</span>';
+            echo '</div>';
+
+            if (!empty($displayValues)) {
+                echo '<div class="item-details">';
+                foreach ($displayValues as $key => $value) {
+                    renderSerenumDetailField($key, $value);
+                }
+                echo '</div>';
+            } else {
+                echo '<div style="margin-top:10px;color:#94a3b8;font-size:13px;">No configuration fields available.</div>';
+            }
+
+            // Keep operation_status separate from the ordinary configuration fields.
+            if (isset($config['operation_status']) && $config['operation_status'] !== '') {
+                $operationStatusText = (string)$config['operation_status'];
+                echo '<div class="operation-status-panel">';
+                echo '<div class="detail-label">Operation Status</div>';
+                echo '<div class="detail-value">' . htmlspecialchars($operationStatusText, ENT_QUOTES, 'UTF-8') . '</div>';
+                echo '</div>';
+            }
+
+            echo '<div class="item-actions">';
+            echo '<button type="button" class="btn btn-secondary btn-sm" onclick="copySingleStatusEntry(' . $index . ', this)">📋 Copy Entry</button>';
+            echo '<button type="button" class="btn btn-edit" onclick="showEditConfigByIndex(' . $index . ')">✏️ Edit</button>';
+            // Pass the author label printed in this exact card. Do not re-resolve
+            // it from a potentially stale parallel JavaScript array.
+            $safeAuthorAttribute = htmlspecialchars($author, ENT_QUOTES, 'UTF-8');
+            echo '<button type="button" class="btn btn-delete" data-author="' . $safeAuthorAttribute . '" onclick="deleteConfigByIndex(' . $index . ', this.dataset.author)">🗑️ Delete</button>';
+            echo '<label class="status-select-label" for="statusSelect_' . $index . '">Status';
+            echo '<select id="statusSelect_' . $index . '" class="status-select" data-current-status="' . htmlspecialchars($status, ENT_QUOTES, 'UTF-8') . '" onchange="handleStatusSelectChange(' . $index . ', this)">';
+            foreach (['pending' => 'Pending', 'completed' => 'Completed', 'aborted' => 'Aborted'] as $statusOption => $statusOptionLabel) {
+                $selected = ($status === $statusOption) ? ' selected' : '';
+                echo '<option value="' . $statusOption . '"' . $selected . '>' . $statusOptionLabel . '</option>';
+            }
+            echo '</select></label>';
+            echo '</div>';
+            echo '</div>';
+        }
+        echo '</div>';
+    }
+?>
+
 <script>
     // ===== DATA =====
     let configData = {
@@ -3211,9 +2968,6 @@
         dynamic_fields: <?php echo json_encode($dynamic_fields_data); ?>
     };
     
-    // ===== COPIED LINKS DATA FROM JPGSVAULT =====
-    let copiedLinksData = <?php echo json_encode($copiedLinksData); ?>;
-    
     let configId = <?php echo $config_id ?? 0; ?>;
     let isEditMode = false;
     let editingAuthor = '';
@@ -3223,1543 +2977,700 @@
     // Store time format preference per field
     let timeFormatPreferences = {};
     
-    // Store submit as preference per field
-    let submitAsPreferences = {};
-    
     // Store list values for modal
-    let _newListValues = [];
-    
-    // Ensure proper data types
-    if (!configData.accounts || typeof configData.accounts !== 'object' || Array.isArray(configData.accounts)) {
-        configData.accounts = {};
-    }
-    if (!configData.captions || !Array.isArray(configData.captions)) {
-        configData.captions = [];
-    }
-    if (!configData.timeorders || typeof configData.timeorders !== 'object' || Array.isArray(configData.timeorders)) {
-        configData.timeorders = {};
-    }
-    if (!configData.settings || !Array.isArray(configData.settings) && !configData.settings.author) {
-        configData.settings = [];
-    }
-    if (!configData.dynamic_fields || typeof configData.dynamic_fields !== 'object' || Array.isArray(configData.dynamic_fields)) {
-        configData.dynamic_fields = {};
-    }
-    
-    let currentTimeOrderName = '';
-    let editingTimeOrderKey = null;
-    let editingCaptionAuthor = null;
-    let _newTimeList = [];
     let _newDefaultValues = [];
-    // ===== HELP MODAL FUNCTIONS =====
-    function openHelpModal() {
-        document.getElementById('helpModal').classList.add('active');
-        // Populate time orders
-        populateHelpTimeOrders();
-        // Set default dates (today and 7 days from now)
-        const today = new Date();
-        const sevenDaysLater = new Date();
-        sevenDaysLater.setDate(today.getDate() + 7);
-        
-        document.getElementById('helpFromDate').value = today.toISOString().split('T')[0];
-        document.getElementById('helpToDate').value = sevenDaysLater.toISOString().split('T')[0];
-        
-        // Hide result section initially
-        document.getElementById('helpResultSection').style.display = 'none';
+    let _newListValues = [];
+    let _newTimeList = [];
+
+    // ===== STATUS DATA COPY CONTROLS (matching the SceneIQ server pattern) =====
+    function setSerenumCopyFeedback(button) {
+        if (!button) return;
+        if (!button.dataset.originalCopyLabel) {
+            button.dataset.originalCopyLabel = button.innerHTML;
+        }
+        button.innerHTML = '&#10003; Copied';
+        button.classList.add('copy-button-copied');
+        if (button._serenumCopyTimer) clearTimeout(button._serenumCopyTimer);
+        button._serenumCopyTimer = setTimeout(function() {
+            button.innerHTML = button.dataset.originalCopyLabel;
+            button.classList.remove('copy-button-copied');
+        }, 1800);
     }
 
-    function closeHelpModal() {
-        document.getElementById('helpModal').classList.remove('active');
-    }
+    function fallbackSerenumCopy(text, button) {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        textarea.setAttribute('readonly', 'readonly');
+        textarea.style.position = 'fixed';
+        textarea.style.left = '-9999px';
+        textarea.style.top = '0';
+        document.body.appendChild(textarea);
+        textarea.select();
+        textarea.setSelectionRange(0, textarea.value.length);
+        let copied = false;
+        try {
+            copied = document.execCommand('copy');
+        } catch (error) {
+            copied = false;
+        }
+        document.body.removeChild(textarea);
 
-    function populateHelpTimeOrders() {
-        const select = document.getElementById('helpTimeOrderSelect');
-        const timeOrders = configData.timeorders || {};
-        select.innerHTML = '<option value="">-- Select Time Order --</option>';
-        
-        for (const [key, value] of Object.entries(timeOrders)) {
-            const option = document.createElement('option');
-            option.value = key;
-            const count = Array.isArray(value) ? value.length : 0;
-            option.textContent = key + ' (' + count + ' times)';
-            select.appendChild(option);
-        }
-        
-        // Auto-select first time order if exists
-        const keys = Object.keys(timeOrders);
-        if (keys.length > 0) {
-            select.value = keys[0];
-            displayHelpTimes(keys[0]);
-        }
-        
-        // Add change event
-        select.onchange = function() {
-            displayHelpTimes(this.value);
-        };
-    }
-
-    function displayHelpTimes(key) {
-        const container = document.getElementById('helpTimeListDisplay');
-        const wrapper = document.getElementById('helpTimeListWrapper');
-        const timeOrders = configData.timeorders || {};
-        
-        if (!key || !timeOrders[key]) {
-            container.innerHTML = '<div class="no-times">Select a time order to see the times</div>';
-            document.getElementById('helpTimeOrderName').textContent = 'Select a time order';
-            return;
-        }
-        
-        const times = timeOrders[key];
-        document.getElementById('helpTimeOrderName').textContent = key + ' (' + times.length + ' times)';
-        
-        if (!Array.isArray(times) || times.length === 0) {
-            container.innerHTML = '<div class="no-times">No times recorded for this order</div>';
-            return;
-        }
-        
-        let html = '<div class="time-list-display">';
-        html += '<div class="time-item header">12 Hours</div>';
-        html += '<div class="time-item header">24 Hours</div>';
-        times.forEach(time => {
-            const time12 = time['12hours'] || time.twelveHour || time.time || '--:--';
-            const time24 = time['24hours'] || time.twentyFourHour || '';
-            html += '<div class="time-item">' + time12 + '</div>';
-            html += '<div class="time-item">' + time24 + '</div>';
-        });
-        html += '</div>';
-        container.innerHTML = html;
-    }
-
-    function calculateHelp() {
-        const fromDate = document.getElementById('helpFromDate').value;
-        const toDate = document.getElementById('helpToDate').value;
-        const timeOrderKey = document.getElementById('helpTimeOrderSelect').value;
-        const timeOrders = configData.timeorders || {};
-        
-        if (!fromDate || !toDate) {
-            showModal('Error', 'Please select both From and To dates.');
-            return;
-        }
-        
-        if (!timeOrderKey || !timeOrders[timeOrderKey]) {
-            showModal('Error', 'Please select a valid time order.');
-            return;
-        }
-        
-        // Calculate days difference
-        const from = new Date(fromDate);
-        const to = new Date(toDate);
-        const diffTime = Math.abs(to - from);
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1; // Include both days
-        
-        // Get times per day
-        const times = timeOrders[timeOrderKey];
-        const timesPerDay = Array.isArray(times) ? times.length : 0;
-        
-        // Calculate total images needed
-        const totalImages = diffDays * timesPerDay;
-        
-        // Display result
-        document.getElementById('helpTotalDays').textContent = diffDays;
-        document.getElementById('helpTimesPerDay').textContent = timesPerDay;
-        document.getElementById('helpTotalImages').textContent = totalImages;
-        document.getElementById('helpResultSection').style.display = 'block';
-        
-        // Scroll to result
-        document.getElementById('helpResultSection').scrollIntoView({ behavior: 'smooth', block: 'center' });
-    }
-
-    // Close help modal on overlay click
-    document.addEventListener('click', function(e) {
-        if (e.target === document.getElementById('helpModal')) {
-            closeHelpModal();
-        }
-    });
-
-    // Show/hide help button based on view
-    function toggleHelpButton() {
-        const btn = document.getElementById('helpFloatingBtn');
-        const addConfigView = document.getElementById('addConfigView');
-        if (addConfigView && addConfigView.classList.contains('active')) {
-            btn.classList.add('visible');
+        if (copied) {
+            setSerenumCopyFeedback(button);
         } else {
-            btn.classList.remove('visible');
+            showModal('Copy Error', 'The browser could not copy this data. Please select and copy it manually.');
         }
     }
 
-    // Override showAddConfig and showDashboard to toggle help button
-    const originalShowAddConfig = window.showAddConfig;
-    window.showAddConfig = function() {
-        if (originalShowAddConfig) originalShowAddConfig();
-        setTimeout(toggleHelpButton, 100);
-    };
-
-    const originalShowDashboard = window.showDashboard;
-    window.showDashboard = function() {
-        if (originalShowDashboard) originalShowDashboard();
-        setTimeout(toggleHelpButton, 100);
-    };
-
-    // Also check when views change via other functions
-    const originalShowSetupView = window.showSetupView;
-    window.showSetupView = function() {
-        if (originalShowSetupView) originalShowSetupView();
-        setTimeout(toggleHelpButton, 100);
-    };
-
-    const originalShowDetailView = window.showDetailView;
-    window.showDetailView = function(status) {
-        if (originalShowDetailView) originalShowDetailView(status);
-        setTimeout(toggleHelpButton, 100);
-    };
-    
-    // ===== VIEW NAVIGATION =====
-    function showDashboard() {
-        clearEditMode();
-        document.getElementById('dashboardView').style.display = 'block';
-        document.getElementById('detailView').classList.remove('active');
-        document.getElementById('detailView').style.display = 'none';
-        document.getElementById('addConfigView').classList.remove('active');
-        document.getElementById('addConfigView').style.display = 'none';
-        document.getElementById('setupView').classList.remove('active');
-        document.getElementById('setupView').style.display = 'none';
-        document.getElementById('configTabs').classList.remove('visible');
-        document.getElementById('saveBtnContainer').classList.remove('visible');
-        document.getElementById('saveConfigBtn').style.display = 'none';
-        document.getElementById('saveSetupBtn').style.display = 'none';
-        document.getElementById('backToDashboardBtn').style.display = 'none';
-        document.getElementById('scrollBody').classList.remove('tabs-visible');
-        document.getElementById('editModeBanner').classList.remove('visible');
-        
-        // Hide help button
-        document.getElementById('helpFloatingBtn').classList.remove('visible');
-    }
-    
-    function showDetailView(status) {
-        clearEditMode();
-        document.getElementById('dashboardView').style.display = 'none';
-        document.getElementById('addConfigView').classList.remove('active');
-        document.getElementById('addConfigView').style.display = 'none';
-        document.getElementById('setupView').classList.remove('active');
-        document.getElementById('setupView').style.display = 'none';
-        document.getElementById('configTabs').classList.remove('visible');
-        document.getElementById('saveBtnContainer').classList.remove('visible');
-        document.getElementById('saveConfigBtn').style.display = 'none';
-        document.getElementById('saveSetupBtn').style.display = 'none';
-        document.getElementById('backToDashboardBtn').style.display = 'block';
-        document.getElementById('scrollBody').classList.remove('tabs-visible');
-        document.getElementById('editModeBanner').classList.remove('visible');
-        
-        const view = document.getElementById('detailView');
-        view.style.display = 'block';
-        view.classList.add('active');
-        
-        const statusLabels = {
-            'pending': 'Pending Operations',
-            'completed': 'Completed Operations',
-            'aborted': 'Aborted Operations'
-        };
-        
-        document.getElementById('detailTitle').innerHTML = (statusLabels[status] || status) + ' <span class="count" id="detailCount"></span>';
-        
-        // Get configurations for this status
-        const configs = getConfigsByStatus(status);
-        document.getElementById('detailCount').textContent = configs.length + ' configuration(s)';
-        
-        renderConfigList(configs);
-    }
-    
-    function showAddConfig() {
-        clearEditMode();
-        document.getElementById('dashboardView').style.display = 'none';
-        document.getElementById('detailView').classList.remove('active');
-        document.getElementById('detailView').style.display = 'none';
-        document.getElementById('setupView').classList.remove('active');
-        document.getElementById('setupView').style.display = 'none';
-        document.getElementById('addConfigView').classList.add('active');
-        document.getElementById('addConfigView').style.display = 'block';
-        document.getElementById('configTabs').classList.remove('visible');
-        document.getElementById('saveBtnContainer').classList.add('visible');
-        document.getElementById('saveConfigBtn').style.display = 'block';
-        document.getElementById('saveSetupBtn').style.display = 'none';
-        document.getElementById('backToDashboardBtn').style.display = 'block';
-        document.getElementById('settingsTabTitle').textContent = 'Set Configuration';
-        document.getElementById('scrollBody').classList.remove('tabs-visible');
-        document.getElementById('editModeBanner').classList.remove('visible');
-        
-        // Show help button
-        document.getElementById('helpFloatingBtn').classList.add('visible');
-        
-        loadAllData();
-        renderDynamicFields();
-    }
-        
-    function showSetupView() {
-        clearEditMode();
-        document.getElementById('dashboardView').style.display = 'none';
-        document.getElementById('detailView').classList.remove('active');
-        document.getElementById('detailView').style.display = 'none';
-        document.getElementById('addConfigView').classList.remove('active');
-        document.getElementById('addConfigView').style.display = 'none';
-        document.getElementById('setupView').classList.add('active');
-        document.getElementById('setupView').style.display = 'block';
-        document.getElementById('configTabs').classList.add('visible');
-        document.getElementById('saveBtnContainer').classList.add('visible');
-        document.getElementById('saveConfigBtn').style.display = 'none';
-        document.getElementById('saveSetupBtn').style.display = 'block';
-        document.getElementById('backToDashboardBtn').style.display = 'block';
-        document.getElementById('scrollBody').classList.add('tabs-visible');
-        document.getElementById('editModeBanner').classList.remove('visible');
-        
-        // Switch to accounts tab by default
-        switchTab('accounts', document.querySelector('.tab-btn'));
-        
-        loadSetupData();
-    }
-    
-    function editConfigByIndex(index) {
-        const settings = configData.settings;
-        
-        if (!Array.isArray(settings) || index < 0 || index >= settings.length) {
-            showModal('Error', 'Invalid configuration index.');
-            return;
+    function serenumCopyToClipboard(value, button) {
+        const textToCopy = value === null || value === undefined ? '' : String(value);
+        if (navigator.clipboard && typeof navigator.clipboard.writeText === 'function') {
+            navigator.clipboard.writeText(textToCopy).then(function() {
+                setSerenumCopyFeedback(button);
+            }).catch(function() {
+                fallbackSerenumCopy(textToCopy, button);
+            });
+        } else {
+            fallbackSerenumCopy(textToCopy, button);
         }
-        
-        const config = settings[index];
-        let author = 'Unknown Author';
-        
-        if (config && typeof config === 'object') {
-            author = config.author || (config.dynamic_values && config.dynamic_values.author) || 'Unknown';
+    }
+
+    // Convert JSON text stored in string fields into actual nested JSON values
+    // before copying. This keeps bulk and entry exports neatly formatted too.
+    function normalizeSerenumCopyValue(value) {
+        if (Array.isArray(value)) {
+            return value.map(normalizeSerenumCopyValue);
         }
-        
-        isEditMode = true;
-        editingAuthor = author;
-        window._editingIndex = index;
-        
-        document.getElementById('dashboardView').style.display = 'none';
-        document.getElementById('detailView').classList.remove('active');
-        document.getElementById('detailView').style.display = 'none';
-        document.getElementById('setupView').classList.remove('active');
-        document.getElementById('setupView').style.display = 'none';
-        document.getElementById('addConfigView').classList.add('active');
-        document.getElementById('addConfigView').style.display = 'block';
-        document.getElementById('configTabs').classList.remove('visible');
-        document.getElementById('saveBtnContainer').classList.add('visible');
-        document.getElementById('saveConfigBtn').style.display = 'block';
-        document.getElementById('saveSetupBtn').style.display = 'none';
-        document.getElementById('backToDashboardBtn').style.display = 'block';
-        document.getElementById('editAuthorNameDisplay').textContent = author;
-        document.getElementById('settingsTabTitle').textContent = 'Edit Configuration - ' + author;
-        document.getElementById('scrollBody').classList.remove('tabs-visible');
-        document.getElementById('editModeBanner').classList.add('visible');
-        
-        // Load the config data
-        if (config && config.dynamic_values) {
-            loadDynamicValues(config.dynamic_values);
+        if (value && typeof value === 'object') {
+            const normalized = {};
+            Object.keys(value).forEach(function(key) {
+                normalized[key] = normalizeSerenumCopyValue(value[key]);
+            });
+            return normalized;
         }
-        
-        loadAccounts();
-        loadCaptions();
-        loadTimeOrders();
-        loadFilters();
-        loadCaptionAuthors();
-        renderDynamicFields();
-    }
-    
-    function cancelEditMode() {
-        window._editingIndex = null;
-        showDashboard();
-    }
-    
-    function clearEditMode() {
-        isEditMode = false;
-        editingAuthor = '';
-        window._editingIndex = null;
-        document.getElementById('settingsTabTitle').textContent = 'Set Configuration';
-        document.getElementById('editModeBanner').classList.remove('visible');
-    }
-    
-    function loadSetupData() {
-        loadAccounts();
-        loadCaptions();
-        loadTimeOrders();
-        loadFilters();
-        loadCaptionAuthors();
-        loadDynamicFields();
-    }
-    function loadConfigForEdit(author) {
-        // Find the config in the data
-        const settings = configData.settings;
-        let foundConfig = null;
-        
-        if (Array.isArray(settings)) {
-            for (let config of settings) {
-                if (config && typeof config === 'object') {
-                    // Check if config matches by author or by dynamic_values.author
-                    let configAuthor = config.author || (config.dynamic_values && config.dynamic_values.author);
-                    if (configAuthor === author) {
-                        foundConfig = config;
-                        break;
+        if (typeof value === 'string') {
+            const trimmed = value.trim();
+            if (trimmed && (trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[')) {
+                try {
+                    const parsed = JSON.parse(trimmed);
+                    if (parsed && typeof parsed === 'object') {
+                        return normalizeSerenumCopyValue(parsed);
                     }
+                } catch (error) {
+                    // Preserve the original text when it is not valid JSON.
                 }
             }
-        } else if (settings && typeof settings === 'object') {
-            let configAuthor = settings.author || (settings.dynamic_values && settings.dynamic_values.author);
-            if (configAuthor === author) {
-                foundConfig = settings;
-            }
+        }
+        return value;
+    }
+
+    // Copy all records belonging to the selected status tab as one valid,
+    // consistently indented JSON array.
+    function copyAllStatusEntries(status, button) {
+        const allRecords = Array.isArray(configData.settings) ? configData.settings : [];
+        const normalizedStatus = String(status || '').toLowerCase();
+        const records = allRecords.filter(function(entry) {
+            const entryStatus = String((entry && entry.status) || 'pending').toLowerCase();
+            return entryStatus === normalizedStatus;
+        }).map(normalizeSerenumCopyValue);
+
+        if (!records.length) {
+            showModal('No Data', 'There are no ' + normalizedStatus + ' records to copy.');
+            return;
+        }
+
+        serenumCopyToClipboard(JSON.stringify(records, null, 2), button);
+    }
+
+    // Copy one complete configuration record, including status and operation status.
+    function copySingleStatusEntry(index, button) {
+        const entryIndex = Number(index);
+        const records = Array.isArray(configData.settings) ? configData.settings : [];
+        if (!Number.isInteger(entryIndex) || entryIndex < 0 || !records[entryIndex] || typeof records[entryIndex] !== 'object') {
+            showModal('Copy Error', 'This configuration could not be found. Refresh the page and try again.');
+            return;
+        }
+
+        const normalizedRecord = normalizeSerenumCopyValue(records[entryIndex]);
+        serenumCopyToClipboard(JSON.stringify(normalizedRecord, null, 2), button);
+    }
+
+    // ===== MAIN TAB SWITCHING =====
+    function switchMainTab(tab) {
+        // Navigating away from the editor cancels its pending edit context.
+        if (document.getElementById('addConfigView') &&
+            document.getElementById('addConfigView').classList.contains('active')) {
+            resetSerenumEditorState();
+        }
+        // Update main tabs
+        document.querySelectorAll('.main-tab-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.tab === tab);
+        });
+        
+        // Update tab contents
+        document.querySelectorAll('.tab-content-area').forEach(content => {
+            content.classList.remove('active');
+        });
+        
+        const targetContent = document.getElementById('tabContent' + tab.charAt(0).toUpperCase() + tab.slice(1));
+        if (targetContent) {
+            targetContent.classList.add('active');
         }
         
-        if (foundConfig) {
-            // Load dynamic values
-            if (foundConfig.dynamic_values && typeof foundConfig.dynamic_values === 'object') {
-                loadDynamicValues(foundConfig.dynamic_values);
-            }
-            
-            // Load accounts, captions, time orders for the dropdowns
+        // Show/hide sub tabs
+        const subTabs = document.getElementById('subTabs');
+        const scrollBody = document.getElementById('scrollBody');
+        const saveBtnContainer = document.getElementById('saveBtnContainer');
+        const saveConfigBtn = document.getElementById('saveConfigBtn');
+        const saveSetupBtn = document.getElementById('saveSetupBtn');
+        
+        if (tab === 'setup') {
+            subTabs.classList.add('visible');
+            scrollBody.classList.add('setup-visible');
+            saveBtnContainer.classList.add('visible');
+            saveConfigBtn.style.display = 'none';
+            saveSetupBtn.style.display = 'block';
+            // Show first sub-tab by default
+            switchSubTab('accounts');
+        } else {
+            subTabs.classList.remove('visible');
+            scrollBody.classList.remove('setup-visible');
+            saveBtnContainer.classList.remove('visible');
+            saveConfigBtn.style.display = 'none';
+            saveSetupBtn.style.display = 'none';
+        }
+        
+        // Hide add config view if open
+        document.getElementById('addConfigView').classList.remove('active');
+        document.getElementById('addConfigView').style.display = 'none';
+        
+        // Show/hide FAB
+        const fab = document.getElementById('fabButton');
+        if (tab === 'pending' || tab === 'completed' || tab === 'aborted') {
+            fab.classList.add('visible');
+        } else {
+            fab.classList.remove('visible');
+        }
+        
+        // Load data for setup tab
+        if (tab === 'setup') {
             loadAccounts();
             loadCaptions();
             loadTimeOrders();
             loadFilters();
             loadCaptionAuthors();
-        } else {
-            // If config not found, create a temporary one with the author from dynamic_values
-            showModal('Error', 'Configuration not found for author: ' + author);
-        }
-    }
-    
-    function loadDynamicValues(dynamicValues) {
-        // This will be called after dynamic fields are rendered
-        // We'll set the values in the renderDynamicFields function
-        window._dynamicValuesToLoad = dynamicValues;
-    }
-    
-    function getConfigsByStatus(status) {
-        const settings = configData.settings;
-        const configs = [];
-        
-        if (!settings || !Array.isArray(settings)) return configs;
-        
-        settings.forEach((config, index) => {
-            if (config && typeof config === 'object') {
-                // Get status from root level
-                const configStatus = (config.status || 'pending').toLowerCase();
-                if (configStatus === status) {
-                    // Store the index with the config
-                    configs.push({
-                        ...config,
-                        _index: index
-                    });
-                }
-            }
-        });
-        
-        return configs;
-    }
-    
-    function renderConfigList(configs) {
-        const container = document.getElementById('detailList');
-        container.innerHTML = '';
-        
-        if (configs.length === 0) {
-            container.innerHTML = `
-                <div style="text-align: center; padding: 40px; background: white; border-radius: 12px;">
-                    <p style="color: #718096; font-size: 18px;">No configurations found with this status.</p>
-                </div>
-            `;
-            return;
-        }
-        
-        configs.forEach((config) => {
-            const div = document.createElement('div');
-            div.className = 'config-item';
-            
-            // Use the stored index or find it
-            let actualIndex = config._index;
-            if (actualIndex === undefined || actualIndex === null) {
-                // Fallback: find by matching
-                const fullSettings = configData.settings;
-                if (Array.isArray(fullSettings)) {
-                    const cleanConfig = {...config};
-                    delete cleanConfig._index;
-                    for (let i = 0; i < fullSettings.length; i++) {
-                        if (JSON.stringify(fullSettings[i]) === JSON.stringify(cleanConfig)) {
-                            actualIndex = i;
-                            break;
-                        }
-                    }
-                }
-            }
-            
-            // Get status from root level
-            const status = (config.status || 'pending').toLowerCase();
-            
-            const statusColor = {
-                'pending': '#f6ad55',
-                'completed': '#48bb78',
-                'aborted': '#fc8181',
-                'incomplete': '#a0aec0'
-            };
-            
-            const statusLabel = {
-                'pending': 'Pending',
-                'completed': 'Completed',
-                'aborted': 'Aborted',
-                'incomplete': 'Incomplete'
-            };
-            
-            // Get author
-            let author = 'Unknown Author';
-            if (config.dynamic_values && config.dynamic_values.author) {
-                author = config.dynamic_values.author;
-            } else if (config.author) {
-                author = config.author;
-            } else if (config.dynamic_values) {
-                const firstKey = Object.keys(config.dynamic_values)[0];
-                if (firstKey) author = firstKey;
-            }
-            
-            // Build dynamic fields display - EXCLUDE status and operation_status
-            let dynamicFieldsHtml = '';
-            if (config.dynamic_values && typeof config.dynamic_values === 'object') {
-                const entries = Object.entries(config.dynamic_values);
-                // Filter out status and operation_status from dynamic_values
-                const filteredEntries = entries.filter(([key]) => 
-                    key !== 'status' && key !== 'operation_status'
-                );
-                
-                if (filteredEntries.length > 0) {
-                    dynamicFieldsHtml = '<div><div class="detail-label">Dynamic Fields</div>';
-                    filteredEntries.forEach(([key, value]) => {
-                        let displayValue = value;
-                        if (typeof value === 'object' && value !== null) {
-                            displayValue = JSON.stringify(value);
-                        }
-                        dynamicFieldsHtml += `<div class="detail-value"><strong>${key}:</strong> ${displayValue}</div>`;
-                    });
-                    dynamicFieldsHtml += '</div>';
-                }
-            }
-            
-            // Add operation status from root level
-            let operationStatusHtml = '';
-            if (config.operation_status) {
-                const statusClass = config.operation_status.toLowerCase();
-                operationStatusHtml = `
-                    <div style="margin-top: 10px;">
-                        <div class="detail-label">Operation Status</div>
-                        <div class="detail-value">
-                            <span class="operation-status-badge ${statusClass}">${config.operation_status}</span>
-                        </div>
-                    </div>
-                `;
-            }
-            
-            // Use actualIndex for all operations
-            const indexParam = actualIndex !== undefined && actualIndex !== null ? actualIndex : -1;
-            
-            div.innerHTML = `
-                <div class="item-header">
-                    <span class="item-author">${author}</span>
-                    <span class="item-status" style="background: ${statusColor[status] || '#a0aec0'}">${statusLabel[status] || status}</span>
-                </div>
-                <div class="item-details">
-                    ${dynamicFieldsHtml}
-                    ${operationStatusHtml}
-                </div>
-                <div class="item-actions">
-                    <button class="btn btn-edit-config" onclick="showEditConfigByIndex(${indexParam})">Edit</button>
-                    <button class="btn btn-delete" onclick="deleteConfigByIndex(${indexParam})">Delete</button>
-                    <button class="btn btn-status" onclick="changeStatusByIndex(${indexParam}, 'completed')">Mark Completed</button>
-                    <button class="btn btn-status" onclick="changeStatusByIndex(${indexParam}, 'aborted')">Mark Aborted</button>
-                    <button class="btn btn-status" onclick="changeStatusByIndex(${indexParam}, 'pending')">Mark Pending</button>
-                </div>
-            `;
-            
-            container.appendChild(div);
-        });
-    }
-    
-    // ===== CONFIG OPERATIONS - UPDATED DELETE FUNCTIONS =====
-    // ===== NEW INDEX-BASED DELETE =====
-    function deleteConfigByIndex(index) {
-        if (index === undefined || index === null || index === -1) {
-            showModal('Error', 'Invalid configuration index.');
-            return;
-        }
-        
-        const settings = configData.settings;
-        if (!Array.isArray(settings) || index < 0 || index >= settings.length) {
-            showModal('Error', 'Configuration not found.');
-            return;
-        }
-        
-        const config = settings[index];
-        let authorName = 'Unknown';
-        if (config && typeof config === 'object') {
-            authorName = config.author || (config.dynamic_values && config.dynamic_values.author) || 'Unknown';
-        }
-        
-        showModal('Confirm Delete', 'Are you sure you want to delete configuration "' + authorName + '"?', function() {
-            // Remove the entry at the specified index
-            settings.splice(index, 1);
-            
-            // Update configData
-            configData.settings = settings;
-            
-            // Save to database
-            const postData = {
-                settings: configData.settings,
-                accounts: configData.accounts || {},
-                captions: configData.captions || [],
-                timeorders: configData.timeorders || {},
-                filters: configData.filters || [],
-                dynamic_fields: configData.dynamic_fields || {}
-            };
-            
-            const formData = new FormData();
-            formData.append('save_all', 'true');
-            formData.append('settings', JSON.stringify(postData.settings));
-            formData.append('accounts', JSON.stringify(postData.accounts));
-            formData.append('captions', JSON.stringify(postData.captions));
-            formData.append('timeorders', JSON.stringify(postData.timeorders));
-            formData.append('filters', JSON.stringify(postData.filters));
-            formData.append('dynamic_fields', JSON.stringify(postData.dynamic_fields));
-            
-            fetch(window.location.href, {
-                method: 'POST',
-                body: formData
-            })
-            .then(response => response.json())
-            .then(data => {
-                if (data.success) {
-                    showModal('Success', 'Configuration deleted successfully! Refreshing...');
-                    setTimeout(() => window.location.reload(), 1500);
-                } else {
-                    showModal('Error', data.message);
-                }
-            })
-            .catch(error => {
-                console.error('Error:', error);
-                showModal('Error', 'Error deleting configuration: ' + error.message);
-            });
-        });
-    }
-
-    // Keep old function for backward compatibility
-    function deleteConfig(author, index) {
-        if (index !== undefined && index !== null) {
-            deleteConfigByIndex(index);
-        } else {
-            // Try to find by author
-            const settings = configData.settings;
-            let foundIndex = -1;
-            if (Array.isArray(settings)) {
-                for (let i = 0; i < settings.length; i++) {
-                    let configAuthor = settings[i].author || (settings[i].dynamic_values && settings[i].dynamic_values.author);
-                    if (configAuthor === author) {
-                        foundIndex = i;
-                        break;
-                    }
-                }
-            }
-            if (foundIndex !== -1) {
-                deleteConfigByIndex(foundIndex);
-            } else {
-                showModal('Error', 'Configuration not found for author: ' + author);
-            }
-        }
-    }
-    // ===== NEW INDEX-BASED EDIT =====
-    function showEditConfigByIndex(index) {
-        if (index === undefined || index === null || index === -1) {
-            showModal('Error', 'Invalid configuration index.');
-            return;
-        }
-        
-        const settings = configData.settings;
-        if (!Array.isArray(settings) || index < 0 || index >= settings.length) {
-            showModal('Error', 'Configuration not found.');
-            return;
-        }
-        
-        const config = settings[index];
-        let author = 'Unknown Author';
-        
-        if (config && typeof config === 'object') {
-            author = config.author || (config.dynamic_values && config.dynamic_values.author) || 'Unknown';
-        }
-        
-        isEditMode = true;
-        editingAuthor = author;
-        window._editingIndex = index;
-        
-        document.getElementById('dashboardView').style.display = 'none';
-        document.getElementById('detailView').classList.remove('active');
-        document.getElementById('detailView').style.display = 'none';
-        document.getElementById('setupView').classList.remove('active');
-        document.getElementById('setupView').style.display = 'none';
-        document.getElementById('addConfigView').classList.add('active');
-        document.getElementById('addConfigView').style.display = 'block';
-        document.getElementById('configTabs').classList.remove('visible');
-        document.getElementById('saveBtnContainer').classList.add('visible');
-        document.getElementById('saveConfigBtn').style.display = 'block';
-        document.getElementById('saveSetupBtn').style.display = 'none';
-        document.getElementById('backToDashboardBtn').style.display = 'block';
-        document.getElementById('editAuthorNameDisplay').textContent = author;
-        document.getElementById('settingsTabTitle').textContent = 'Edit Configuration - ' + author;
-        document.getElementById('scrollBody').classList.remove('tabs-visible');
-        document.getElementById('editModeBanner').classList.add('visible');
-        
-        // Load the config data
-        if (config && config.dynamic_values) {
-            loadDynamicValues(config.dynamic_values);
-        }
-        
-        loadAccounts();
-        loadCaptions();
-        loadTimeOrders();
-        loadFilters();
-        loadCaptionAuthors();
-        renderDynamicFields();
-    }
-
-    // Keep old function for backward compatibility
-    function showEditConfig(author, index) {
-        if (index !== undefined && index !== null) {
-            showEditConfigByIndex(index);
-        } else {
-            // Try to find by author
-            const settings = configData.settings;
-            let foundIndex = -1;
-            if (Array.isArray(settings)) {
-                for (let i = 0; i < settings.length; i++) {
-                    let configAuthor = settings[i].author || (settings[i].dynamic_values && settings[i].dynamic_values.author);
-                    if (configAuthor === author) {
-                        foundIndex = i;
-                        break;
-                    }
-                }
-            }
-            if (foundIndex !== -1) {
-                showEditConfigByIndex(foundIndex);
-            } else {
-                showModal('Error', 'Configuration not found for author: ' + author);
-            }
-        }
-    }
-
-    function deleteConfigFromDB(index) {
-        if (!configId) {
-            showModal('Error', 'No configuration found to delete.');
-            return;
-        }
-        
-        // Get the settings array
-        let settings = configData.settings;
-        
-        if (!Array.isArray(settings) || settings.length === 0) {
-            showModal('Error', 'No configurations to delete.');
-            return;
-        }
-        
-        // Check if the index is valid
-        if (index < 0 || index >= settings.length) {
-            showModal('Error', 'Invalid configuration index.');
-            return;
-        }
-        
-        // Get the author for the confirmation message (if available)
-        let authorName = 'Unknown';
-        if (settings[index] && typeof settings[index] === 'object') {
-            authorName = settings[index].author || (settings[index].dynamic_values && settings[index].dynamic_values.author) || 'Unknown';
-        }
-        
-        // Remove the entry at the specified index
-        settings.splice(index, 1);
-        
-        // Update configData
-        configData.settings = settings;
-        
-        // Save to database
-        const postData = {
-            settings: configData.settings,
-            accounts: configData.accounts || {},
-            captions: configData.captions || [],
-            timeorders: configData.timeorders || {},
-            filters: configData.filters || [],
-            dynamic_fields: configData.dynamic_fields || {}
-        };
-        
-        const formData = new FormData();
-        formData.append('save_all', 'true');
-        formData.append('settings', JSON.stringify(postData.settings));
-        formData.append('accounts', JSON.stringify(postData.accounts));
-        formData.append('captions', JSON.stringify(postData.captions));
-        formData.append('timeorders', JSON.stringify(postData.timeorders));
-        formData.append('filters', JSON.stringify(postData.filters));
-        formData.append('dynamic_fields', JSON.stringify(postData.dynamic_fields));
-        
-        fetch(window.location.href, {
-            method: 'POST',
-            body: formData
-        })
-        .then(response => response.json())
-        .then(data => {
-            if (data.success) {
-                showModal('Success', 'Configuration "' + authorName + '" deleted successfully! Refreshing...');
-                setTimeout(() => window.location.reload(), 1500);
-            } else {
-                showModal('Error', data.message);
-            }
-        })
-        .catch(error => {
-            console.error('Error:', error);
-            showModal('Error', 'Error deleting configuration: ' + error.message);
-        });
-    }
-        
-    // ===== INDEX-BASED STATUS CHANGE (USE THIS ONLY) =====
-    function changeStatusByIndex(index, status) {
-        if (index === undefined || index === null || index === -1) {
-            showModal('Error', 'Invalid configuration index.');
-            return;
-        }
-        
-        if (!configId) {
-            showModal('Error', 'No configuration found.');
-            return;
-        }
-        
-        const settings = configData.settings;
-        if (!Array.isArray(settings) || index < 0 || index >= settings.length) {
-            showModal('Error', 'Configuration not found at index ' + index);
-            return;
-        }
-        
-        const config = settings[index];
-        if (!config || typeof config !== 'object') {
-            showModal('Error', 'Invalid configuration.');
-            return;
-        }
-        
-        // Update the status at root level ONLY
-        config.status = status;
-        config.operation_status = "change_status: Status updated to '" + status + "'";
-        
-        // REMOVE status and operation_status from dynamic_values
-        if (config.dynamic_values && typeof config.dynamic_values === 'object') {
-            delete config.dynamic_values.status;
-            delete config.dynamic_values.operation_status;
-        }
-        
-        // Save all data
-        const postData = {
-            settings: configData.settings,
-            accounts: configData.accounts || {},
-            captions: configData.captions || [],
-            timeorders: configData.timeorders || {},
-            filters: configData.filters || [],
-            dynamic_fields: configData.dynamic_fields || {}
-        };
-        
-        const formData = new FormData();
-        formData.append('save_all', 'true');
-        formData.append('settings', JSON.stringify(postData.settings));
-        formData.append('accounts', JSON.stringify(postData.accounts));
-        formData.append('captions', JSON.stringify(postData.captions));
-        formData.append('timeorders', JSON.stringify(postData.timeorders));
-        formData.append('filters', JSON.stringify(postData.filters));
-        formData.append('dynamic_fields', JSON.stringify(postData.dynamic_fields));
-        
-        // Show loading
-        showModal('Processing', 'Updating status to "' + status + '"...');
-        
-        fetch(window.location.href, {
-            method: 'POST',
-            body: formData
-        })
-        .then(response => response.json())
-        .then(data => {
-            closeModal();
-            if (data.success) {
-                showModal('Success', 'Status updated to "' + status + '"! Refreshing...');
-                setTimeout(() => window.location.reload(), 1500);
-            } else {
-                showModal('Error', data.message || 'Failed to update status.');
-            }
-        })
-        .catch(error => {
-            closeModal();
-            showModal('Error', 'Error: ' + error.message);
-        });
-    }
-
-    // Remove the old changeStatus function entirely - it's causing confusion
-    // If you need to keep it for backward compatibility, redirect it:
-    function changeStatus(author, status, index) {
-        // Always use index if available
-        if (index !== undefined && index !== null && index !== -1) {
-            changeStatusByIndex(index, status);
-            return;
-        }
-        
-        // If no index, try to find by author (but this should be avoided)
-        const settings = configData.settings;
-        if (Array.isArray(settings)) {
-            for (let i = 0; i < settings.length; i++) {
-                let configAuthor = settings[i].author || (settings[i].dynamic_values && settings[i].dynamic_values.author);
-                if (configAuthor === author) {
-                    changeStatusByIndex(i, status);
-                    return;
-                }
-            }
-        }
-        showModal('Error', 'Configuration not found for author: ' + author);
-    }
-    
-    // ===== MODAL =====
-    function showModal(title, message, callback, extraContent) {
-        document.getElementById('modalTitle').textContent = title;
-        document.getElementById('modalMessage').textContent = message;
-        
-        const contentDiv = document.querySelector('.modal-content');
-        if (extraContent) {
-            contentDiv.innerHTML = extraContent;
-        } else {
-            contentDiv.innerHTML = '';
-        }
-        
-        document.getElementById('customModal').classList.add('active');
-        
-        if (callback) {
-            window._modalCallback = callback;
-            const modalButtons = document.querySelector('.modal-buttons');
-            modalButtons.innerHTML = `
-                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-                <button class="btn btn-danger" onclick="confirmModalAction()">Confirm</button>
-            `;
-        } else {
-            window._modalCallback = null;
-            const modalButtons = document.querySelector('.modal-buttons');
-            modalButtons.innerHTML = `
-                <button class="btn btn-primary" onclick="closeModal()">OK</button>
-            `;
-        }
-    }
-    
-    function confirmModalAction() {
-        if (window._modalCallback) {
-            window._modalCallback();
-            window._modalCallback = null;
-        }
-        closeModal();
-    }
-    
-    function closeModal() {
-        document.getElementById('customModal').classList.remove('active');
-        window._modalCallback = null;
-        const contentDiv = document.querySelector('.modal-content');
-        if (contentDiv) contentDiv.innerHTML = '';
-        document.querySelector('.modal-buttons').innerHTML = `
-            <button class="btn btn-primary" onclick="closeModal()">OK</button>
-        `;
-    }
-    
-    document.getElementById('customModal').addEventListener('click', function(e) {
-        if (e.target === this) {
-            closeModal();
-        }
-    });
-    
-    // ===== TAB SWITCHING =====
-    function switchTab(tabName, btnElement) {
-        document.querySelectorAll('.setup-view .tab-content').forEach(el => el.classList.remove('active'));
-        document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
-        document.getElementById(tabName + '-tab').classList.add('active');
-        if (btnElement) {
-            btnElement.classList.add('active');
-        }
-        
-        // Refresh dynamic fields when switching to that tab
-        if (tabName === 'dynamicfields') {
             loadDynamicFields();
         }
     }
     
-    function loadAllData() {
-        loadAccounts();
-        loadCaptions();
-        loadTimeOrders();
-        loadFilters();
-        loadCaptionAuthors();
-        loadDynamicFields();
-    }
-    
-    function loadAccounts() {
-        const container = document.getElementById('accounts_list');
-        container.innerHTML = '';
-        
-        const accounts = configData.accounts || {};
-        
-        if (Object.keys(accounts).length === 0) {
-            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No accounts added yet.</p>';
-            return;
-        }
-        
-        for (const [key, value] of Object.entries(accounts)) {
-            const url = value.schedule && value.schedule[0] ? value.schedule[0] : '';
-            const profileLink = value.profile_link && value.profile_link[0] ? value.profile_link[0] : '';
-            const div = document.createElement('div');
-            div.className = 'item-row';
-            div.innerHTML = `
-                <div class="item-info">
-                    <span class="key">${key}</span>
-                    <span class="value">${url}</span>
-                    ${profileLink ? '<span class="value" style="color:#667eea;">Link: ' + profileLink + '</span>' : ''}
-                </div>
-                <button class="btn btn-danger" onclick="deleteAccount('${key}')">Delete</button>
-            `;
-            container.appendChild(div);
-        }
-    }
-    
-    function loadCaptions() {
-        const container = document.getElementById('captions_list');
-        container.innerHTML = '';
-        
-        const captions = configData.captions || [];
-        
-        if (captions.length === 0) {
-            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No captions added yet.</p>';
-            return;
-        }
-        
-        captions.forEach((authorData, index) => {
-            const div = document.createElement('div');
-            div.className = 'caption-item';
-            
-            // Display captions as plain text lines without JSON
-            let captionsDisplay = '';
-            if (authorData.captions && authorData.captions.length > 0) {
-                // Extract just the description content
-                const captionLines = authorData.captions
-                    .map(cap => {
-                        // If cap is an object with description, extract it
-                        if (cap && typeof cap === 'object' && cap.description) {
-                            return cap.description;
-                        }
-                        // If cap is an object with caption field
-                        if (cap && typeof cap === 'object' && cap.caption) {
-                            return cap.caption;
-                        }
-                        // If cap is a string, use it directly
-                        if (typeof cap === 'string') {
-                            return cap;
-                        }
-                        // Fallback: stringify the object
-                        return JSON.stringify(cap);
-                    })
-                    .slice(0, 5); // Show first 5 captions as preview
-                captionsDisplay = captionLines.join(' | ');
-                if (authorData.captions.length > 5) {
-                    captionsDisplay += ` ... (+${authorData.captions.length - 5} more)`;
-                }
-            } else {
-                captionsDisplay = 'No captions';
-            }
-            
-            div.innerHTML = `
-                <div class="caption-content">
-                    <span class="caption-author">${authorData.name || 'Unknown Author'}</span>
-                    <span style="font-size:13px; color:#5a7a8a;">${authorData.captions ? authorData.captions.length : 0} caption(s)</span>
-                    <div style="margin-top:5px; font-size:13px; color:#718096; word-break:break-word;">
-                        ${captionsDisplay}
-                    </div>
-                </div>
-                <div>
-                    <button class="btn btn-warning" onclick="editCaptions(${index})" style="margin-right:5px;">Edit</button>
-                    <button class="btn btn-danger" onclick="deleteCaptionAuthor(${index})">Delete</button>
-                </div>
-            `;
-            container.appendChild(div);
+    // ===== SUB TAB SWITCHING =====
+    function switchSubTab(subtab) {
+        // Update sub tabs
+        document.querySelectorAll('.sub-tab-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.subtab === subtab);
         });
-    }
         
-    function loadCaptionAuthors() {
-        const select = document.getElementById('caption_author_select');
-        if (!select) return;
-        select.innerHTML = '<option value="">Select Author</option>';
-        
-        const accounts = configData.accounts || {};
-        for (const key of Object.keys(accounts)) {
-            const option = document.createElement('option');
-            option.value = key;
-            option.textContent = key;
-            select.appendChild(option);
-        }
-    }
-    
-    function loadTimeOrders() {
-        const container = document.getElementById('timeorders_list');
-        container.innerHTML = '';
-        
-        const timeOrders = configData.timeorders || {};
-        
-        if (Object.keys(timeOrders).length === 0) {
-            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No time orders added yet.</p>';
-            return;
-        }
-        
-        for (const [key, value] of Object.entries(timeOrders)) {
-            const div = document.createElement('div');
-            div.className = 'timeorder-item';
-            
-            let timesHtml = '';
-            if (Array.isArray(value) && value.length > 0) {
-                timesHtml += '<div class="time-list">';
-                value.forEach(t => {
-                    const time12 = t['12hours'] || t.twelveHour || t.time || '';
-                    const time24 = t['24hours'] || '';
-                    timesHtml += '<div class="time-badge">' + time12 + '</div><div class="time-badge">' + time24 + '</div>';
-                });
-                timesHtml += '</div>';
-            } else {
-                timesHtml = '<span style="color:#999;">No times added</span>';
-            }
-            
-            div.innerHTML = `
-                <div class="timeorder-header">
-                    <span class="key">${key}</span>
-                    <button class="btn btn-danger" onclick="deleteTimeOrder('${key}')">Delete</button>
-                </div>
-                ${timesHtml}
-                <div class="add-time-area">
-                    <button class="btn btn-primary" onclick="addTimeToExistingOrder('${key}')">Add Time</button>
-                    <div id="add_time_${key}" style="display:none; margin-top:10px;">
-                        <div class="time-input-group">
-                            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px;">
-                                <span style="font-weight:500;">24h:</span>
-                                <input type="number" id="time_hour_24_${key}" placeholder="HH" min="0" max="23" style="width:80px; padding:10px;">
-                                <span>:</span>
-                                <input type="number" id="time_minute_24_${key}" placeholder="MM" min="0" max="59" style="width:80px; padding:10px;">
-                            </div>
-                            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
-                                <span style="font-weight:500;">12h:</span>
-                                <input type="number" id="time_hour_12_${key}" placeholder="HH" min="1" max="12" style="width:80px; padding:10px;">
-                                <span>:</span>
-                                <input type="number" id="time_minute_12_${key}" placeholder="MM" min="0" max="59" style="width:80px; padding:10px;">
-                                <select id="time_ampm_${key}" style="width:100px; padding:10px;">
-                                    <option value="AM">AM</option>
-                                    <option value="PM">PM</option>
-                                </select>
-                            </div>
-                            <div style="margin-top:10px;">
-                                <button class="btn btn-success" onclick="saveTimeToOrder('${key}')">Add to List</button>
-                                <button class="btn btn-secondary" onclick="cancelAddTime('${key}')">Cancel</button>
-                            </div>
-                        </div>
-                    </div>
-                </div>
-            `;
-            container.appendChild(div);
-            setupTimeOrderConversion(key);
-        }
-    }
-    
-    function loadFilters() {
-        const container = document.getElementById('filters_list');
-        container.innerHTML = '';
-        
-        const filters = configData.filters || [];
-        if (filters.length === 0) {
-            container.innerHTML = '<p style="color: #999; font-size: 14px;">No filters added.</p>';
-            return;
-        }
-        
-        filters.forEach((filter, index) => {
-            const span = document.createElement('span');
-            span.className = 'group-item';
-            span.innerHTML = filter + ' <span class="remove-group" onclick="removeFilter(' + index + ')">×</span>';
-            container.appendChild(span);
+        // Update sub tab contents
+        document.querySelectorAll('.sub-tab-content').forEach(content => {
+            content.style.display = 'none';
         });
+        
+        const targetContent = document.getElementById(subtab + '-tab');
+        if (targetContent) {
+            targetContent.style.display = 'block';
+        }
+        
+        // Refresh content
+        if (subtab === 'accounts') loadAccounts();
+        else if (subtab === 'captions') loadCaptions();
+        else if (subtab === 'timeorders') loadTimeOrders();
+        else if (subtab === 'filters') loadFilters();
+        else if (subtab === 'dynamicfields') loadDynamicFields();
     }
     
-    // ===== DYNAMIC FIELDS FUNCTIONS =====
-    function loadDynamicFields() {
-        const container = document.getElementById('dynamic_fields_list');
+    // ===== ADD CONFIG =====
+    function resetSerenumEditorState() {
+        isEditMode = false;
+        editingAuthor = '';
+        editingIndex = null;
+        window._dynamicValuesToLoad = null;
+        const banner = document.getElementById('editModeBanner');
+        if (banner) banner.classList.remove('visible');
+        const title = document.getElementById('settingsTabTitle');
+        if (title) title.textContent = 'New Configuration';
+    }
+
+    function openAddConfig() {
+        // Every Add New action starts as a clean insert, never as an old edit.
+        resetSerenumEditorState();
+        document.querySelectorAll('.tab-content-area').forEach(c => c.classList.remove('active'));
+        document.querySelectorAll('.main-tab-btn').forEach(b => b.classList.remove('active'));
+        
+        document.getElementById('addConfigView').classList.add('active');
+        document.getElementById('addConfigView').style.display = 'block';
+        document.getElementById('settingsTabTitle').textContent = 'New Configuration';
+        document.getElementById('editModeBanner').classList.remove('visible');
+        
+        // Hide FAB
+        document.getElementById('fabButton').classList.remove('visible');
+        
+        renderDynamicFields();
+    }
+    
+    function closeAddConfig() {
+        resetSerenumEditorState();
+        document.getElementById('addConfigView').classList.remove('active');
+        document.getElementById('addConfigView').style.display = 'none';
+        // Switch to pending tab
+        switchMainTab('pending');
+    }
+    
+    // ===== RENDER DYNAMIC FIELDS =====
+    function renderDynamicFields() {
+        const container = document.getElementById('dynamicFieldsContainer');
         container.innerHTML = '';
         
         const fields = configData.dynamic_fields || {};
         const fieldKeys = Object.keys(fields);
         
         if (fieldKeys.length === 0) {
-            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No dynamic fields added yet.</p>';
+            container.innerHTML = `
+                <div class="no-fields-message">
+                    <div class="icon">📋</div>
+                    <h3>No Dynamic Fields Configured</h3>
+                    <p>No dynamic fields have been set up yet. Go to Setup Config → Dynamic Fields to add some.</p>
+                </div>
+            `;
             return;
         }
+        
+        // Edit data is passed from the exact selected record. Never search by
+        // author because author names are not unique.
+        let dynamicValues = {};
+        if (isEditMode && window._dynamicValuesToLoad && typeof window._dynamicValuesToLoad === 'object') {
+            dynamicValues = window._dynamicValuesToLoad;
+        }
+        window._dynamicValuesToLoad = null;
         
         for (const key of fieldKeys) {
             const field = fields[key];
-            const div = document.createElement('div');
-            div.className = 'dynamic-field-item';
-            
+            const elementType = field.element_type || 'input';
+            const title = field.title || key;
             const defaultValues = field.default_values || [];
             const sourceType = field.source_type || 'none';
             const allowList = field.allow_list || false;
-            const title = field.title || key;
             const submitAs = field.submit_as || 'key';
             
-            let sourceInfo = '';
-            if (sourceType === 'accounts') sourceInfo = ' | Source: Account URLs';
-            else if (sourceType === 'captions') sourceInfo = ' | Source: Captions';
-            else if (sourceType === 'timeorders') sourceInfo = ' | Source: Time Orders';
-            else if (sourceType === 'filters') sourceInfo = ' | Source: filters';
-            else if (sourceType === 'copied_links') sourceInfo = ' | Source: Copied Links (JPGS Vault)';
+            const div = document.createElement('div');
+            div.className = 'form-group';
             
-            let submitAsLabel = '';
-            if (submitAs === 'key') submitAsLabel = 'Submit: Key Only';
-            else if (submitAs === 'value') submitAsLabel = 'Submit: Value Only';
-            else if (submitAs === 'both') submitAsLabel = 'Submit: Key & Value';
+            const label = document.createElement('label');
+            label.textContent = title;
+            div.appendChild(label);
             
-            div.innerHTML = `
-                <div class="field-header">
-                    <span class="field-name">${title} (${key})</span>
-                    <span class="field-type-badge">${field.element_type || 'input'}${allowList ? ' + List' : ''}</span>
-                </div>
-                <div style="color: #5a7a8a; font-size: 13px;">
-                    ${field.element_type === 'select' ? 'Options: ' + (defaultValues.length > 0 ? defaultValues.join(', ') : 'None') : ''}
-                    ${sourceInfo}
-                    ${allowList ? ' | Allows adding custom values' : ''}
-                    ${submitAsLabel ? ' | ' + submitAsLabel : ''}
-                </div>
-                <div class="default-values">
-                    ${defaultValues.map(val => `<span class="value-tag">${val}</span>`).join('')}
-                </div>
-                <div style="margin-top: 10px;">
-                    <button class="btn btn-warning" onclick="editDynamicField('${key}')" style="margin-right:5px;">Edit</button>
-                    <button class="btn btn-danger" onclick="deleteDynamicField('${key}')">Delete</button>
-                </div>
-            `;
+            let inputElement;
+            const value = dynamicValues[key] !== undefined && dynamicValues[key] !== null ? dynamicValues[key] : '';
+            
+            if (elementType === 'date-time-input') {
+                // Create date-time input
+                const wrapper = document.createElement('div');
+                wrapper.className = 'datetime-group';
+                wrapper.style.width = '100%';
+                wrapper.style.boxSizing = 'border-box';
+                
+                const dateInput = document.createElement('input');
+                dateInput.type = 'date';
+                dateInput.id = 'dynamic_field_' + key + '_date';
+                dateInput.className = 'date-input';
+                dateInput.style.width = '100%';
+                dateInput.style.boxSizing = 'border-box';
+                
+                if (value && typeof value === 'string') {
+                    if (value.includes('/')) {
+                        const parts = value.split(' ');
+                        if (parts.length > 0 && parts[0].includes('/')) {
+                            const dateParts = parts[0].split('/');
+                            if (dateParts.length === 3) {
+                                const formattedDate = dateParts[2] + '-' + dateParts[1].padStart(2, '0') + '-' + dateParts[0].padStart(2, '0');
+                                dateInput.value = formattedDate;
+                            }
+                        }
+                    } else if (value.includes('-')) {
+                        dateInput.value = value.split(' ')[0] || '';
+                    }
+                }
+                
+                const formatDiv = document.createElement('div');
+                formatDiv.className = 'time-format-select';
+                formatDiv.style.cssText = 'display:flex; align-items:center; gap:12px; margin-top:8px; padding:8px 12px; background:#f8fafc; border-radius:8px; border:1px solid #e5e7eb; flex-wrap:wrap;';
+                
+                const formatLabel = document.createElement('label');
+                formatLabel.textContent = 'Submit in format:';
+                formatLabel.style.marginBottom = '0 !important';
+                formatLabel.style.fontWeight = '500 !important';
+                formatLabel.style.color = '#1a1a2e';
+                formatLabel.style.fontSize = '14px';
+                
+                const formatSelect = document.createElement('select');
+                formatSelect.id = 'dynamic_field_' + key + '_format';
+                formatSelect.style.cssText = 'padding:6px 12px; border:2px solid #e5e7eb; border-radius:6px; font-size:14px; background:#fafafa; width:auto; min-width:80px;';
+                
+                const option12 = document.createElement('option');
+                option12.value = '12h';
+                option12.textContent = '12h';
+                formatSelect.appendChild(option12);
+                
+                const option24 = document.createElement('option');
+                option24.value = '24h';
+                option24.textContent = '24h';
+                formatSelect.appendChild(option24);
+                
+                const prefKey = key;
+                if (timeFormatPreferences[prefKey] === undefined) {
+                    timeFormatPreferences[prefKey] = '12h';
+                }
+                formatSelect.value = timeFormatPreferences[prefKey];
+                
+                formatDiv.appendChild(formatLabel);
+                formatDiv.appendChild(formatSelect);
+                
+                const timeGroup = document.createElement('div');
+                timeGroup.id = 'dynamic_field_' + key + '_time_group';
+                timeGroup.className = 'time-group';
+                timeGroup.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap; width:100%; margin-top:10px;';
+                
+                const twelveHourDiv = document.createElement('div');
+                twelveHourDiv.id = 'dynamic_field_' + key + '_12h_group';
+                twelveHourDiv.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
+                
+                const hour12 = document.createElement('input');
+                hour12.type = 'number';
+                hour12.id = 'dynamic_field_' + key + '_hour_12';
+                hour12.placeholder = 'HH';
+                hour12.min = '1';
+                hour12.max = '12';
+                hour12.style.cssText = 'width:60px; padding:10px; border:2px solid #e5e7eb; border-radius:10px; font-size:14px; background:#fafafa;';
+                
+                const colon1 = document.createElement('span');
+                colon1.textContent = ':';
+                
+                const minute12 = document.createElement('input');
+                minute12.type = 'number';
+                minute12.id = 'dynamic_field_' + key + '_minute_12';
+                minute12.placeholder = 'MM';
+                minute12.min = '0';
+                minute12.max = '59';
+                minute12.style.cssText = 'width:60px; padding:10px; border:2px solid #e5e7eb; border-radius:10px; font-size:14px; background:#fafafa;';
+                
+                const ampmSelect = document.createElement('select');
+                ampmSelect.id = 'dynamic_field_' + key + '_ampm';
+                ampmSelect.style.cssText = 'width:80px; padding:10px; border:2px solid #e5e7eb; border-radius:10px; font-size:14px; background:#fafafa;';
+                
+                const amOption = document.createElement('option');
+                amOption.value = 'AM';
+                amOption.textContent = 'AM';
+                ampmSelect.appendChild(amOption);
+                
+                const pmOption = document.createElement('option');
+                pmOption.value = 'PM';
+                pmOption.textContent = 'PM';
+                ampmSelect.appendChild(pmOption);
+                
+                twelveHourDiv.appendChild(hour12);
+                twelveHourDiv.appendChild(colon1);
+                twelveHourDiv.appendChild(minute12);
+                twelveHourDiv.appendChild(ampmSelect);
+                
+                const twentyFourDiv = document.createElement('div');
+                twentyFourDiv.id = 'dynamic_field_' + key + '_24h_group';
+                twentyFourDiv.style.cssText = 'display:none; gap:10px; align-items:center; flex-wrap:wrap;';
+                
+                const hour24 = document.createElement('input');
+                hour24.type = 'number';
+                hour24.id = 'dynamic_field_' + key + '_hour_24';
+                hour24.placeholder = 'HH';
+                hour24.min = '0';
+                hour24.max = '23';
+                hour24.style.cssText = 'width:60px; padding:10px; border:2px solid #e5e7eb; border-radius:10px; font-size:14px; background:#fafafa;';
+                
+                const colon2 = document.createElement('span');
+                colon2.textContent = ':';
+                
+                const minute24 = document.createElement('input');
+                minute24.type = 'number';
+                minute24.id = 'dynamic_field_' + key + '_minute_24';
+                minute24.placeholder = 'MM';
+                minute24.min = '0';
+                minute24.max = '59';
+                minute24.style.cssText = 'width:60px; padding:10px; border:2px solid #e5e7eb; border-radius:10px; font-size:14px; background:#fafafa;';
+                
+                twentyFourDiv.appendChild(hour24);
+                twentyFourDiv.appendChild(colon2);
+                twentyFourDiv.appendChild(minute24);
+                
+                timeGroup.appendChild(twelveHourDiv);
+                timeGroup.appendChild(twentyFourDiv);
+                
+                wrapper.appendChild(dateInput);
+                wrapper.appendChild(formatDiv);
+                wrapper.appendChild(timeGroup);
+                
+                formatSelect.addEventListener('change', function() {
+                    const format = this.value;
+                    timeFormatPreferences[prefKey] = format;
+                    
+                    if (format === '12h') {
+                        twelveHourDiv.style.display = 'flex';
+                        twentyFourDiv.style.display = 'none';
+                    } else {
+                        twelveHourDiv.style.display = 'none';
+                        twentyFourDiv.style.display = 'flex';
+                    }
+                });
+                
+                if (formatSelect.value === '12h') {
+                    twelveHourDiv.style.display = 'flex';
+                    twentyFourDiv.style.display = 'none';
+                } else {
+                    twelveHourDiv.style.display = 'none';
+                    twentyFourDiv.style.display = 'flex';
+                }
+                
+                if (value && typeof value === 'string') {
+                    const timeMatch = value.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/);
+                    if (timeMatch) {
+                        hour12.value = parseInt(timeMatch[1]);
+                        minute12.value = parseInt(timeMatch[2]);
+                        ampmSelect.value = timeMatch[3];
+                        formatSelect.value = '12h';
+                        twelveHourDiv.style.display = 'flex';
+                        twentyFourDiv.style.display = 'none';
+                    } else {
+                        const timeMatch24 = value.match(/(\d{1,2}):(\d{2})/);
+                        if (timeMatch24) {
+                            hour24.value = parseInt(timeMatch24[1]);
+                            minute24.value = parseInt(timeMatch24[2]);
+                            formatSelect.value = '24h';
+                            twelveHourDiv.style.display = 'none';
+                            twentyFourDiv.style.display = 'flex';
+                        }
+                    }
+                }
+                
+                inputElement = wrapper;
+                
+            } else if (elementType === 'textarea') {
+                inputElement = document.createElement('textarea');
+                inputElement.id = 'dynamic_field_' + key;
+                inputElement.className = 'dynamic-field-input';
+                inputElement.rows = 3;
+                inputElement.placeholder = 'Enter ' + title + '...';
+                if (typeof value === 'string') {
+                    inputElement.value = value;
+                }
+                inputElement.style.width = '100%';
+                inputElement.style.padding = '12px 16px';
+                inputElement.style.border = '2px solid #e5e7eb';
+                inputElement.style.borderRadius = '10px';
+                inputElement.style.fontSize = '14px';
+                inputElement.style.transition = 'all 0.3s';
+                inputElement.style.boxSizing = 'border-box';
+                inputElement.style.background = '#fafafa';
+                inputElement.style.fontFamily = 'inherit';
+                inputElement.style.resize = 'vertical';
+            } else if (elementType === 'select') {
+                const wrapper = document.createElement('div');
+                wrapper.style.width = '100%';
+                
+                inputElement = document.createElement('select');
+                inputElement.id = 'dynamic_field_' + key;
+                inputElement.className = 'dynamic-field-input';
+                inputElement.style.width = '100%';
+                inputElement.style.padding = '12px 16px';
+                inputElement.style.border = '2px solid #e5e7eb';
+                inputElement.style.borderRadius = '10px';
+                inputElement.style.fontSize = '14px';
+                inputElement.style.transition = 'all 0.3s';
+                inputElement.style.boxSizing = 'border-box';
+                inputElement.style.background = '#fafafa';
+                
+                const emptyOption = document.createElement('option');
+                emptyOption.value = '';
+                emptyOption.textContent = 'Select ' + title + '...';
+                inputElement.appendChild(emptyOption);
+                
+                let sourceValues = [];
+                
+                if (sourceType !== 'none') {
+                    sourceValues = getSourceValues(sourceType, submitAs);
+                } else {
+                    defaultValues.forEach(val => {
+                        let submitData = '';
+                        if (submitAs === 'key') {
+                            submitData = val;
+                        } else if (submitAs === 'value') {
+                            submitData = val;
+                        } else if (submitAs === 'both') {
+                            submitData = JSON.stringify({ [val]: val });
+                        }
+                        
+                        sourceValues.push({ 
+                            key: val, 
+                            value: val,
+                            display: val,
+                            submitData: submitData,
+                            submitAs: submitAs
+                        });
+                    });
+                }
+                
+                sourceValues.forEach(({ key: optionKey, value: actualValue, display, submitData }) => {
+                    const option = document.createElement('option');
+                    option.value = submitData;
+                    option.textContent = display;
+                    option.dataset.key = optionKey;
+                    option.dataset.value = actualValue;
+                    option.dataset.submitAs = submitAs;
+                    
+                    if (value === actualValue || value === submitData) {
+                        option.selected = true;
+                    }
+                    inputElement.appendChild(option);
+                });
+                
+                wrapper.appendChild(inputElement);
+                
+                const previewDiv = document.createElement('div');
+                previewDiv.className = 'submit-as-preview';
+                previewDiv.style.cssText = 'margin-top:5px; padding:6px 12px; background:#f8fafc; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#6b7280; font-family:monospace; word-break:break-all; max-height:100px; overflow-y:auto;';
+                previewDiv.textContent = 'Selected: ' + (inputElement.value || 'None');
+                wrapper.appendChild(previewDiv);
+                
+                inputElement.addEventListener('change', function() {
+                    const selectedOption = this.options[this.selectedIndex];
+                    if (selectedOption && selectedOption.value) {
+                        previewDiv.textContent = 'Selected: ' + selectedOption.value;
+                    } else {
+                        previewDiv.textContent = 'Selected: None';
+                    }
+                });
+                
+                inputElement = wrapper;
+            } else {
+                // input - could be list input or single input
+                if (allowList) {
+                    const wrapper = document.createElement('div');
+                    wrapper.style.width = '100%';
+                    
+                    const listContainer = document.createElement('div');
+                    listContainer.id = 'dynamic_field_' + key + '_list';
+                    listContainer.className = 'list-values';
+                    
+                    let listValues = [];
+                    if (Array.isArray(value)) {
+                        listValues = value;
+                    } else if (typeof value === 'string' && value) {
+                        listValues = [value];
+                    } else if (value && typeof value === 'object') {
+                        listValues = Object.values(value);
+                    }
+                    
+                    const inputGroup = document.createElement('div');
+                    inputGroup.className = 'list-input-container';
+                    inputGroup.style.display = 'flex';
+                    inputGroup.style.gap = '10px';
+                    inputGroup.style.marginTop = '5px';
+                    inputGroup.style.flexWrap = 'wrap';
+                    
+                    const listInput = document.createElement('input');
+                    listInput.type = 'text';
+                    listInput.id = 'dynamic_field_' + key + '_input';
+                    listInput.placeholder = 'Add value...';
+                    listInput.style.flex = '1';
+                    listInput.style.minWidth = '150px';
+                    listInput.style.padding = '10px 14px';
+                    listInput.style.border = '2px solid #e5e7eb';
+                    listInput.style.borderRadius = '10px';
+                    listInput.style.fontSize = '14px';
+                    listInput.style.background = '#fafafa';
+                    
+                    const addBtn = document.createElement('button');
+                    addBtn.type = 'button';
+                    addBtn.className = 'btn btn-primary';
+                    addBtn.textContent = 'Add';
+                    addBtn.style.padding = '10px 20px';
+                    addBtn.style.margin = '0';
+                    addBtn.style.whiteSpace = 'nowrap';
+                    
+                    inputGroup.appendChild(listInput);
+                    inputGroup.appendChild(addBtn);
+                    
+                    wrapper.appendChild(listContainer);
+                    wrapper.appendChild(inputGroup);
+                    
+                    wrapper._fieldKey = key;
+                    wrapper._listValues = listValues;
+                    
+                    function renderListValues() {
+                        listContainer.innerHTML = '';
+                        if (listValues.length === 0) {
+                            listContainer.innerHTML = '<span style="color: #999; font-size: 13px;">No values added</span>';
+                            return;
+                        }
+                        listValues.forEach((val, idx) => {
+                            const tag = document.createElement('span');
+                            tag.className = 'value-tag';
+                            tag.innerHTML = val + ' <span class="remove-value" data-index="' + idx + '">×</span>';
+                            tag.querySelector('.remove-value').addEventListener('click', function() {
+                                listValues.splice(parseInt(this.dataset.index), 1);
+                                renderListValues();
+                            });
+                            listContainer.appendChild(tag);
+                        });
+                    }
+                    
+                    addBtn.addEventListener('click', function() {
+                        const val = listInput.value.trim();
+                        if (val && !listValues.includes(val)) {
+                            listValues.push(val);
+                            renderListValues();
+                            listInput.value = '';
+                        }
+                    });
+                    
+                    listInput.addEventListener('keypress', function(e) {
+                        if (e.key === 'Enter') {
+                            e.preventDefault();
+                            addBtn.click();
+                        }
+                    });
+                    
+                    renderListValues();
+                    inputElement = wrapper;
+                    
+                } else {
+                    inputElement = document.createElement('input');
+                    inputElement.type = 'text';
+                    inputElement.id = 'dynamic_field_' + key;
+                    inputElement.className = 'dynamic-field-input';
+                    inputElement.placeholder = 'Enter ' + title + '...';
+                    if (typeof value === 'string') {
+                        inputElement.value = value;
+                    }
+                    inputElement.style.width = '100%';
+                    inputElement.style.padding = '12px 16px';
+                    inputElement.style.border = '2px solid #e5e7eb';
+                    inputElement.style.borderRadius = '10px';
+                    inputElement.style.fontSize = '14px';
+                    inputElement.style.transition = 'all 0.3s';
+                    inputElement.style.boxSizing = 'border-box';
+                    inputElement.style.background = '#fafafa';
+                }
+            }
+            
+            div.appendChild(inputElement);
             container.appendChild(div);
         }
-    }
-    
-    function showAddDynamicFieldModal() {
-        _newDefaultValues = [];
-        _newListValues = [];
-        editingDynamicFieldKey = null;
-        
-        const html = `
-            <div class="form-group">
-                <label>Display Title (shown in UI)</label>
-                <input type="text" id="modal_field_title" placeholder="Enter display title..." style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                <small style="color:#999;">This is what users will see</small>
-            </div>
-            <div class="form-group">
-                <label>Field Value (used in backend)</label>
-                <input type="text" id="modal_field_name" placeholder="Enter field value (no spaces)..." style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                <small style="color:#999;">Spaces will be replaced with underscores. Used for storage.</small>
-            </div>
-            <div class="form-group">
-                <label>Element Type</label>
-                <select id="modal_element_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="select">Select</option>
-                    <option value="input">Input</option>
-                    <option value="textarea">Textarea</option>
-                    <option value="date-time-input">Date & Time</option>
-                </select>
-            </div>
-            <div class="form-group" id="modal_allow_list_container" style="display:none;">
-                <label>Allow Adding Custom Values (List Input)</label>
-                <select id="modal_allow_list" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="no">No - Single value only</option>
-                    <option value="yes">Yes - Allow multiple values (add/remove)</option>
-                </select>
-                <small style="color:#999;">If Yes, users can add multiple values to this field</small>
-            </div>
-            <div class="form-group" id="modal_default_values_container">
-                <label>Default Values</label>
-                <div style="display:flex; gap:10px; margin-bottom:10px;">
-                    <input type="text" id="modal_default_value_input" placeholder="Enter value..." style="flex:1; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <button class="btn btn-primary" onclick="addModalDefaultValue()">Add</button>
-                </div>
-                <div id="modal_default_values_list"></div>
-            </div>
-            <div class="form-group" id="modal_source_container">
-                <label>Source Options From (for Select type)</label>
-                <select id="modal_source_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="none">None - Use default values only</option>
-                    <option value="accounts">Account URLs</option>
-                    <option value="captions">Captions</option>
-                    <option value="timeorders">Time Orders</option>
-                    <option value="filters">Filters</option>
-                    <option value="copied_links">Copied Links (JPGS Vault)</option>
-                </select>
-                <small style="color:#999;">Select which data source to populate the dropdown with</small>
-            </div>
-            <div class="form-group" id="modal_submit_as_container">
-                <label>Submit As</label>
-                <select id="modal_submit_as" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="key">Submit Key Only</option>
-                    <option value="value">Submit Value Only</option>
-                    <option value="both">Submit Key & Value</option>
-                </select>
-                <small style="color:#999;">Choose what data to submit to the backend</small>
-                <div id="modal_submit_preview" class="submit-as-preview" style="margin-top:5px; padding:6px 12px; background:#f8fcf9; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#5a7a8a; font-family:monospace;">
-                    Example: "key" → "value"
-                </div>
-            </div>
-            <div style="margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;">
-                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-                <button class="btn btn-success" onclick="saveDynamicFieldFromModal()">Save Field</button>
-            </div>
-        `;
-        
-        showModal('Add Dynamic Field', '', null, html);
-        renderModalDefaultValues();
-        
-        // Toggle visibility based on element type
-        document.getElementById('modal_element_type').addEventListener('change', function() {
-            const isSelect = this.value === 'select';
-            const isInput = this.value === 'input';
-            
-            document.getElementById('modal_default_values_container').style.display = (isSelect || isInput) ? 'block' : 'none';
-            document.getElementById('modal_source_container').style.display = isSelect ? 'block' : 'none';
-            document.getElementById('modal_allow_list_container').style.display = isInput ? 'block' : 'none';
-            document.getElementById('modal_submit_as_container').style.display = isSelect ? 'block' : 'none';
-        });
-        
-        // Auto-generate field name from title
-        document.getElementById('modal_field_title').addEventListener('input', function() {
-            const title = this.value;
-            const nameInput = document.getElementById('modal_field_name');
-            if (!nameInput.dataset.manual) {
-                nameInput.value = title.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            }
-        });
-        
-        document.getElementById('modal_field_name').addEventListener('input', function() {
-            this.dataset.manual = 'true';
-        });
-        
-        // Update preview when submit as changes
-        document.getElementById('modal_submit_as').addEventListener('change', function() {
-            updateSubmitPreview(this.value);
-        });
-    }
-    
-    function updateSubmitPreview(value) {
-        const preview = document.getElementById('modal_submit_preview');
-        if (!preview) return;
-        
-        if (value === 'key') {
-            preview.innerHTML = 'Example: "key"';
-        } else if (value === 'value') {
-            preview.innerHTML = 'Example: "value"';
-        } else if (value === 'both') {
-            preview.innerHTML = 'Example: {"key": "value"}';
-        }
-    }
-    
-    function editDynamicField(key) {
-        editingDynamicFieldKey = key;
-        const field = configData.dynamic_fields[key];
-        if (!field) return;
-        
-        _newDefaultValues = field.default_values || [];
-        _newListValues = field.list_values || [];
-        
-        const html = `
-            <div class="form-group">
-                <label>Display Title (shown in UI)</label>
-                <input type="text" id="modal_field_title" value="${field.title || key}" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                <small style="color:#999;">This is what users will see</small>
-            </div>
-            <div class="form-group">
-                <label>Field Value (used in backend)</label>
-                <input type="text" id="modal_field_name" value="${key}" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;" readonly>
-                <small style="color:#999;">Field value cannot be changed</small>
-            </div>
-            <div class="form-group">
-                <label>Element Type</label>
-                <select id="modal_element_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="select" ${field.element_type === 'select' ? 'selected' : ''}>Select</option>
-                    <option value="input" ${field.element_type === 'input' ? 'selected' : ''}>Input</option>
-                    <option value="textarea" ${field.element_type === 'textarea' ? 'selected' : ''}>Textarea</option>
-                    <option value="date-time-input" ${field.element_type === 'date-time-input' ? 'selected' : ''}>Date & Time</option>
-                </select>
-            </div>
-            <div class="form-group" id="modal_allow_list_container" style="${field.element_type === 'input' ? 'display:block' : 'display:none'}">
-                <label>Allow Adding Custom Values (List Input)</label>
-                <select id="modal_allow_list" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="no" ${field.allow_list ? '' : 'selected'}>No - Single value only</option>
-                    <option value="yes" ${field.allow_list ? 'selected' : ''}>Yes - Allow multiple values (add/remove)</option>
-                </select>
-                <small style="color:#999;">If Yes, users can add multiple values to this field</small>
-            </div>
-            <div class="form-group" id="modal_default_values_container" style="${field.element_type === 'select' || field.element_type === 'input' ? 'display:block' : 'display:none'}">
-                <label>Default Values ${field.element_type === 'input' ? '(Pre-filled values)' : ''}</label>
-                <div style="display:flex; gap:10px; margin-bottom:10px;">
-                    <input type="text" id="modal_default_value_input" placeholder="Enter value..." style="flex:1; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <button class="btn btn-primary" onclick="addModalDefaultValue()">Add</button>
-                </div>
-                <div id="modal_default_values_list"></div>
-            </div>
-            <div class="form-group" id="modal_source_container" style="${field.element_type === 'select' ? 'display:block' : 'display:none'}">
-                <label>Source Options From (for Select type)</label>
-                <select id="modal_source_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="none" ${field.source_type === 'none' || !field.source_type ? 'selected' : ''}>None - Use default values only</option>
-                    <option value="accounts" ${field.source_type === 'accounts' ? 'selected' : ''}>Account URLs</option>
-                    <option value="captions" ${field.source_type === 'captions' ? 'selected' : ''}>Captions</option>
-                    <option value="timeorders" ${field.source_type === 'timeorders' ? 'selected' : ''}>Time Orders</option>
-                    <option value="filters" ${field.source_type === 'filters' ? 'selected' : ''}>filters</option>
-                    <option value="copied_links" ${field.source_type === 'copied_links' ? 'selected' : ''}>Copied Links (JPGS Vault)</option>
-                </select>
-                <small style="color:#999;">Select which data source to populate the dropdown with</small>
-            </div>
-            <div class="form-group" id="modal_submit_as_container" style="${field.element_type === 'select' ? 'display:block' : 'display:none'}">
-                <label>Submit As</label>
-                <select id="modal_submit_as" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
-                    <option value="key" ${field.submit_as === 'key' || !field.submit_as ? 'selected' : ''}>Submit Key Only</option>
-                    <option value="value" ${field.submit_as === 'value' ? 'selected' : ''}>Submit Value Only</option>
-                    <option value="both" ${field.submit_as === 'both' ? 'selected' : ''}>Submit Key & Value</option>
-                </select>
-                <small style="color:#999;">Choose what data to submit to the backend</small>
-                <div id="modal_submit_preview" class="submit-as-preview" style="margin-top:5px; padding:6px 12px; background:#f8fcf9; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#5a7a8a; font-family:monospace;">
-                    ${field.submit_as === 'key' || !field.submit_as ? 'Example: "key"' : field.submit_as === 'value' ? 'Example: "value"' : 'Example: {"key": "value"}'}
-                </div>
-            </div>
-            <div style="margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;">
-                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
-                <button class="btn btn-success" onclick="saveDynamicFieldFromModal()">Update Field</button>
-            </div>
-        `;
-        
-        showModal('Edit Dynamic Field', '', null, html);
-        renderModalDefaultValues();
-        
-        // Toggle visibility based on element type
-        document.getElementById('modal_element_type').addEventListener('change', function() {
-            const isSelect = this.value === 'select';
-            const isInput = this.value === 'input';
-            
-            document.getElementById('modal_default_values_container').style.display = (isSelect || isInput) ? 'block' : 'none';
-            document.getElementById('modal_source_container').style.display = isSelect ? 'block' : 'none';
-            document.getElementById('modal_allow_list_container').style.display = isInput ? 'block' : 'none';
-            document.getElementById('modal_submit_as_container').style.display = isSelect ? 'block' : 'none';
-        });
-        
-        // Update preview when submit as changes
-        document.getElementById('modal_submit_as').addEventListener('change', function() {
-            updateSubmitPreview(this.value);
-        });
-    }
-    
-    function addModalDefaultValue() {
-        const input = document.getElementById('modal_default_value_input');
-        const value = input.value.trim();
-        if (value) {
-            if (!_newDefaultValues.includes(value)) {
-                _newDefaultValues.push(value);
-                renderModalDefaultValues();
-                input.value = '';
-            }
-        }
-    }
-    
-    function removeModalDefaultValue(index) {
-        _newDefaultValues.splice(index, 1);
-        renderModalDefaultValues();
-    }
-    
-    function renderModalDefaultValues() {
-        const container = document.getElementById('modal_default_values_list');
-        if (!container) return;
-        container.innerHTML = '';
-        
-        if (_newDefaultValues.length === 0) {
-            container.innerHTML = '<p style="color: #999; font-size: 14px;">No values added.</p>';
-            return;
-        }
-        
-        _newDefaultValues.forEach((val, index) => {
-            const span = document.createElement('span');
-            span.className = 'group-item';
-            span.innerHTML = val + ' <span class="remove-group" onclick="removeModalDefaultValue(' + index + ')">×</span>';
-            container.appendChild(span);
-        });
-    }
-    
-    function normalizeFieldName(name) {
-        return name.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-    }
-    
-    function saveDynamicFieldFromModal() {
-        const title = document.getElementById('modal_field_title').value.trim();
-        let fieldName = document.getElementById('modal_field_name').value.trim();
-        const elementType = document.getElementById('modal_element_type').value;
-        const sourceType = document.getElementById('modal_source_type').value;
-        const allowList = document.getElementById('modal_allow_list').value === 'yes';
-        const submitAs = document.getElementById('modal_submit_as') ? document.getElementById('modal_submit_as').value : 'key';
-        
-        if (!title) {
-            showModal('Error', 'Please enter a display title.');
-            return;
-        }
-        
-        // If field name is empty or wasn't manually set, generate from title
-        if (!fieldName || !document.getElementById('modal_field_name').dataset.manual) {
-            fieldName = normalizeFieldName(title);
-        }
-        
-        if (!fieldName) {
-            showModal('Error', 'Please enter a field value.');
-            return;
-        }
-        
-        // Check if field name already exists (for new fields)
-        if (!editingDynamicFieldKey && configData.dynamic_fields[fieldName]) {
-            showModal('Error', 'A field with this value already exists.');
-            return;
-        }
-        
-        const fieldData = {
-            title: title,
-            element_type: elementType,
-            default_values: (elementType === 'select' || elementType === 'input') ? _newDefaultValues : [],
-            source_type: (elementType === 'select' && sourceType !== 'none') ? sourceType : 'none',
-            allow_list: elementType === 'input' ? allowList : false,
-            submit_as: (elementType === 'select' && sourceType !== 'none') ? submitAs : 'key'
-        };
-        
-        // If editing, remove old key and add new one (if name changed - but we don't allow name change in edit)
-        if (editingDynamicFieldKey) {
-            if (editingDynamicFieldKey !== fieldName) {
-                delete configData.dynamic_fields[editingDynamicFieldKey];
-            }
-        }
-        
-        configData.dynamic_fields[fieldName] = fieldData;
-        
-        // Re-render dynamic fields in setup view
-        loadDynamicFields();
-        
-        // Re-render dynamic fields in add config view
-        renderDynamicFields();
-        
-        closeModal();
-        showModal('Success', 'Dynamic field saved successfully!');
-    }
-    
-    function deleteDynamicField(key) {
-        showModal('Confirm Delete', 'Are you sure you want to delete dynamic field "' + key + '"?', function() {
-            if (configData.dynamic_fields) {
-                delete configData.dynamic_fields[key];
-                loadDynamicFields();
-                renderDynamicFields();
-                showModal('Success', 'Dynamic field deleted successfully!');
-            }
-        });
     }
     
     // ===== GET SOURCE VALUES =====
@@ -4831,7 +3742,7 @@
                     submitData = JSON.stringify(captionsList);
                     displayText = JSON.stringify(captionsList);
                 } else if (submitAs === 'both') {
-                    submitData = JSON.stringify(captionsList);
+                    submitData = JSON.stringify({ [authorName]: captionsList });
                     displayText = authorName + ' (' + captionsList.length + ' captions)';
                 }
                 
@@ -4901,630 +3812,422 @@
                     isGrouped: false
                 });
             });
-        } else if (sourceType === 'copied_links') {
-            const copiedLinks = copiedLinksData || {};
-            
-            // Get the domain from the current page URL
-            const domain = window.location.origin; // e.g., https://yourdomain.com
-            
-            console.log('Total folders from JPGS Vault:', Object.keys(copiedLinks).length);
-            
-            for (const [folder, data] of Object.entries(copiedLinks)) {
-                const urlCount = data.count || 0;
-                const urls = data.urls || [];
-                
-                // Store original URLs for display
-                const originalUrls = urls;
-                
-                // Prepend domain to each URL for submission
-                const urlsWithDomain = urls.map(url => {
-                    // Remove leading slash if exists to avoid double slashes
-                    const cleanUrl = url.startsWith('/') ? url.substring(1) : url;
-                    return domain + '/' + cleanUrl;
-                });
-                
-                // For display: show folder name with count
-                const displayName = folder + ' (' + urlCount + ' URL' + (urlCount !== 1 ? 's' : '') + ')';
-                
-                let submitData = '';
-                
-                if (submitAs === 'key') {
-                    submitData = folder;
-                } else if (submitAs === 'value') {
-                    // Submit the full URLs with domain
-                    submitData = urlsWithDomain.join(', ');
-                } else if (submitAs === 'both') {
-                    // For both, store as {"folder": "url1, url2, url3"} with domain
-                    submitData = JSON.stringify({ [folder]: urlsWithDomain.join(', ') });
-                }
-                
-                values.push({
-                    key: folder,
-                    value: urlsWithDomain, // Store with domain for value
-                    originalUrls: originalUrls, // Store original for reference
-                    display: displayName,
-                    submitData: submitData,
-                    submitAs: submitAs,
-                    urlCount: urlCount,
-                    urls: urlsWithDomain,
-                    isGrouped: false,
-                    isCopiedLinks: true // Flag to identify this source type
-                });
-            }
-            
-            // Sort by URL count (most first)
-            values.sort((a, b) => b.urlCount - a.urlCount);
         }
         return values;
     }
     
-    // ===== RENDER DYNAMIC FIELDS IN ADD CONFIG VIEW =====
-    function renderDynamicFields() {
-        const container = document.getElementById('dynamicFieldsContainer');
-        container.innerHTML = '';
-        
+    // ===== SUBMIT CONFIG =====
+    function submitConfig(event) {
+        event.preventDefault();
+
         const fields = configData.dynamic_fields || {};
-        const fieldKeys = Object.keys(fields);
+        const configDataObj = {};
+        let authorValue = '';
+        let engineValue = '';
+
+        const normalizeFieldName = value => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+        for (const key of Object.keys(fields)) {
+            const field = fields[key] || {};
+            const elementType = field.element_type || 'input';
+            const allowList = !!field.allow_list;
+            let value = '';
+
+            if (elementType === 'date-time-input') {
+                const dateInput = document.getElementById('dynamic_field_' + key + '_date');
+                const formatSelect = document.getElementById('dynamic_field_' + key + '_format');
+                if (dateInput && formatSelect) {
+                    const date = dateInput.value;
+                    const format = formatSelect.value;
+                    let timeStr = '';
+                    if (format === '12h') {
+                        const hour = document.getElementById('dynamic_field_' + key + '_hour_12');
+                        const minute = document.getElementById('dynamic_field_' + key + '_minute_12');
+                        const ampm = document.getElementById('dynamic_field_' + key + '_ampm');
+                        if (hour && minute && ampm && hour.value !== '' && minute.value !== '') {
+                            timeStr = hour.value + ':' + String(minute.value).padStart(2, '0') + ' ' + ampm.value;
+                        }
+                    } else {
+                        const hour = document.getElementById('dynamic_field_' + key + '_hour_24');
+                        const minute = document.getElementById('dynamic_field_' + key + '_minute_24');
+                        if (hour && minute && hour.value !== '' && minute.value !== '') {
+                            timeStr = String(hour.value).padStart(2, '0') + ':' + String(minute.value).padStart(2, '0');
+                        }
+                    }
+                    if (date) {
+                        const parts = date.split('-');
+                        value = (parts.length === 3 ? parts[2] + '/' + parts[1] + '/' + parts[0] : date) + (timeStr ? ' ' + timeStr : '');
+                    } else if (timeStr) value = timeStr;
+                }
+            } else if (elementType === 'input' && allowList) {
+                const listContainer = document.getElementById('dynamic_field_' + key + '_list');
+                if (listContainer) {
+                    const values = [];
+                    listContainer.querySelectorAll('.value-tag').forEach(tag => {
+                        const text = tag.textContent.replace('×', '').trim();
+                        if (text) values.push(text);
+                    });
+                    value = values.join(', ');
+                }
+            } else {
+                const input = document.getElementById('dynamic_field_' + key);
+                if (input) value = input.value;
+            }
+            configDataObj[key] = value;
+
+            const candidates = [key, field.title].map(normalizeFieldName);
+            if (!authorValue && candidates.some(name => name === 'author' || name === 'authorname' || name === 'name')) {
+                const authorInput = document.getElementById('dynamic_field_' + key);
+                if (authorInput && authorInput.tagName === 'SELECT') {
+                    const selectedAuthorOption = authorInput.options[authorInput.selectedIndex];
+                    const selectedAuthorKey = selectedAuthorOption && selectedAuthorOption.dataset
+                        ? selectedAuthorOption.dataset.key
+                        : '';
+                    authorValue = String(selectedAuthorKey || value || '').trim();
+                } else if (value !== null && value !== undefined) {
+                    authorValue = String(value).trim();
+                }
+            }
+            // For select fields, .value may be a transformed submit_as payload
+            // (for example JSON when submit_as is 'both'). The engine stored at
+            // the root must be the actual selected option value, not that wrapper.
+            if (!engineValue && candidates.some(name => name === 'engine' || name === 'enginetype' || name === 'processingengine' || name.includes('engine'))) {
+                const engineInput = document.getElementById('dynamic_field_' + key);
+                if (engineInput && engineInput.tagName === 'SELECT') {
+                    const selectedOption = engineInput.options[engineInput.selectedIndex];
+                    const actualSelectedValue = selectedOption && selectedOption.dataset
+                        ? (selectedOption.dataset.value || selectedOption.dataset.key || selectedOption.value)
+                        : engineInput.value;
+                    engineValue = String(actualSelectedValue || '').trim();
+                } else if (value !== null && value !== undefined) {
+                    engineValue = String(value).trim();
+                }
+            }
+        }
+
+        // Support legacy setups where the author field is named differently but
+        // the configured author value is present in the submitted values.
+        if (!authorValue && configDataObj.author !== undefined) authorValue = String(configDataObj.author).trim();
+        if (!authorValue) {
+            showModal('Error', 'Please enter a value in the Author/Name field.');
+            return;
+        }
+
+        const hasData = Object.values(configDataObj).some(v => v !== '' && v !== null && v !== undefined);
+        if (!hasData) {
+            showModal('Error', 'Please enter at least one field value.');
+            return;
+        }
+
+        const engineFieldKey = Object.keys(fields).find(key => {
+            const field = fields[key] || {};
+            const names = [key, field.title].map(normalizeFieldName);
+            return names.some(name => name === 'engine' || name === 'enginetype' || name === 'processingengine' || name.includes('engine'));
+        });
+        if (engineFieldKey && !engineValue) {
+            showModal('Error', 'Please select a value for the Engine field.');
+            return;
+        }
+
+        const payload = {
+            author: authorValue,
+            engine: engineValue,
+            edit_index: isEditMode ? editingIndex : null,
+            dynamic_values: configDataObj
+        };
+        document.getElementById('configDataInput').value = JSON.stringify(payload);
+        document.getElementById('configForm').submit();
+    }
+
+    // ===== CUSTOM DIALOG =====
+    function showModal(title, message, callback, extraContent) {
+        document.getElementById('modalTitle').textContent = title;
+        document.getElementById('modalMessage').textContent = message;
         
-        if (fieldKeys.length === 0) {
-            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No dynamic fields configured. Go to Setup Config → Dynamic Fields to add some.</p>';
+        const contentDiv = document.querySelector('.modal-content');
+        if (extraContent) {
+            contentDiv.innerHTML = extraContent;
+        } else {
+            contentDiv.innerHTML = '';
+        }
+        
+        document.getElementById('customModal').classList.add('active');
+        
+        if (callback) {
+            window._modalCallback = callback;
+            const modalButtons = document.querySelector('.modal-buttons');
+            modalButtons.innerHTML = `
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-danger" onclick="confirmModalAction()">Confirm</button>
+            `;
+        } else {
+            window._modalCallback = null;
+            const modalButtons = document.querySelector('.modal-buttons');
+            modalButtons.innerHTML = `
+                <button class="btn btn-primary" onclick="closeModal()">OK</button>
+            `;
+        }
+    }
+    
+    function confirmModalAction() {
+        if (window._modalCallback) {
+            window._modalCallback();
+            window._modalCallback = null;
+        }
+        closeModal();
+    }
+    
+    function closeModal() {
+        document.getElementById('customModal').classList.remove('active');
+        window._modalCallback = null;
+        const contentDiv = document.querySelector('.modal-content');
+        if (contentDiv) contentDiv.innerHTML = '';
+        document.querySelector('.modal-buttons').innerHTML = `
+            <button class="btn btn-primary" onclick="closeModal()">OK</button>
+        `;
+    }
+    
+    document.getElementById('customModal').addEventListener('click', function(e) {
+        if (e.target === this) {
+            closeModal();
+        }
+    });
+    
+    // Resolve author labels consistently with the PHP pending-card renderer.
+    function getSerenumAuthorLabel(config) {
+        if (!config || typeof config !== 'object') return 'Unknown Author';
+        const candidates = [config.author, config.dynamic_values && config.dynamic_values.author];
+        for (const candidate of candidates) {
+            if (candidate === undefined || candidate === null || candidate === '') continue;
+            const label = String(candidate).trim();
+            if (!label) continue;
+            if (label[0] === '{' || label[0] === '[') {
+                try {
+                    const parsed = JSON.parse(label);
+                    if (Array.isArray(parsed) && parsed[0] && parsed[0]['key-name']) {
+                        return String(parsed[0]['key-name']);
+                    }
+                    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+                        const keys = Object.keys(parsed);
+                        if (keys.length === 1) return keys[0];
+                    }
+                } catch (error) {
+                    // Keep the original label when the stored value is not valid JSON.
+                }
+            }
+            return label;
+        }
+        return 'Unknown Author';
+    }
+
+    // ===== CONFIG OPERATIONS =====
+    function deleteConfigByIndex(index, displayedAuthor) {
+        const recordIndex = Number(index);
+        const authorName = String(displayedAuthor || '').trim();
+        if (!Number.isInteger(recordIndex) || recordIndex < 0 || !authorName) {
+            showModal('Error', 'Invalid configuration identity. Refresh the page and try again.');
+            return;
+        }
+
+        // Use the exact name printed on this server-rendered card. The browser's
+        // configData array is not used to decide which name the user is deleting.
+        showModal('Confirm Delete', 'Are you sure you want to delete configuration "' + authorName + '"?', function() {
+            const formData = new FormData();
+            formData.append('delete_config', 'true');
+            formData.append('id', String(configId));
+            formData.append('index', String(recordIndex));
+            formData.append('expected_author', authorName);
+            fetch(window.location.href, { method: 'POST', body: formData })
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        showModal('Success', 'Configuration deleted successfully! Refreshing...');
+                        setTimeout(() => window.location.reload(), 800);
+                    } else {
+                        showModal('Error', data.message || 'Unable to delete configuration.');
+                    }
+                })
+                .catch(error => {
+                    console.error('Delete configuration failed:', error);
+                    showModal('Error', 'Error deleting configuration: ' + error.message);
+                });
+        });
+    }
+
+    function showEditConfigByIndex(index) {
+        if (index === undefined || index === null || index === -1) {
+            showModal('Error', 'Invalid configuration index.');
             return;
         }
         
-        // Get dynamic values from current config if in edit mode
-        let dynamicValues = {};
-        if (isEditMode && editingAuthor) {
-            const settings = configData.settings;
-            if (Array.isArray(settings)) {
-                for (let config of settings) {
-                    if (config && config.author === editingAuthor && config.dynamic_values) {
-                        dynamicValues = config.dynamic_values;
-                        break;
-                    }
-                }
-            }
+        const settings = configData.settings;
+        if (!Array.isArray(settings) || index < 0 || index >= settings.length) {
+            showModal('Error', 'Configuration not found.');
+            return;
         }
         
-        // Check if we have values to load from loadDynamicValues
-        if (window._dynamicValuesToLoad) {
-            dynamicValues = window._dynamicValuesToLoad;
-            window._dynamicValuesToLoad = null;
-        }
+        const config = settings[index];
+        const author = getSerenumAuthorLabel(config);
         
-        for (const key of fieldKeys) {
-            const field = fields[key];
-            const elementType = field.element_type || 'input';
-            const title = field.title || key;
-            const defaultValues = field.default_values || [];
-            const sourceType = field.source_type || 'none';
-            const allowList = field.allow_list || false;
-            const submitAs = field.submit_as || 'key';
-            
-            const div = document.createElement('div');
-            div.className = 'form-group';
-            
-            const label = document.createElement('label');
-            label.textContent = title;
-            div.appendChild(label);
-            
-            let inputElement;
-            const value = dynamicValues[key] || '';
-            
-            if (elementType === 'date-time-input') {
-                // Create date-time input with 12/24 hour select
-                const wrapper = document.createElement('div');
-                wrapper.className = 'datetime-group';
-                wrapper.style.width = '100%';
-                wrapper.style.maxWidth = '100%';
-                wrapper.style.boxSizing = 'border-box';
-                
-                // Date input
-                const dateInput = document.createElement('input');
-                dateInput.type = 'date';
-                dateInput.id = 'dynamic_field_' + key + '_date';
-                dateInput.className = 'date-input';
-                dateInput.style.width = '100%';
-                dateInput.style.maxWidth = '100%';
-                dateInput.style.boxSizing = 'border-box';
-                
-                // Set date value if exists
-                if (value && typeof value === 'string') {
-                    if (value.includes('/')) {
-                        const parts = value.split(' ');
-                        if (parts.length > 0 && parts[0].includes('/')) {
-                            const dateParts = parts[0].split('/');
-                            if (dateParts.length === 3) {
-                                const formattedDate = dateParts[2] + '-' + dateParts[1].padStart(2, '0') + '-' + dateParts[0].padStart(2, '0');
-                                dateInput.value = formattedDate;
-                            }
-                        }
-                    } else if (value.includes('-')) {
-                        dateInput.value = value.split(' ')[0] || '';
-                    }
-                } else if (value && typeof value === 'object') {
-                    if (value.date) {
-                        dateInput.value = value.date;
-                    }
-                }
-                
-                // Time format select
-                const formatDiv = document.createElement('div');
-                formatDiv.className = 'time-format-select';
-                formatDiv.style.cssText = 'display:flex; align-items:center; gap:12px; margin-top:8px; padding:8px 12px; background:#f8fcf9; border-radius:8px; border:1px solid #e0ece8; flex-wrap:wrap;';
-                
-                const formatLabel = document.createElement('label');
-                formatLabel.textContent = 'Submit in format:';
-                formatLabel.style.marginBottom = '0 !important';
-                formatLabel.style.fontWeight = '500 !important';
-                formatLabel.style.color = '#2c3e50';
-                formatLabel.style.fontSize = '14px';
-                
-                const formatSelect = document.createElement('select');
-                formatSelect.id = 'dynamic_field_' + key + '_format';
-                formatSelect.style.cssText = 'padding:6px 12px; border:2px solid #e0ece8; border-radius:6px; font-size:14px; background:#fafdfc; width:auto; min-width:80px;';
-                
-                const option12 = document.createElement('option');
-                option12.value = '12h';
-                option12.textContent = '12h';
-                formatSelect.appendChild(option12);
-                
-                const option24 = document.createElement('option');
-                option24.value = '24h';
-                option24.textContent = '24h';
-                formatSelect.appendChild(option24);
-                
-                // Set initial format preference
-                const prefKey = key;
-                if (timeFormatPreferences[prefKey] === undefined) {
-                    timeFormatPreferences[prefKey] = '12h';
-                }
-                formatSelect.value = timeFormatPreferences[prefKey];
-                
-                formatDiv.appendChild(formatLabel);
-                formatDiv.appendChild(formatSelect);
-                
-                // Time input group - will be shown/hidden based on format
-                const timeGroup = document.createElement('div');
-                timeGroup.id = 'dynamic_field_' + key + '_time_group';
-                timeGroup.className = 'time-group';
-                timeGroup.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap; width:100%; margin-top:10px;';
-                
-                // 12-hour inputs
-                const twelveHourDiv = document.createElement('div');
-                twelveHourDiv.id = 'dynamic_field_' + key + '_12h_group';
-                twelveHourDiv.style.cssText = 'display:flex; gap:10px; align-items:center; flex-wrap:wrap;';
-                
-                const hour12 = document.createElement('input');
-                hour12.type = 'number';
-                hour12.id = 'dynamic_field_' + key + '_hour_12';
-                hour12.placeholder = 'HH';
-                hour12.min = '1';
-                hour12.max = '12';
-                hour12.style.cssText = 'width:60px; padding:10px; border:2px solid #e0ece8; border-radius:10px; font-size:14px; background:#fafdfc;';
-                
-                const colon1 = document.createElement('span');
-                colon1.textContent = ':';
-                
-                const minute12 = document.createElement('input');
-                minute12.type = 'number';
-                minute12.id = 'dynamic_field_' + key + '_minute_12';
-                minute12.placeholder = 'MM';
-                minute12.min = '0';
-                minute12.max = '59';
-                minute12.style.cssText = 'width:60px; padding:10px; border:2px solid #e0ece8; border-radius:10px; font-size:14px; background:#fafdfc;';
-                
-                const ampmSelect = document.createElement('select');
-                ampmSelect.id = 'dynamic_field_' + key + '_ampm';
-                ampmSelect.style.cssText = 'width:80px; padding:10px; border:2px solid #e0ece8; border-radius:10px; font-size:14px; background:#fafdfc;';
-                
-                const amOption = document.createElement('option');
-                amOption.value = 'AM';
-                amOption.textContent = 'AM';
-                ampmSelect.appendChild(amOption);
-                
-                const pmOption = document.createElement('option');
-                pmOption.value = 'PM';
-                pmOption.textContent = 'PM';
-                ampmSelect.appendChild(pmOption);
-                
-                twelveHourDiv.appendChild(hour12);
-                twelveHourDiv.appendChild(colon1);
-                twelveHourDiv.appendChild(minute12);
-                twelveHourDiv.appendChild(ampmSelect);
-                
-                // 24-hour inputs
-                const twentyFourDiv = document.createElement('div');
-                twentyFourDiv.id = 'dynamic_field_' + key + '_24h_group';
-                twentyFourDiv.style.cssText = 'display:none; gap:10px; align-items:center; flex-wrap:wrap;';
-                
-                const hour24 = document.createElement('input');
-                hour24.type = 'number';
-                hour24.id = 'dynamic_field_' + key + '_hour_24';
-                hour24.placeholder = 'HH';
-                hour24.min = '0';
-                hour24.max = '23';
-                hour24.style.cssText = 'width:60px; padding:10px; border:2px solid #e0ece8; border-radius:10px; font-size:14px; background:#fafdfc;';
-                
-                const colon2 = document.createElement('span');
-                colon2.textContent = ':';
-                
-                const minute24 = document.createElement('input');
-                minute24.type = 'number';
-                minute24.id = 'dynamic_field_' + key + '_minute_24';
-                minute24.placeholder = 'MM';
-                minute24.min = '0';
-                minute24.max = '59';
-                minute24.style.cssText = 'width:60px; padding:10px; border:2px solid #e0ece8; border-radius:10px; font-size:14px; background:#fafdfc;';
-                
-                twentyFourDiv.appendChild(hour24);
-                twentyFourDiv.appendChild(colon2);
-                twentyFourDiv.appendChild(minute24);
-                
-                timeGroup.appendChild(twelveHourDiv);
-                timeGroup.appendChild(twentyFourDiv);
-                
-                wrapper.appendChild(dateInput);
-                wrapper.appendChild(formatDiv);
-                wrapper.appendChild(timeGroup);
-                
-                // Show/hide time inputs based on format selection
-                formatSelect.addEventListener('change', function() {
-                    const format = this.value;
-                    timeFormatPreferences[prefKey] = format;
-                    
-                    if (format === '12h') {
-                        twelveHourDiv.style.display = 'flex';
-                        twentyFourDiv.style.display = 'none';
-                    } else {
-                        twelveHourDiv.style.display = 'none';
-                        twentyFourDiv.style.display = 'flex';
-                    }
-                });
-                
-                // Trigger initial visibility
-                if (formatSelect.value === '12h') {
-                    twelveHourDiv.style.display = 'flex';
-                    twentyFourDiv.style.display = 'none';
-                } else {
-                    twelveHourDiv.style.display = 'none';
-                    twentyFourDiv.style.display = 'flex';
-                }
-                
-                // Set initial values if they exist
-                if (value && typeof value === 'string') {
-                    const timeMatch = value.match(/(\d{1,2}):(\d{2})\s*(AM|PM)/);
-                    if (timeMatch) {
-                        hour12.value = parseInt(timeMatch[1]);
-                        minute12.value = parseInt(timeMatch[2]);
-                        ampmSelect.value = timeMatch[3];
-                        formatSelect.value = '12h';
-                        twelveHourDiv.style.display = 'flex';
-                        twentyFourDiv.style.display = 'none';
-                    } else {
-                        const timeMatch24 = value.match(/(\d{1,2}):(\d{2})/);
-                        if (timeMatch24) {
-                            hour24.value = parseInt(timeMatch24[1]);
-                            minute24.value = parseInt(timeMatch24[2]);
-                            formatSelect.value = '24h';
-                            twelveHourDiv.style.display = 'none';
-                            twentyFourDiv.style.display = 'flex';
-                        }
-                    }
-                }
-                
-                inputElement = wrapper;
-                
-            } else if (elementType === 'textarea') {
-                inputElement = document.createElement('textarea');
-                inputElement.id = 'dynamic_field_' + key;
-                inputElement.className = 'dynamic-field-input';
-                inputElement.rows = 3;
-                inputElement.placeholder = 'Enter ' + title + '...';
-                if (typeof value === 'string') {
-                    inputElement.value = value;
-                }
-                inputElement.style.width = '100%';
-                inputElement.style.padding = '12px 16px';
-                inputElement.style.border = '2px solid #e0ece8';
-                inputElement.style.borderRadius = '10px';
-                inputElement.style.fontSize = '14px';
-                inputElement.style.transition = 'all 0.3s';
-                inputElement.style.boxSizing = 'border-box';
-                inputElement.style.background = '#fafdfc';
-                inputElement.style.fontFamily = 'inherit';
-                inputElement.style.resize = 'vertical';
-            } else if (elementType === 'select') {
-                const wrapper = document.createElement('div');
-                wrapper.style.width = '100%';
-                
-                inputElement = document.createElement('select');
-                inputElement.id = 'dynamic_field_' + key;
-                inputElement.className = 'dynamic-field-input';
-                inputElement.style.width = '100%';
-                inputElement.style.padding = '12px 16px';
-                inputElement.style.border = '2px solid #e0ece8';
-                inputElement.style.borderRadius = '10px';
-                inputElement.style.fontSize = '14px';
-                inputElement.style.transition = 'all 0.3s';
-                inputElement.style.boxSizing = 'border-box';
-                inputElement.style.background = '#fafdfc';
-                
-                const emptyOption = document.createElement('option');
-                emptyOption.value = '';
-                emptyOption.textContent = 'Select ' + title + '...';
-                inputElement.appendChild(emptyOption);
-                
-                let sourceValues = [];
-                
-                if (sourceType !== 'none') {
-                    sourceValues = getSourceValues(sourceType, submitAs);
-                } else {
-                    defaultValues.forEach(val => {
-                        let submitData = '';
-                        if (submitAs === 'key') {
-                            submitData = val;
-                        } else if (submitAs === 'value') {
-                            submitData = val;
-                        } else if (submitAs === 'both') {
-                            submitData = JSON.stringify({ [val]: val });
-                        }
-                        
-                        sourceValues.push({ 
-                            key: val, 
-                            value: val,
-                            display: val,
-                            submitData: submitData,
-                            submitAs: submitAs
-                        });
-                    });
-                }
-                
-                sourceValues.forEach(({ key: optionKey, value: actualValue, display, submitData, isCopiedLinks }) => {
-                    const option = document.createElement('option');
-                    // For copied links, store the submitData which already has domain
-                    option.value = submitData;
-                    option.textContent = display;
-                    option.dataset.key = optionKey;
-                    option.dataset.value = actualValue;
-                    option.dataset.submitAs = submitAs;
-                    option.dataset.isCopiedLinks = isCopiedLinks || false;
-                    
-                    // If this is copied links, store the raw URLs without domain for display purposes
-                    if (isCopiedLinks && actualValue) {
-                        option.dataset.rawUrls = JSON.stringify(actualValue);
-                    }
-                    
-                    if (value === actualValue || value === submitData) {
-                        option.selected = true;
-                    }
-                    inputElement.appendChild(option);
-                });
-                
-                wrapper.appendChild(inputElement);
-                
-                // Add preview of what will be submitted
-                const previewDiv = document.createElement('div');
-                previewDiv.className = 'submit-as-preview';
-                previewDiv.style.cssText = 'margin-top:5px; padding:6px 12px; background:#f8fcf9; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#5a7a8a; font-family:monospace; word-break:break-all; max-height:100px; overflow-y:auto;';
-                previewDiv.textContent = 'Selected: ' + (inputElement.value || 'None');
-                wrapper.appendChild(previewDiv);
-                
-                inputElement.addEventListener('change', function() {
-                    const selectedOption = this.options[this.selectedIndex];
-                    if (selectedOption && selectedOption.value) {
-                        // Display the selected value (which already has domain if copied links)
-                        previewDiv.textContent = 'Selected: ' + selectedOption.value;
-                    } else {
-                        previewDiv.textContent = 'Selected: None';
-                    }
-                });
-                
-                inputElement = wrapper;
-            } else {
-                // input - could be list input or single input
-                if (allowList) {
-                    // List input with add/remove functionality
-                    const wrapper = document.createElement('div');
-                    wrapper.style.width = '100%';
-                    
-                    const listContainer = document.createElement('div');
-                    listContainer.id = 'dynamic_field_' + key + '_list';
-                    listContainer.className = 'list-values';
-                    
-                    // Load existing values
-                    let listValues = [];
-                    if (Array.isArray(value)) {
-                        listValues = value;
-                    } else if (typeof value === 'string' && value) {
-                        listValues = [value];
-                    } else if (value && typeof value === 'object') {
-                        listValues = Object.values(value);
-                    }
-                    
-                    // Input with add button
-                    const inputGroup = document.createElement('div');
-                    inputGroup.className = 'list-input-container';
-                    inputGroup.style.display = 'flex';
-                    inputGroup.style.gap = '10px';
-                    inputGroup.style.marginTop = '5px';
-                    inputGroup.style.flexWrap = 'wrap';
-                    
-                    const listInput = document.createElement('input');
-                    listInput.type = 'text';
-                    listInput.id = 'dynamic_field_' + key + '_input';
-                    listInput.placeholder = 'Add value...';
-                    listInput.style.flex = '1';
-                    listInput.style.minWidth = '150px';
-                    listInput.style.padding = '10px 14px';
-                    listInput.style.border = '2px solid #e0ece8';
-                    listInput.style.borderRadius = '10px';
-                    listInput.style.fontSize = '14px';
-                    listInput.style.background = '#fafdfc';
-                    
-                    const addBtn = document.createElement('button');
-                    addBtn.type = 'button';
-                    addBtn.className = 'btn btn-primary';
-                    addBtn.textContent = 'Add';
-                    addBtn.style.padding = '10px 20px';
-                    addBtn.style.margin = '0';
-                    addBtn.style.whiteSpace = 'nowrap';
-                    
-                    inputGroup.appendChild(listInput);
-                    inputGroup.appendChild(addBtn);
-                    
-                    wrapper.appendChild(listContainer);
-                    wrapper.appendChild(inputGroup);
-                    
-                    // Store reference for save
-                    wrapper._fieldKey = key;
-                    wrapper._listValues = listValues;
-                    
-                    // Function to render list values
-                    function renderListValues() {
-                        listContainer.innerHTML = '';
-                        if (listValues.length === 0) {
-                            listContainer.innerHTML = '<span style="color: #999; font-size: 13px;">No values added</span>';
-                            return;
-                        }
-                        listValues.forEach((val, idx) => {
-                            const tag = document.createElement('span');
-                            tag.className = 'value-tag';
-                            tag.innerHTML = val + ' <span class="remove-value" data-index="' + idx + '">×</span>';
-                            tag.querySelector('.remove-value').addEventListener('click', function() {
-                                listValues.splice(parseInt(this.dataset.index), 1);
-                                renderListValues();
-                            });
-                            listContainer.appendChild(tag);
-                        });
-                    }
-                    
-                    // Add value function
-                    addBtn.addEventListener('click', function() {
-                        const val = listInput.value.trim();
-                        if (val && !listValues.includes(val)) {
-                            listValues.push(val);
-                            renderListValues();
-                            listInput.value = '';
-                        }
-                    });
-                    
-                    listInput.addEventListener('keypress', function(e) {
-                        if (e.key === 'Enter') {
-                            e.preventDefault();
-                            addBtn.click();
-                        }
-                    });
-                    
-                    renderListValues();
-                    inputElement = wrapper;
-                    
-                } else {
-                    // Single input
-                    inputElement = document.createElement('input');
-                    inputElement.type = 'text';
-                    inputElement.id = 'dynamic_field_' + key;
-                    inputElement.className = 'dynamic-field-input';
-                    inputElement.placeholder = 'Enter ' + title + '...';
-                    if (typeof value === 'string') {
-                        inputElement.value = value;
-                    }
-                    inputElement.style.width = '100%';
-                    inputElement.style.padding = '12px 16px';
-                    inputElement.style.border = '2px solid #e0ece8';
-                    inputElement.style.borderRadius = '10px';
-                    inputElement.style.fontSize = '14px';
-                    inputElement.style.transition = 'all 0.3s';
-                    inputElement.style.boxSizing = 'border-box';
-                    inputElement.style.background = '#fafdfc';
-                }
-            }
-            
-            div.appendChild(inputElement);
-            container.appendChild(div);
+        isEditMode = true;
+        editingAuthor = author;
+        editingIndex = index;
+
+        const editValues = {};
+        if (config && config.dynamic_values && typeof config.dynamic_values === 'object' && !Array.isArray(config.dynamic_values)) {
+            Object.assign(editValues, config.dynamic_values);
         }
-    }
-    
-    // ===== TIME CONVERSION =====
-    function setupTimeOrderConversion(key) {
-        const hour12 = document.getElementById('time_hour_12_' + key);
-        const minute12 = document.getElementById('time_minute_12_' + key);
-        const ampm = document.getElementById('time_ampm_' + key);
-        const hour24 = document.getElementById('time_hour_24_' + key);
-        const minute24 = document.getElementById('time_minute_24_' + key);
-        
-        if (!hour12 || !minute12 || !ampm || !hour24 || !minute24) return;
-        
-        function convert12To24() {
-            let h = parseInt(hour12.value);
-            const m = parseInt(minute12.value);
-            const a = ampm.value;
-            
-            if (isNaN(h) || isNaN(m) || h < 1 || h > 12 || m < 0 || m > 59) {
-                return;
-            }
-            
-            let h24 = h;
-            if (a === 'PM' && h !== 12) h24 = h + 12;
-            if (a === 'AM' && h === 12) h24 = 0;
-            
-            hour24.value = String(h24).padStart(2, '0');
-            minute24.value = String(m).padStart(2, '0');
-        }
-        
-        function convert24To12() {
-            let h = parseInt(hour24.value);
-            const m = parseInt(minute24.value);
-            
-            if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) {
-                return;
-            }
-            
-            let a = 'AM';
-            let h12 = h;
-            if (h >= 12) {
-                a = 'PM';
-                if (h > 12) h12 = h - 12;
-            }
-            if (h === 0) {
-                h12 = 12;
-                a = 'AM';
-            }
-            
-            hour12.value = h12;
-            ampm.value = a;
-            minute12.value = String(m).padStart(2, '0');
-        }
-        
-        hour12.addEventListener('input', convert12To24);
-        minute12.addEventListener('input', convert12To24);
-        ampm.addEventListener('change', convert12To24);
-        hour24.addEventListener('input', convert24To12);
-        minute24.addEventListener('input', convert24To12);
-    }
-    
-    // ===== COUNTRY FUNCTIONS =====
-    function addFilter() {
-        const input = document.getElementById('filter_input');
-        const value = input.value.trim();
-        if (value) {
-            if (!configData.filters) configData.filters = [];
-            if (!configData.filters.includes(value)) {
-                configData.filters.push(value);
-                loadFilters();
-                renderDynamicFields();
-                input.value = '';
-            }
-        }
-    }
-    
-    function removeFilter(index) {
-        showModal('Confirm Delete', 'Are you sure you want to remove this filter?', function() {
-            if (configData.filters) {
-                configData.filters.splice(index, 1);
-                loadFilters();
-                renderDynamicFields();
+        Object.keys(configData.dynamic_fields || {}).forEach(function(fieldKey) {
+            if (!Object.prototype.hasOwnProperty.call(editValues, fieldKey) &&
+                config && Object.prototype.hasOwnProperty.call(config, fieldKey)) {
+                editValues[fieldKey] = config[fieldKey];
             }
         });
+        loadDynamicValues(editValues);
+        
+        document.querySelectorAll('.tab-content-area').forEach(c => c.classList.remove('active'));
+        document.querySelectorAll('.main-tab-btn').forEach(b => b.classList.remove('active'));
+        
+        document.getElementById('addConfigView').classList.add('active');
+        document.getElementById('addConfigView').style.display = 'block';
+        document.getElementById('settingsTabTitle').textContent = 'Edit Configuration - ' + author;
+        document.getElementById('editModeBanner').classList.add('visible');
+        document.getElementById('editAuthorNameDisplay').textContent = author;
+        
+        document.getElementById('fabButton').classList.remove('visible');
+        
+        renderDynamicFields();
+    }
+    
+    function loadDynamicValues(dynamicValues) {
+        window._dynamicValuesToLoad = (dynamicValues && typeof dynamicValues === 'object' && !Array.isArray(dynamicValues))
+            ? Object.assign({}, dynamicValues)
+            : {};
+    }
+    
+    function cancelEditMode() {
+        closeAddConfig();
+    }
+    
+    function handleStatusSelectChange(index, selectElement) {
+        if (!selectElement) return;
+        const previousStatus = String(selectElement.dataset.currentStatus || 'pending').toLowerCase();
+        const selectedStatus = String(selectElement.value || '').toLowerCase();
+        const allowedStatuses = ['pending', 'completed', 'aborted'];
+
+        if (!allowedStatuses.includes(selectedStatus)) {
+            selectElement.value = previousStatus;
+            return;
+        }
+        if (selectedStatus === previousStatus) return;
+
+        changeStatusByIndex(index, selectedStatus, selectElement, previousStatus);
+    }
+
+    function changeStatusByIndex(index, status, statusSelect, previousStatus) {
+        const allowedStatuses = ['pending', 'completed', 'aborted'];
+        status = String(status || '').toLowerCase();
+
+        if (index === undefined || index === null || index === -1) {
+            if (statusSelect && previousStatus) statusSelect.value = previousStatus;
+            showModal('Error', 'Invalid configuration index.');
+            return;
+        }
+
+        if (!allowedStatuses.includes(status)) {
+            if (statusSelect && previousStatus) statusSelect.value = previousStatus;
+            showModal('Error', 'Invalid status selected.');
+            return;
+        }
+
+        if (!configId) {
+            if (statusSelect && previousStatus) statusSelect.value = previousStatus;
+            showModal('Error', 'No configuration found.');
+            return;
+        }
+
+        const settings = configData.settings;
+        if (!Array.isArray(settings) || index < 0 || index >= settings.length) {
+            if (statusSelect && previousStatus) statusSelect.value = previousStatus;
+            showModal('Error', 'Configuration not found at index ' + index);
+            return;
+        }
+
+        const config = settings[index];
+        if (!config || typeof config !== 'object') {
+            if (statusSelect && previousStatus) statusSelect.value = previousStatus;
+            showModal('Error', 'Invalid configuration.');
+            return;
+        }
+
+        const originalStatus = String(previousStatus || config.status || 'pending').toLowerCase();
+        const hadOperationStatus = Object.prototype.hasOwnProperty.call(config, 'operation_status');
+        const originalOperationStatus = config.operation_status;
+        const hasDynamicValues = config.dynamic_values && typeof config.dynamic_values === 'object';
+        const hadDynamicStatus = hasDynamicValues && Object.prototype.hasOwnProperty.call(config.dynamic_values, 'status');
+        const originalDynamicStatus = hasDynamicValues ? config.dynamic_values.status : undefined;
+        const hadDynamicOperationStatus = hasDynamicValues && Object.prototype.hasOwnProperty.call(config.dynamic_values, 'operation_status');
+        const originalDynamicOperationStatus = hasDynamicValues ? config.dynamic_values.operation_status : undefined;
+
+        if (status === originalStatus) {
+            if (statusSelect) statusSelect.value = originalStatus;
+            return;
+        }
+
+        function rollbackStatusChange() {
+            config.status = originalStatus;
+            if (hadOperationStatus) {
+                config.operation_status = originalOperationStatus;
+            } else {
+                delete config.operation_status;
+            }
+            if (hasDynamicValues) {
+                if (hadDynamicStatus) config.dynamic_values.status = originalDynamicStatus;
+                else delete config.dynamic_values.status;
+                if (hadDynamicOperationStatus) config.dynamic_values.operation_status = originalDynamicOperationStatus;
+                else delete config.dynamic_values.operation_status;
+            }
+            if (statusSelect) {
+                statusSelect.value = originalStatus;
+                statusSelect.dataset.currentStatus = originalStatus;
+                statusSelect.disabled = false;
+            }
+        }
+
+        config.status = status;
+        config.operation_status = "change_status: Status updated to '" + status + "'";
+
+        if (hasDynamicValues) {
+            delete config.dynamic_values.status;
+            delete config.dynamic_values.operation_status;
+        }
+
+        const formData = new FormData();
+        formData.append('update_status', 'true');
+        formData.append('id', String(configId));
+        formData.append('index', String(index));
+        formData.append('status', status);
+
+        if (statusSelect) statusSelect.disabled = true;
+        showModal('Processing', 'Updating status to "' + status + '"...');
+
+        fetch(window.location.href, { method: 'POST', body: formData })
+            .then(response => response.json())
+            .then(data => {
+                closeModal();
+                if (data.success) {
+                    if (statusSelect) statusSelect.dataset.currentStatus = status;
+                    showModal('Success', 'Status updated to "' + status + '"! Refreshing...');
+                    setTimeout(() => window.location.reload(), 700);
+                } else {
+                    rollbackStatusChange();
+                    showModal('Error', data.message || 'Failed to update status.');
+                }
+            })
+            .catch(error => {
+                rollbackStatusChange();
+                closeModal();
+                showModal('Error', 'Error: ' + error.message);
+            });
     }
     
     // ===== ACCOUNT FUNCTIONS =====
@@ -5559,7 +4262,6 @@
         configData.accounts[name] = { schedule: [url] };
         loadAccounts();
         loadCaptionAuthors();
-        renderDynamicFields();
         hideAddAccount();
         showModal('Success', 'Account added successfully!');
     }
@@ -5570,9 +4272,34 @@
                 delete configData.accounts[name];
                 loadAccounts();
                 loadCaptionAuthors();
-                renderDynamicFields();
             }
         });
+    }
+    
+    function loadAccounts() {
+        const container = document.getElementById('accounts_list');
+        container.innerHTML = '';
+        
+        const accounts = configData.accounts || {};
+        
+        if (Object.keys(accounts).length === 0) {
+            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No accounts added yet.</p>';
+            return;
+        }
+        
+        for (const [key, value] of Object.entries(accounts)) {
+            const url = value.schedule && value.schedule[0] ? value.schedule[0] : '';
+            const div = document.createElement('div');
+            div.className = 'item-row';
+            div.innerHTML = `
+                <div class="item-info">
+                    <span class="key">${key}</span>
+                    <span class="value">${url}</span>
+                </div>
+                <button class="btn btn-danger btn-sm" onclick="deleteAccount('${key}')">Delete</button>
+            `;
+            container.appendChild(div);
+        }
     }
     
     // ===== CAPTION FUNCTIONS =====
@@ -5580,14 +4307,13 @@
         document.getElementById('add_caption_form').style.display = 'block';
         loadCaptionAuthors();
     }
-
+    
     function hideAddCaption() {
         document.getElementById('add_caption_form').style.display = 'none';
         document.getElementById('new_caption_text').value = '';
         document.getElementById('caption_author_select').value = '';
     }
-
-    // Parse caption input - supports multiple formats with sanitization
+    
     function parseCaptionInput(input) {
         if (!input || typeof input !== 'string') {
             return [];
@@ -5595,28 +4321,21 @@
         
         const trimmed = input.trim();
         
-        // Try to parse as JSON
         try {
             const parsed = JSON.parse(trimmed);
             
-            // Format: [{key-name: string, id: number, description: string}, ...]
             if (Array.isArray(parsed) && parsed.length > 0) {
-                // Check if it's the object format with description/caption field
                 if (parsed[0].description !== undefined || parsed[0].caption !== undefined) {
-                    // Use description or caption field
                     const descriptionField = parsed[0].description !== undefined ? 'description' : 'caption';
-                    
-                    // Sanitize each description and create clean entries
                     return parsed
                         .filter(item => item[descriptionField] && item[descriptionField].trim())
                         .map((item, index) => ({
-                            id: index + 1, // Reset IDs based on position
+                            id: index + 1,
                             description: sanitizeCaption(item[descriptionField].trim())
                         }))
                         .filter(item => item.description);
                 }
                 
-                // Format 1: ["caption 1", "caption 2", ...]
                 if (parsed.length > 0 && typeof parsed[0] === 'string') {
                     return parsed
                         .filter(item => typeof item === 'string' && item.trim())
@@ -5627,23 +4346,18 @@
                         .filter(item => item.description);
                 }
             }
-        } catch (e) {
-            // Not JSON - treat as plain text with newlines
-        }
+        } catch (e) {}
         
-        // Not JSON: split by newlines
         const items = trimmed.split(/\n+/).filter(item => item.trim());
         
         if (items.length === 0) {
             return [];
         }
         
-        // Try to parse each item as JSON object
         const maybeObjects = items.map(item => {
             try {
                 const obj = JSON.parse(item.trim());
                 if (obj && typeof obj === 'object') {
-                    // Check for description or caption field
                     const descField = obj.description !== undefined ? 'description' : 
                                     obj.caption !== undefined ? 'caption' : null;
                     if (descField && obj[descField]) {
@@ -5657,7 +4371,6 @@
             return null;
         });
         
-        // If all items are valid objects, use them
         if (maybeObjects.every(item => item !== null)) {
             return maybeObjects
                 .filter(item => item && item.description)
@@ -5667,7 +4380,6 @@
                 }));
         }
         
-        // Otherwise treat as plain captions with newline separation
         return items
             .filter(item => item.trim())
             .map((item, index) => ({
@@ -5676,27 +4388,17 @@
             }))
             .filter(item => item.description);
     }
-
-    // ===== CAPTION SANITIZATION HELPER =====
+    
     function sanitizeCaption(text) {
         if (!text || typeof text !== 'string') {
             return text;
         }
         
-        // Step 1: Remove all asterisk (*) characters
         let sanitized = text.replace(/\*/g, '');
-        
-        // Step 2: Remove leading numbers only if at the very beginning
-        // Pattern: matches optional spaces, then numbers, then optional . or ) or - or space
-        // But only if they appear at the start of the string
         sanitized = sanitized.replace(/^[\s]*\d+[\s]*[\.\)\-\:]?\s*/, '');
-        
-        // Step 3: Trim any extra whitespace
-        sanitized = sanitized.trim();
-        
-        return sanitized;
+        return sanitized.trim();
     }
-
+    
     function addCaption() {
         const author = document.getElementById('caption_author_select').value;
         const inputText = document.getElementById('new_caption_text').value;
@@ -5711,16 +4413,13 @@
             return;
         }
         
-        // Parse the input - this now handles both JSON and plain text
         let parsedCaptions = parseCaptionInput(inputText);
         
-        // If parseCaptionInput returns empty, try manual JSON parsing as fallback
         if (parsedCaptions.length === 0) {
             try {
                 const trimmed = inputText.trim();
                 const parsed = JSON.parse(trimmed);
                 if (Array.isArray(parsed) && parsed.length > 0) {
-                    // Check for description or caption field
                     const descField = parsed[0].description !== undefined ? 'description' : 
                                     parsed[0].caption !== undefined ? 'caption' : null;
                     if (descField) {
@@ -5733,9 +4432,7 @@
                             .filter(item => item.description);
                     }
                 }
-            } catch (e) {
-                // Not JSON
-            }
+            } catch (e) {}
         }
         
         if (parsedCaptions.length === 0) {
@@ -5743,16 +4440,13 @@
             return;
         }
         
-        // Initialize captions array if not exists
         if (!configData.captions || !Array.isArray(configData.captions)) {
             configData.captions = [];
         }
         
-        // Find if author already exists
         let authorIndex = configData.captions.findIndex(item => item.name === author);
         
         if (authorIndex === -1) {
-            // Create new author entry
             configData.captions.push({
                 name: author,
                 id: configData.captions.length + 1,
@@ -5761,10 +4455,8 @@
             authorIndex = configData.captions.length - 1;
         }
         
-        // Get existing captions count for ID continuation
         const existingCount = configData.captions[authorIndex].captions.length;
         
-        // Add new captions with proper IDs (continue from existing)
         const newCaptions = parsedCaptions.map((caption, index) => ({
             id: existingCount + index + 1,
             description: caption.description
@@ -5772,19 +4464,15 @@
         
         configData.captions[authorIndex].captions = configData.captions[authorIndex].captions.concat(newCaptions);
         
-        // Reload UI
         loadCaptions();
-        renderDynamicFields();
         hideAddCaption();
-        
-        showModal('Success', `${parsedCaptions.length} caption(s) added successfully for ${author}!`);
+        showModal('Success', parsedCaptions.length + ' caption(s) added successfully for ' + author + '!');
     }
-
+    
     function editCaptions(index) {
         const authorData = configData.captions[index];
         if (!authorData) return;
         
-        // Display captions as plain sentences without JSON structure
         let captionsText = '';
         if (authorData.captions && authorData.captions.length > 0) {
             captionsText = authorData.captions
@@ -5815,7 +4503,7 @@
         showModal('Edit Captions', '', null, html);
         window._editingCaptionIndex = index;
     }
-
+    
     function saveEditedCaptions(index) {
         const authorData = configData.captions[index];
         if (!authorData) return;
@@ -5824,11 +4512,8 @@
         if (!textarea) return;
         
         const inputText = textarea.value;
-        
-        // Parse the input - handles both JSON and plain text
         let parsedCaptions = parseCaptionInput(inputText);
         
-        // If parseCaptionInput returns empty, try manual JSON parsing as fallback
         if (parsedCaptions.length === 0) {
             try {
                 const trimmed = inputText.trim();
@@ -5846,9 +4531,7 @@
                             .filter(item => item.description);
                     }
                 }
-            } catch (e) {
-                // Not JSON
-            }
+            } catch (e) {}
         }
         
         if (parsedCaptions.length === 0) {
@@ -5856,39 +4539,105 @@
             return;
         }
         
-        // Replace all captions with the sanitized ones (reset IDs)
         authorData.captions = parsedCaptions.map((caption, idx) => ({
             id: idx + 1,
             description: caption.description
         }));
         
         loadCaptions();
-        renderDynamicFields();
         closeModal();
-        showModal('Success', `${authorData.captions.length} caption(s) updated successfully!`);
+        showModal('Success', authorData.captions.length + ' caption(s) updated successfully!');
     }
-
+    
     function deleteCaptionFromAuthor(index) {
         showModal('Confirm Delete', 'Are you sure you want to delete all captions for this author?', function() {
             if (configData.captions && configData.captions[index]) {
                 configData.captions[index].captions = [];
                 loadCaptions();
-                renderDynamicFields();
                 closeModal();
                 showModal('Success', 'All captions deleted for this author.');
             }
         });
     }
-
-function deleteCaptionAuthor(index) {
-    showModal('Confirm Delete', 'Are you sure you want to delete this author and all their captions?', function() {
-        if (configData.captions) {
-            configData.captions.splice(index, 1);
-            loadCaptions();
-            renderDynamicFields();
+    
+    function deleteCaptionAuthor(index) {
+        showModal('Confirm Delete', 'Are you sure you want to delete this author and all their captions?', function() {
+            if (configData.captions) {
+                configData.captions.splice(index, 1);
+                loadCaptions();
+            }
+        });
+    }
+    
+    function loadCaptions() {
+        const container = document.getElementById('captions_list');
+        container.innerHTML = '';
+        
+        const captions = configData.captions || [];
+        
+        if (captions.length === 0) {
+            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No captions added yet.</p>';
+            return;
         }
-    });
-}
+        
+        captions.forEach((authorData, index) => {
+            const div = document.createElement('div');
+            div.className = 'caption-item';
+            
+            let captionsDisplay = '';
+            if (authorData.captions && authorData.captions.length > 0) {
+                const captionLines = authorData.captions
+                    .map(cap => {
+                        if (cap && typeof cap === 'object' && cap.description) {
+                            return cap.description;
+                        }
+                        if (cap && typeof cap === 'object' && cap.caption) {
+                            return cap.caption;
+                        }
+                        if (typeof cap === 'string') {
+                            return cap;
+                        }
+                        return JSON.stringify(cap);
+                    })
+                    .slice(0, 5);
+                captionsDisplay = captionLines.join(' | ');
+                if (authorData.captions.length > 5) {
+                    captionsDisplay += ' ... (+' + (authorData.captions.length - 5) + ' more)';
+                }
+            } else {
+                captionsDisplay = 'No captions';
+            }
+            
+            div.innerHTML = `
+                <div class="caption-content">
+                    <span class="caption-author">${authorData.name || 'Unknown Author'}</span>
+                    <span style="font-size:13px; color:#5a7a8a;">${authorData.captions ? authorData.captions.length : 0} caption(s)</span>
+                    <div style="margin-top:5px; font-size:13px; color:#718096; word-break:break-word;">
+                        ${captionsDisplay}
+                    </div>
+                </div>
+                <div>
+                    <button class="btn btn-warning btn-sm" onclick="editCaptions(${index})" style="margin-right:5px;">Edit</button>
+                    <button class="btn btn-danger btn-sm" onclick="deleteCaptionAuthor(${index})">Delete</button>
+                </div>
+            `;
+            container.appendChild(div);
+        });
+    }
+    
+    function loadCaptionAuthors() {
+        const select = document.getElementById('caption_author_select');
+        if (!select) return;
+        select.innerHTML = '<option value="">Select Author</option>';
+        
+        const accounts = configData.accounts || {};
+        for (const key of Object.keys(accounts)) {
+            const option = document.createElement('option');
+            option.value = key;
+            option.textContent = key;
+            select.appendChild(option);
+        }
+    }
     
     // ===== TIME ORDER FUNCTIONS =====
     function showAddTimeOrder() {
@@ -5897,7 +4646,7 @@ function deleteCaptionAuthor(index) {
         const container = document.getElementById('timeorders_list');
         const form = document.createElement('div');
         form.id = 'add_timeorder_form';
-        form.style.cssText = 'background: #f8f9fa; padding: 20px; border-radius: 6px; margin-bottom: 20px;';
+        form.style.cssText = 'background: #f8fafc; padding: 20px; border-radius: 8px; margin-bottom: 20px;';
         form.innerHTML = `
             <div class="form-group">
                 <label>Time Order Name</label>
@@ -6035,8 +4784,8 @@ function deleteCaptionAuthor(index) {
         const table = document.createElement('div');
         table.style.cssText = 'display: grid; grid-template-columns: 1fr 1fr; gap: 5px;';
         table.innerHTML = `
-            <div class="time-badge header" style="background:#667eea; color:white; padding:8px; border-radius:6px; text-align:center; font-weight:600;">12 Hours</div>
-            <div class="time-badge header" style="background:#667eea; color:white; padding:8px; border-radius:6px; text-align:center; font-weight:600;">24 Hours</div>
+            <div class="time-badge header" style="background:#00695c; color:white; padding:8px; border-radius:6px; text-align:center; font-weight:600;">12 Hours</div>
+            <div class="time-badge header" style="background:#00695c; color:white; padding:8px; border-radius:6px; text-align:center; font-weight:600;">24 Hours</div>
         `;
         
         _newTimeList.forEach((item, index) => {
@@ -6048,7 +4797,7 @@ function deleteCaptionAuthor(index) {
             const div2 = document.createElement('div');
             div2.className = 'time-badge';
             div2.style.cssText = 'background:white; padding:8px; border-radius:6px; border:1px solid #ddd; text-align:center; display:flex; justify-content:space-between; align-items:center;';
-            div2.innerHTML = item['24hours'] + ' <span style="color:#fc8181; cursor:pointer; margin-left:10px;" onclick="removeNewTime(' + index + ')">×</span>';
+            div2.innerHTML = item['24hours'] + ' <span style="color:#ef4444; cursor:pointer; margin-left:10px;" onclick="removeNewTime(' + index + ')">×</span>';
             
             table.appendChild(div1);
             table.appendChild(div2);
@@ -6086,7 +4835,6 @@ function deleteCaptionAuthor(index) {
         
         configData.timeorders[name] = _newTimeList;
         loadTimeOrders();
-        renderDynamicFields();
         cancelNewTimeOrder();
         showModal('Success', 'Time order saved successfully!');
     }
@@ -6125,7 +4873,6 @@ function deleteCaptionAuthor(index) {
         if (configData.timeorders && configData.timeorders[key]) {
             configData.timeorders[key].push({ '12hours': time12h, '24hours': time24h });
             loadTimeOrders();
-            renderDynamicFields();
             showModal('Success', 'Time added successfully!');
         }
     }
@@ -6135,24 +4882,656 @@ function deleteCaptionAuthor(index) {
             if (configData.timeorders) {
                 delete configData.timeorders[name];
                 loadTimeOrders();
-                renderDynamicFields();
             }
         });
     }
     
+    function loadTimeOrders() {
+        const container = document.getElementById('timeorders_list');
+        container.innerHTML = '';
+        
+        const timeOrders = configData.timeorders || {};
+        
+        if (Object.keys(timeOrders).length === 0) {
+            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No time orders added yet.</p>';
+            return;
+        }
+        
+        for (const [key, value] of Object.entries(timeOrders)) {
+            const div = document.createElement('div');
+            div.className = 'timeorder-item';
+            
+            let timesHtml = '';
+            if (Array.isArray(value) && value.length > 0) {
+                timesHtml += '<div class="time-list">';
+                value.forEach(t => {
+                    const time12 = t['12hours'] || t.twelveHour || t.time || '';
+                    const time24 = t['24hours'] || '';
+                    timesHtml += '<div class="time-badge">' + time12 + '</div><div class="time-badge">' + time24 + '</div>';
+                });
+                timesHtml += '</div>';
+            } else {
+                timesHtml = '<span style="color:#999;">No times added</span>';
+            }
+            
+            div.innerHTML = `
+                <div class="timeorder-header">
+                    <span class="key">${key}</span>
+                    <button class="btn btn-danger btn-sm" onclick="deleteTimeOrder('${key}')">Delete</button>
+                </div>
+                ${timesHtml}
+                <div class="add-time-area">
+                    <button class="btn btn-primary btn-sm" onclick="addTimeToExistingOrder('${key}')">Add Time</button>
+                    <div id="add_time_${key}" style="display:none; margin-top:10px;">
+                        <div class="time-input-group">
+                            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px;">
+                                <span style="font-weight:500;">24h:</span>
+                                <input type="number" id="time_hour_24_${key}" placeholder="HH" min="0" max="23" style="width:80px; padding:10px;">
+                                <span>:</span>
+                                <input type="number" id="time_minute_24_${key}" placeholder="MM" min="0" max="59" style="width:80px; padding:10px;">
+                            </div>
+                            <div style="display:flex; gap:10px; align-items:center; flex-wrap:wrap;">
+                                <span style="font-weight:500;">12h:</span>
+                                <input type="number" id="time_hour_12_${key}" placeholder="HH" min="1" max="12" style="width:80px; padding:10px;">
+                                <span>:</span>
+                                <input type="number" id="time_minute_12_${key}" placeholder="MM" min="0" max="59" style="width:80px; padding:10px;">
+                                <select id="time_ampm_${key}" style="width:100px; padding:10px;">
+                                    <option value="AM">AM</option>
+                                    <option value="PM">PM</option>
+                                </select>
+                            </div>
+                            <div style="margin-top:10px;">
+                                <button class="btn btn-success btn-sm" onclick="saveTimeToOrder('${key}')">Add to List</button>
+                                <button class="btn btn-secondary btn-sm" onclick="cancelAddTime('${key}')">Cancel</button>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            `;
+            container.appendChild(div);
+            setupTimeOrderConversion(key);
+        }
+    }
+    
+    function setupTimeOrderConversion(key) {
+        const hour12 = document.getElementById('time_hour_12_' + key);
+        const minute12 = document.getElementById('time_minute_12_' + key);
+        const ampm = document.getElementById('time_ampm_' + key);
+        const hour24 = document.getElementById('time_hour_24_' + key);
+        const minute24 = document.getElementById('time_minute_24_' + key);
+        
+        if (!hour12 || !minute12 || !ampm || !hour24 || !minute24) return;
+        
+        function convert12To24() {
+            let h = parseInt(hour12.value);
+            const m = parseInt(minute12.value);
+            const a = ampm.value;
+            
+            if (isNaN(h) || isNaN(m) || h < 1 || h > 12 || m < 0 || m > 59) {
+                return;
+            }
+            
+            let h24 = h;
+            if (a === 'PM' && h !== 12) h24 = h + 12;
+            if (a === 'AM' && h === 12) h24 = 0;
+            
+            hour24.value = String(h24).padStart(2, '0');
+            minute24.value = String(m).padStart(2, '0');
+        }
+        
+        function convert24To12() {
+            let h = parseInt(hour24.value);
+            const m = parseInt(minute24.value);
+            
+            if (isNaN(h) || isNaN(m) || h < 0 || h > 23 || m < 0 || m > 59) {
+                return;
+            }
+            
+            let a = 'AM';
+            let h12 = h;
+            if (h >= 12) {
+                a = 'PM';
+                if (h > 12) h12 = h - 12;
+            }
+            if (h === 0) {
+                h12 = 12;
+                a = 'AM';
+            }
+            
+            hour12.value = h12;
+            ampm.value = a;
+            minute12.value = String(m).padStart(2, '0');
+        }
+        
+        hour12.addEventListener('input', convert12To24);
+        minute12.addEventListener('input', convert12To24);
+        ampm.addEventListener('change', convert12To24);
+        hour24.addEventListener('input', convert24To12);
+        minute24.addEventListener('input', convert24To12);
+    }
+    
+    // ===== FILTER FUNCTIONS =====
+    function addFilter() {
+        const input = document.getElementById('filter_input');
+        const value = input.value.trim();
+        if (value) {
+            if (!configData.filters) configData.filters = [];
+            if (!configData.filters.includes(value)) {
+                configData.filters.push(value);
+                loadFilters();
+                input.value = '';
+            }
+        }
+    }
+    
+    function removeFilter(index) {
+        showModal('Confirm Delete', 'Are you sure you want to remove this filter?', function() {
+            if (configData.filters) {
+                configData.filters.splice(index, 1);
+                loadFilters();
+            }
+        });
+    }
+    
+    function loadFilters() {
+        const container = document.getElementById('filters_list');
+        container.innerHTML = '';
+        
+        const filters = configData.filters || [];
+        if (filters.length === 0) {
+            container.innerHTML = '<p style="color: #999; font-size: 14px;">No filters added.</p>';
+            return;
+        }
+        
+        filters.forEach((filter, index) => {
+            const span = document.createElement('span');
+            span.className = 'group-item';
+            span.innerHTML = filter + ' <span class="remove-group" onclick="removeFilter(' + index + ')">×</span>';
+            container.appendChild(span);
+        });
+    }
+    
+    // ===== DYNAMIC FIELD FUNCTIONS =====
+    function loadDynamicFields() {
+        const container = document.getElementById('dynamic_fields_list');
+        if (!container) return;
+        container.innerHTML = '';
+
+        const fields = configData.dynamic_fields || {};
+        const fieldKeys = Object.keys(fields);
+
+        if (fieldKeys.length === 0) {
+            container.innerHTML = '<p style="color: #999; text-align: center; padding: 20px;">No dynamic fields added yet.</p>';
+            return;
+        }
+
+        fieldKeys.forEach((key, index) => {
+            const field = fields[key] || {};
+            const div = document.createElement('div');
+            div.className = 'dynamic-field-item';
+
+            const defaultValues = Array.isArray(field.default_values) ? field.default_values : [];
+            const sourceType = field.source_type || 'none';
+            const allowList = !!field.allow_list;
+            const title = field.title || key;
+            const submitAs = field.submit_as || 'key';
+
+            let sourceInfo = '';
+            if (sourceType === 'accounts') sourceInfo = ' | Source: Account URLs';
+            else if (sourceType === 'captions') sourceInfo = ' | Source: Captions';
+            else if (sourceType === 'timeorders') sourceInfo = ' | Source: Time Orders';
+            else if (sourceType === 'filters') sourceInfo = ' | Source: Filters';
+
+            let submitAsLabel = '';
+            if (submitAs === 'key') submitAsLabel = 'Submit: Key Only';
+            else if (submitAs === 'value') submitAsLabel = 'Submit: Value Only';
+            else if (submitAs === 'both') submitAsLabel = 'Submit: Key & Value';
+
+            div.innerHTML = `
+                <div class="field-header">
+                    <span class="field-name">${title} (${key})</span>
+                    <span class="field-type-badge">${field.element_type || 'input'}${allowList ? ' + List' : ''}</span>
+                </div>
+                <div style="color: #6b7280; font-size: 13px;">
+                    ${field.element_type === 'select' ? 'Options: ' + (defaultValues.length > 0 ? defaultValues.join(', ') : 'None') : ''}
+                    ${sourceInfo}
+                    ${allowList ? ' | Allows adding custom values' : ''}
+                    ${submitAsLabel ? ' | ' + submitAsLabel : ''}
+                </div>
+                <div class="default-values">
+                    ${defaultValues.map(val => `<span class="value-tag">${val}</span>`).join('')}
+                </div>
+                <div class="dynamic-field-action-row" style="margin-top:10px;display:flex;align-items:center;gap:7px;flex-wrap:wrap;">
+                    <button type="button" class="btn btn-warning btn-sm dynamic-field-edit-button" style="margin-right:5px;">Edit</button>
+                    <button type="button" class="btn btn-danger btn-sm dynamic-field-delete-button">Delete</button>
+                </div>
+            `;
+
+            // SceneIQ-style position controls for the complete Dynamic Fields list.
+            const header = div.querySelector('.field-header');
+            const reorderControls = document.createElement('div');
+            reorderControls.className = 'dynamic-field-reorder-controls';
+
+            const position = document.createElement('span');
+            position.className = 'dynamic-field-position';
+            position.textContent = String(index + 1);
+            position.setAttribute('aria-label', 'Position ' + (index + 1));
+
+            const moveUp = document.createElement('button');
+            moveUp.type = 'button';
+            moveUp.className = 'dynamic-field-move-button';
+            moveUp.textContent = '↑';
+            moveUp.title = 'Move field up';
+            moveUp.setAttribute('aria-label', 'Move ' + key + ' up');
+            moveUp.disabled = index === 0;
+            moveUp.addEventListener('click', function(event) {
+                event.preventDefault();
+                event.stopPropagation();
+                moveDynamicField(key, 'up');
+            });
+
+            const moveDown = document.createElement('button');
+            moveDown.type = 'button';
+            moveDown.className = 'dynamic-field-move-button';
+            moveDown.textContent = '↓';
+            moveDown.title = 'Move field down';
+            moveDown.setAttribute('aria-label', 'Move ' + key + ' down');
+            moveDown.disabled = index === fieldKeys.length - 1;
+            moveDown.addEventListener('click', function(event) {
+                event.preventDefault();
+                event.stopPropagation();
+                moveDynamicField(key, 'down');
+            });
+
+            reorderControls.appendChild(position);
+            reorderControls.appendChild(moveUp);
+            reorderControls.appendChild(moveDown);
+            header.appendChild(reorderControls);
+
+            div.querySelector('.dynamic-field-edit-button').addEventListener('click', function() {
+                editDynamicField(key);
+            });
+            div.querySelector('.dynamic-field-delete-button').addEventListener('click', function() {
+                deleteDynamicField(key);
+            });
+
+            container.appendChild(div);
+        });
+    }
+
+    // Rebuild dynamic_fields in the chosen key order. Object insertion order survives
+    // JSON.stringify and PHP json_decode, so Setup and Add/Edit forms stay aligned.
+    function moveDynamicField(fieldKey, direction) {
+        const current = configData.dynamic_fields || {};
+        const keys = Object.keys(current);
+        const from = keys.indexOf(String(fieldKey));
+        const to = from + (direction === 'up' ? -1 : 1);
+
+        if (from < 0 || to < 0 || to >= keys.length) return;
+
+        const reorderedKeys = keys.slice();
+        const movedKey = reorderedKeys.splice(from, 1)[0];
+        reorderedKeys.splice(to, 0, movedKey);
+
+        const reorderedFields = {};
+        reorderedKeys.forEach(function(key) {
+            reorderedFields[key] = current[key];
+        });
+
+        const previousFields = current;
+        configData.dynamic_fields = reorderedFields;
+
+        const container = document.getElementById('dynamic_fields_list');
+        if (container) container.classList.add('is-saving-order');
+
+        loadDynamicFields();
+
+        const formData = new FormData();
+        formData.append('save_dynamic_fields_order', 'true');
+        formData.append('field_order', JSON.stringify(reorderedKeys));
+
+        fetch(window.location.href, { method: 'POST', body: formData })
+            .then(function(response) {
+                return response.json().then(function(result) {
+                    if (!response.ok || !result || !result.success) {
+                        throw new Error((result && result.message) || 'The new field order could not be saved.');
+                    }
+                    return result;
+                });
+            })
+            .then(function() {
+                loadDynamicFields();
+            })
+            .catch(function(error) {
+                configData.dynamic_fields = previousFields;
+                loadDynamicFields();
+                showModal('Order Not Saved', error.message || 'Could not save the new dynamic-field order.');
+            })
+            .finally(function() {
+                if (container) container.classList.remove('is-saving-order');
+            });
+    }
+
+    function showAddDynamicFieldModal() {
+        _newDefaultValues = [];
+        editingDynamicFieldKey = null;
+        
+        const html = `
+            <div class="form-group">
+                <label>Display Title (shown in UI)</label>
+                <input type="text" id="modal_field_title" placeholder="Enter display title..." style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                <small style="color:#999;">This is what users will see</small>
+            </div>
+            <div class="form-group">
+                <label>Field Value (used in backend)</label>
+                <input type="text" id="modal_field_name" placeholder="Enter field value (no spaces)..." style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                <small style="color:#999;">Spaces will be replaced with underscores. Used for storage.</small>
+            </div>
+            <div class="form-group">
+                <label>Element Type</label>
+                <select id="modal_element_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="select">Select</option>
+                    <option value="input">Input</option>
+                    <option value="textarea">Textarea</option>
+                    <option value="date-time-input">Date & Time</option>
+                </select>
+            </div>
+            <div class="form-group" id="modal_allow_list_container" style="display:none;">
+                <label>Allow Adding Custom Values (List Input)</label>
+                <select id="modal_allow_list" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="no">No - Single value only</option>
+                    <option value="yes">Yes - Allow multiple values (add/remove)</option>
+                </select>
+                <small style="color:#999;">If Yes, users can add multiple values to this field</small>
+            </div>
+            <div class="form-group" id="modal_default_values_container">
+                <label>Default Values</label>
+                <div style="display:flex; gap:10px; margin-bottom:10px;">
+                    <input type="text" id="modal_default_value_input" placeholder="Enter value..." style="flex:1; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <button class="btn btn-primary" onclick="addModalDefaultValue()">Add</button>
+                </div>
+                <div id="modal_default_values_list"></div>
+            </div>
+            <div class="form-group" id="modal_source_container">
+                <label>Source Options From (for Select type)</label>
+                <select id="modal_source_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="none">None - Use default values only</option>
+                    <option value="accounts">Account URLs</option>
+                    <option value="captions">Captions</option>
+                    <option value="timeorders">Time Orders</option>
+                    <option value="filters">Filters</option>
+                </select>
+                <small style="color:#999;">Select which data source to populate the dropdown with</small>
+            </div>
+            <div class="form-group" id="modal_submit_as_container">
+                <label>Submit As</label>
+                <select id="modal_submit_as" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="key">Submit Key Only</option>
+                    <option value="value">Submit Value Only</option>
+                    <option value="both">Submit Key & Value</option>
+                </select>
+                <small style="color:#999;">Choose what data to submit to the backend</small>
+                <div id="modal_submit_preview" class="submit-as-preview" style="margin-top:5px; padding:6px 12px; background:#f8fafc; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#6b7280; font-family:monospace;">
+                    Example: "key" → "value"
+                </div>
+            </div>
+            <div style="margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-success" onclick="saveDynamicFieldFromModal()">Save Field</button>
+            </div>
+        `;
+        
+        showModal('Add Dynamic Field', '', null, html);
+        renderModalDefaultValues();
+        
+        document.getElementById('modal_element_type').addEventListener('change', function() {
+            const isSelect = this.value === 'select';
+            const isInput = this.value === 'input';
+            
+            document.getElementById('modal_default_values_container').style.display = (isSelect || isInput) ? 'block' : 'none';
+            document.getElementById('modal_source_container').style.display = isSelect ? 'block' : 'none';
+            document.getElementById('modal_allow_list_container').style.display = isInput ? 'block' : 'none';
+            document.getElementById('modal_submit_as_container').style.display = isSelect ? 'block' : 'none';
+        });
+        
+        document.getElementById('modal_field_title').addEventListener('input', function() {
+            const title = this.value;
+            const nameInput = document.getElementById('modal_field_name');
+            if (!nameInput.dataset.manual) {
+                nameInput.value = title.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            }
+        });
+        
+        document.getElementById('modal_field_name').addEventListener('input', function() {
+            this.dataset.manual = 'true';
+        });
+        
+        document.getElementById('modal_submit_as').addEventListener('change', function() {
+            updateSubmitPreview(this.value);
+        });
+    }
+    
+    function updateSubmitPreview(value) {
+        const preview = document.getElementById('modal_submit_preview');
+        if (!preview) return;
+        
+        if (value === 'key') {
+            preview.innerHTML = 'Example: "key"';
+        } else if (value === 'value') {
+            preview.innerHTML = 'Example: "value"';
+        } else if (value === 'both') {
+            preview.innerHTML = 'Example: {"key": "value"}';
+        }
+    }
+    
+    function editDynamicField(key) {
+        editingDynamicFieldKey = key;
+        const field = configData.dynamic_fields[key];
+        if (!field) return;
+        
+        _newDefaultValues = field.default_values || [];
+        _newListValues = field.list_values || [];
+        
+        const html = `
+            <div class="form-group">
+                <label>Display Title (shown in UI)</label>
+                <input type="text" id="modal_field_title" value="${field.title || key}" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                <small style="color:#999;">This is what users will see</small>
+            </div>
+            <div class="form-group">
+                <label>Field Value (used in backend)</label>
+                <input type="text" id="modal_field_name" value="${key}" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;" readonly>
+                <small style="color:#999;">Field value cannot be changed</small>
+            </div>
+            <div class="form-group">
+                <label>Element Type</label>
+                <select id="modal_element_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="select" ${field.element_type === 'select' ? 'selected' : ''}>Select</option>
+                    <option value="input" ${field.element_type === 'input' ? 'selected' : ''}>Input</option>
+                    <option value="textarea" ${field.element_type === 'textarea' ? 'selected' : ''}>Textarea</option>
+                    <option value="date-time-input" ${field.element_type === 'date-time-input' ? 'selected' : ''}>Date & Time</option>
+                </select>
+            </div>
+            <div class="form-group" id="modal_allow_list_container" style="${field.element_type === 'input' ? 'display:block' : 'display:none'}">
+                <label>Allow Adding Custom Values (List Input)</label>
+                <select id="modal_allow_list" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="no" ${field.allow_list ? '' : 'selected'}>No - Single value only</option>
+                    <option value="yes" ${field.allow_list ? 'selected' : ''}>Yes - Allow multiple values (add/remove)</option>
+                </select>
+                <small style="color:#999;">If Yes, users can add multiple values to this field</small>
+            </div>
+            <div class="form-group" id="modal_default_values_container" style="${field.element_type === 'select' || field.element_type === 'input' ? 'display:block' : 'display:none'}">
+                <label>Default Values ${field.element_type === 'input' ? '(Pre-filled values)' : ''}</label>
+                <div style="display:flex; gap:10px; margin-bottom:10px;">
+                    <input type="text" id="modal_default_value_input" placeholder="Enter value..." style="flex:1; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <button class="btn btn-primary" onclick="addModalDefaultValue()">Add</button>
+                </div>
+                <div id="modal_default_values_list"></div>
+            </div>
+            <div class="form-group" id="modal_source_container" style="${field.element_type === 'select' ? 'display:block' : 'display:none'}">
+                <label>Source Options From (for Select type)</label>
+                <select id="modal_source_type" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="none" ${field.source_type === 'none' || !field.source_type ? 'selected' : ''}>None - Use default values only</option>
+                    <option value="accounts" ${field.source_type === 'accounts' ? 'selected' : ''}>Account URLs</option>
+                    <option value="captions" ${field.source_type === 'captions' ? 'selected' : ''}>Captions</option>
+                    <option value="timeorders" ${field.source_type === 'timeorders' ? 'selected' : ''}>Time Orders</option>
+                    <option value="filters" ${field.source_type === 'filters' ? 'selected' : ''}>Filters</option>
+                </select>
+                <small style="color:#999;">Select which data source to populate the dropdown with</small>
+            </div>
+            <div class="form-group" id="modal_submit_as_container" style="${field.element_type === 'select' ? 'display:block' : 'display:none'}">
+                <label>Submit As</label>
+                <select id="modal_submit_as" style="width:100%; padding:10px; border:1px solid #ddd; border-radius:6px;">
+                    <option value="key" ${field.submit_as === 'key' || !field.submit_as ? 'selected' : ''}>Submit Key Only</option>
+                    <option value="value" ${field.submit_as === 'value' ? 'selected' : ''}>Submit Value Only</option>
+                    <option value="both" ${field.submit_as === 'both' ? 'selected' : ''}>Submit Key & Value</option>
+                </select>
+                <small style="color:#999;">Choose what data to submit to the backend</small>
+                <div id="modal_submit_preview" class="submit-as-preview" style="margin-top:5px; padding:6px 12px; background:#f8fafc; border-radius:6px; border:1px dashed #c8e0d8; font-size:12px; color:#6b7280; font-family:monospace;">
+                    ${field.submit_as === 'key' || !field.submit_as ? 'Example: "key"' : field.submit_as === 'value' ? 'Example: "value"' : 'Example: {"key": "value"}'}
+                </div>
+            </div>
+            <div style="margin-top: 15px; display: flex; gap: 10px; justify-content: flex-end;">
+                <button class="btn btn-secondary" onclick="closeModal()">Cancel</button>
+                <button class="btn btn-success" onclick="saveDynamicFieldFromModal()">Update Field</button>
+            </div>
+        `;
+        
+        showModal('Edit Dynamic Field', '', null, html);
+        renderModalDefaultValues();
+        
+        document.getElementById('modal_element_type').addEventListener('change', function() {
+            const isSelect = this.value === 'select';
+            const isInput = this.value === 'input';
+            
+            document.getElementById('modal_default_values_container').style.display = (isSelect || isInput) ? 'block' : 'none';
+            document.getElementById('modal_source_container').style.display = isSelect ? 'block' : 'none';
+            document.getElementById('modal_allow_list_container').style.display = isInput ? 'block' : 'none';
+            document.getElementById('modal_submit_as_container').style.display = isSelect ? 'block' : 'none';
+        });
+        
+        document.getElementById('modal_submit_as').addEventListener('change', function() {
+            updateSubmitPreview(this.value);
+        });
+    }
+    
+    function addModalDefaultValue() {
+        const input = document.getElementById('modal_default_value_input');
+        const value = input.value.trim();
+        if (value) {
+            if (!_newDefaultValues.includes(value)) {
+                _newDefaultValues.push(value);
+                renderModalDefaultValues();
+                input.value = '';
+            }
+        }
+    }
+    
+    function removeModalDefaultValue(index) {
+        _newDefaultValues.splice(index, 1);
+        renderModalDefaultValues();
+    }
+    
+    function renderModalDefaultValues() {
+        const container = document.getElementById('modal_default_values_list');
+        if (!container) return;
+        container.innerHTML = '';
+        
+        if (_newDefaultValues.length === 0) {
+            container.innerHTML = '<p style="color: #999; font-size: 14px;">No values added.</p>';
+            return;
+        }
+        
+        _newDefaultValues.forEach((val, index) => {
+            const span = document.createElement('span');
+            span.className = 'group-item';
+            span.innerHTML = val + ' <span class="remove-group" onclick="removeModalDefaultValue(' + index + ')">×</span>';
+            container.appendChild(span);
+        });
+    }
+    
+    function saveDynamicFieldFromModal() {
+        const title = document.getElementById('modal_field_title').value.trim();
+        let fieldName = document.getElementById('modal_field_name').value.trim();
+        const elementType = document.getElementById('modal_element_type').value;
+        const sourceType = document.getElementById('modal_source_type').value;
+        const allowList = document.getElementById('modal_allow_list').value === 'yes';
+        const submitAs = document.getElementById('modal_submit_as') ? document.getElementById('modal_submit_as').value : 'key';
+        
+        if (!title) {
+            showModal('Error', 'Please enter a display title.');
+            return;
+        }
+        
+        if (!fieldName || !document.getElementById('modal_field_name').dataset.manual) {
+            fieldName = title.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+        }
+        
+        if (!fieldName) {
+            showModal('Error', 'Please enter a field value.');
+            return;
+        }
+        
+        if (!editingDynamicFieldKey && configData.dynamic_fields[fieldName]) {
+            showModal('Error', 'A field with this value already exists.');
+            return;
+        }
+        
+        const fieldData = {
+            title: title,
+            element_type: elementType,
+            default_values: (elementType === 'select' || elementType === 'input') ? _newDefaultValues : [],
+            source_type: (elementType === 'select' && sourceType !== 'none') ? sourceType : 'none',
+            allow_list: elementType === 'input' ? allowList : false,
+            submit_as: (elementType === 'select' && sourceType !== 'none') ? submitAs : 'key'
+        };
+        
+        if (editingDynamicFieldKey) {
+            if (editingDynamicFieldKey !== fieldName) {
+                const currentFields = configData.dynamic_fields || {};
+                const renamedFields = {};
+                Object.keys(currentFields).forEach(function(existingKey) {
+                    if (existingKey === editingDynamicFieldKey) {
+                        renamedFields[fieldName] = fieldData;
+                    } else {
+                        renamedFields[existingKey] = currentFields[existingKey];
+                    }
+                });
+                configData.dynamic_fields = renamedFields;
+            } else {
+                configData.dynamic_fields[fieldName] = fieldData;
+            }
+        } else {
+            configData.dynamic_fields[fieldName] = fieldData;
+        }
+        
+        loadDynamicFields();
+        renderDynamicFields();
+        closeModal();
+        showModal('Success', 'Dynamic field saved successfully!');
+    }
+    
+    function deleteDynamicField(key) {
+        showModal('Confirm Delete', 'Are you sure you want to delete dynamic field "' + key + '"?', function() {
+            if (configData.dynamic_fields) {
+                delete configData.dynamic_fields[key];
+                loadDynamicFields();
+                renderDynamicFields();
+                showModal('Success', 'Dynamic field deleted successfully!');
+            }
+        });
+    }
+    
+    // ===== SAVE FUNCTIONS =====
     function saveConfig() {
         // Get dynamic values from rendered fields
         const dynamicValues = {};
         const fieldKeys = Object.keys(configData.dynamic_fields || {});
         
-        // Get the domain for URL construction
-        const domain = window.location.origin;
-        
         for (const key of fieldKeys) {
             const field = configData.dynamic_fields[key];
             const elementType = field.element_type || 'input';
             const allowList = field.allow_list || false;
-            const sourceType = field.source_type || 'none';
             
             if (elementType === 'date-time-input') {
                 const dateInput = document.getElementById('dynamic_field_' + key + '_date');
@@ -6211,40 +5590,10 @@ function deleteCaptionAuthor(index) {
                 }
             } else if (elementType === 'select') {
                 const select = document.getElementById('dynamic_field_' + key);
-                let selectedValue = '';
-                let isCopiedLinks = false;
-                
                 if (select) {
                     const selectedOption = select.options[select.selectedIndex];
                     if (selectedOption) {
-                        selectedValue = selectedOption.value;
-                        isCopiedLinks = selectedOption.dataset.isCopiedLinks === 'true';
-                        
-                        if (isCopiedLinks && sourceType === 'copied_links') {
-                            try {
-                                const parsed = JSON.parse(selectedValue);
-                                if (typeof parsed === 'object' && parsed !== null) {
-                                    dynamicValues[key] = selectedValue;
-                                } else {
-                                    dynamicValues[key] = selectedValue;
-                                }
-                            } catch (e) {
-                                dynamicValues[key] = selectedValue;
-                            }
-                        } else {
-                            dynamicValues[key] = selectedValue;
-                        }
-                    }
-                } else {
-                    const wrapper = document.getElementById('dynamic_field_' + key);
-                    if (wrapper && wrapper.querySelector) {
-                        const selectEl = wrapper.querySelector('select');
-                        if (selectEl) {
-                            const selectedOption = selectEl.options[selectEl.selectedIndex];
-                            if (selectedOption) {
-                                dynamicValues[key] = selectedOption.value;
-                            }
-                        }
+                        dynamicValues[key] = selectedOption.value;
                     }
                 }
             } else {
@@ -6258,75 +5607,25 @@ function deleteCaptionAuthor(index) {
         const firstKey = Object.keys(dynamicValues)[0] || 'default';
         const author = dynamicValues[firstKey] || 'default';
         
-        // Create settings object with status at root level (NOT inside dynamic_values)
-        const settingsObj = {
-            author: author,
-            dynamic_values: dynamicValues
-        };
-        
-        let existingSettings = configData.settings;
-        let found = false;
-        
-        if (Array.isArray(existingSettings)) {
-            if (isEditMode && window._editingIndex !== undefined && window._editingIndex !== null) {
-                const idx = window._editingIndex;
-                if (idx >= 0 && idx < existingSettings.length) {
-                    // Preserve existing status and operation_status from root level
-                    if (existingSettings[idx] && existingSettings[idx].status) {
-                        settingsObj.status = existingSettings[idx].status;
-                    } else {
-                        settingsObj.status = 'pending';
-                    }
-                    if (existingSettings[idx] && existingSettings[idx].operation_status) {
-                        settingsObj.operation_status = existingSettings[idx].operation_status;
-                    }
-                    existingSettings[idx] = settingsObj;
-                    found = true;
-                }
-            } else if (isEditMode && editingAuthor) {
-                for (let i = 0; i < existingSettings.length; i++) {
-                    if (existingSettings[i] && existingSettings[i].author === editingAuthor) {
-                        if (existingSettings[i] && existingSettings[i].status) {
-                            settingsObj.status = existingSettings[i].status;
-                        } else {
-                            settingsObj.status = 'pending';
-                        }
-                        if (existingSettings[i] && existingSettings[i].operation_status) {
-                            settingsObj.operation_status = existingSettings[i].operation_status;
-                        }
-                        existingSettings[i] = settingsObj;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    settingsObj.status = 'pending';
-                    existingSettings.push(settingsObj);
-                }
-            } else {
-                for (let i = 0; i < existingSettings.length; i++) {
-                    if (existingSettings[i] && existingSettings[i].author === author) {
-                        if (existingSettings[i] && existingSettings[i].status) {
-                            settingsObj.status = existingSettings[i].status;
-                        } else {
-                            settingsObj.status = 'pending';
-                        }
-                        if (existingSettings[i] && existingSettings[i].operation_status) {
-                            settingsObj.operation_status = existingSettings[i].operation_status;
-                        }
-                        existingSettings[i] = settingsObj;
-                        found = true;
-                        break;
-                    }
-                }
-                if (!found) {
-                    settingsObj.status = 'pending';
-                    existingSettings.push(settingsObj);
-                }
+        let existingSettings = Array.isArray(configData.settings) ? configData.settings : [];
+        let settingsObj;
+        if (isEditMode && Number.isInteger(editingIndex) && editingIndex >= 0 && editingIndex < existingSettings.length) {
+            const oldConfig = existingSettings[editingIndex] && typeof existingSettings[editingIndex] === 'object'
+                ? existingSettings[editingIndex] : {};
+            settingsObj = Object.assign({}, oldConfig, {
+                author: author,
+                dynamic_values: dynamicValues,
+                status: oldConfig.status || 'pending'
+            });
+            if (Object.prototype.hasOwnProperty.call(oldConfig, 'operation_status')) {
+                settingsObj.operation_status = oldConfig.operation_status;
             }
+            existingSettings[editingIndex] = settingsObj;
         } else {
-            settingsObj.status = 'pending';
-            existingSettings = [settingsObj];
+            // A new form submission is always a new independent entry. Never
+            // replace an existing entry merely because its author is the same.
+            settingsObj = { author: author, dynamic_values: dynamicValues, status: 'pending' };
+            existingSettings.push(settingsObj);
         }
         
         configData.settings = existingSettings;
@@ -6376,10 +5675,9 @@ function deleteCaptionAuthor(index) {
             saveBtn.disabled = false;
         });
     }
-    // ===== SAVE SETUP =====
+    
     function saveSetup() {
         const postData = {
-            settings: configData.settings || [],
             accounts: configData.accounts || {},
             captions: configData.captions || [],
             timeorders: configData.timeorders || {},
@@ -6394,7 +5692,6 @@ function deleteCaptionAuthor(index) {
         
         const formData = new FormData();
         formData.append('save_all', 'true');
-        formData.append('settings', JSON.stringify(postData.settings));
         formData.append('accounts', JSON.stringify(postData.accounts));
         formData.append('captions', JSON.stringify(postData.captions));
         formData.append('timeorders', JSON.stringify(postData.timeorders));
@@ -6423,6 +5720,8 @@ function deleteCaptionAuthor(index) {
             saveBtn.disabled = false;
         });
     }
+    
+    // ===== AUTH =====
     function logout() {
         fetch('', {
             method: 'POST',
@@ -6436,7 +5735,7 @@ function deleteCaptionAuthor(index) {
             window.location.href = 'index.php';
         });
     }
-
+    
     function checkAuth() {
         fetch('?action=check_auth')
             .then(r => r.json())
@@ -6449,8 +5748,7 @@ function deleteCaptionAuthor(index) {
                 window.location.href = 'login.php';
             });
     }
-
-    // Auto-logout after 30 minutes of inactivity
+    
     let activityTimer;
     function resetActivityTimer() {
         if (activityTimer) clearTimeout(activityTimer);
@@ -6458,37 +5756,25 @@ function deleteCaptionAuthor(index) {
             logout();
         }, 30 * 60 * 1000);
     }
-
+    
     ['click', 'mousemove', 'keypress', 'scroll', 'touchstart'].forEach(event => {
         document.addEventListener(event, resetActivityTimer);
     });
-
+    
     resetActivityTimer();
     setInterval(checkAuth, 60000);
     
     // ===== INIT =====
     document.addEventListener('DOMContentLoaded', function() {
-        document.getElementById('dashboardView').style.display = 'block';
-        document.getElementById('detailView').style.display = 'none';
-        document.getElementById('addConfigView').style.display = 'none';
-        document.getElementById('setupView').style.display = 'none';
-        document.getElementById('configTabs').classList.remove('visible');
-        document.getElementById('saveBtnContainer').classList.remove('visible');
-        document.getElementById('saveConfigBtn').style.display = 'none';
-        document.getElementById('saveSetupBtn').style.display = 'none';
-        document.getElementById('backToDashboardBtn').style.display = 'none';
-        document.getElementById('scrollBody').classList.remove('tabs-visible');
-        document.getElementById('editModeBanner').classList.remove('visible');
+        // Show pending tab by default
+        switchMainTab('pending');
         
         document.querySelectorAll('input, select, textarea').forEach(el => {
             el.addEventListener('focus', function(e) {
                 this.style.fontSize = '16px';
             });
         });
-        
-        loadDynamicFields();
     });
-
 </script>
 </body>
 </html>
