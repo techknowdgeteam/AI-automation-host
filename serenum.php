@@ -115,16 +115,86 @@
             }
             if ($author === '') throw new RuntimeException('Please provide an author/name value.');
 
-            $engine = trim((string)($payload['engine'] ?? ''));
-            if ($engine === '') $engine = serenumExtractEngineValue($dynamicValues);
+            $requestedEngine = trim((string)($payload['engine'] ?? ''));
+            $engine = '';
             $editIndex = isset($payload['edit_index']) && $payload['edit_index'] !== '' ? (int)$payload['edit_index'] : null;
 
             // Serialize read/modify/write operations so simultaneous saves cannot
             // overwrite one another's pending records.
             $pdo->beginTransaction();
-            $stmt = $pdo->query("SELECT id, settings FROM serenum_config ORDER BY id DESC LIMIT 1 FOR UPDATE");
+            $stmt = $pdo->query("SELECT id, settings, settings_dynamic_tabs, settings_dynamic_fields FROM serenum_config ORDER BY id DESC LIMIT 1 FOR UPDATE");
             $row = $stmt->fetch(PDO::FETCH_ASSOC);
             if (!$row) throw new RuntimeException('Configuration storage is not initialized. Please save Setup first.');
+
+            // Build the server-side Dynamic Field whitelist from the saved Setup.
+            // The browser also limits the visible/submitted fields, but this check
+            // prevents unassigned fields from being stored if an old or modified
+            // browser request sends them anyway.
+            $storedDynamicTabs = json_decode((string)($row['settings_dynamic_tabs'] ?? '[]'), true);
+            if (!is_array($storedDynamicTabs)) $storedDynamicTabs = [];
+
+            $storedDynamicFields = json_decode((string)($row['settings_dynamic_fields'] ?? '{}'), true);
+            if (!is_array($storedDynamicFields)) $storedDynamicFields = [];
+
+            $tabsAreConfigured = count($storedDynamicTabs) > 0;
+            $allowedDynamicFieldKeys = [];
+
+            if (!$tabsAreConfigured) {
+                // Backward compatibility: installations that have not created
+                // Dynamic Tabs yet continue to use the original All Fields form.
+                foreach (array_keys($storedDynamicFields) as $fieldKey) {
+                    $allowedDynamicFieldKeys[(string)$fieldKey] = true;
+                }
+            } else {
+                foreach ($storedDynamicTabs as $tab) {
+                    if (!is_array($tab)) continue;
+                    $requestedFields = $tab['dynamic_fields_display'] ?? $tab['fields'] ?? [];
+                    if (!is_array($requestedFields)) continue;
+
+                    foreach ($requestedFields as $fieldKey) {
+                        if (!is_string($fieldKey) && !is_int($fieldKey)) continue;
+                        $fieldKey = (string)$fieldKey;
+                        if ($fieldKey === '' || !array_key_exists($fieldKey, $storedDynamicFields)) continue;
+                        $allowedDynamicFieldKeys[$fieldKey] = true;
+                    }
+                }
+
+                if (!$allowedDynamicFieldKeys) {
+                    throw new RuntimeException(
+                        'No Dynamic Fields are assigned to a Dynamic Tab. Assign at least one field in Setup Config → Dynamic Tabs before submitting.'
+                    );
+                }
+            }
+
+            // Derive Engine metadata only from a Dynamic Field that is actually
+            // enabled by one of the saved tabs. This prevents an unassigned Engine
+            // field or a stale payload property from being retained on the record.
+            $engineFieldEnabled = false;
+            foreach (array_keys($allowedDynamicFieldKeys) as $fieldKey) {
+                $definition = $storedDynamicFields[$fieldKey] ?? [];
+                if (!is_array($definition)) $definition = [];
+                $fieldTitle = (string)($definition['title'] ?? '');
+                $normalizedEngineKey = strtolower(preg_replace('/[^a-z0-9]/i', '', $fieldKey));
+                $normalizedEngineTitle = strtolower(preg_replace('/[^a-z0-9]/i', '', $fieldTitle));
+                if (strpos($normalizedEngineKey, 'engine') !== false || strpos($normalizedEngineTitle, 'engine') !== false) {
+                    $engineFieldEnabled = true;
+                    break;
+                }
+            }
+
+            $filteredDynamicValues = [];
+            foreach ($dynamicValues as $fieldKey => $fieldValue) {
+                $fieldKey = (string)$fieldKey;
+                if (isset($allowedDynamicFieldKeys[$fieldKey])) {
+                    $filteredDynamicValues[$fieldKey] = $fieldValue;
+                }
+            }
+            $dynamicValues = $filteredDynamicValues;
+
+            if ($engineFieldEnabled) {
+                $engine = $requestedEngine;
+                if ($engine === '') $engine = serenumExtractEngineValue($dynamicValues);
+            }
 
             $rawSettings = trim((string)($row['settings'] ?? '[]'));
             if ($rawSettings === '') $rawSettings = '[]';
@@ -155,15 +225,30 @@
                 if (isset($existing['operation_status'])) {
                     $newConfig['operation_status'] = $existing['operation_status'];
                 }
-                foreach ($existing as $k => $v) {
-                    // Form fields in dynamic_values are the canonical current values.
-                    // Do not retain an older flattened copy at the root, because that
-                    // legacy value could otherwise override the value just submitted.
-                    if (array_key_exists((string)$k, $dynamicValues)) continue;
-                    if (!in_array($k, ['author', 'status', 'dynamic_values', 'operation_status'], true)
-                        && ($k !== 'engine' || $engine === '')) {
-                        $newConfig[$k] = $v;
+                $previousDynamicFieldKeys = [];
+                if (isset($existing['dynamic_values']) && is_array($existing['dynamic_values'])) {
+                    foreach (array_keys($existing['dynamic_values']) as $previousFieldKey) {
+                        $previousDynamicFieldKeys[(string)$previousFieldKey] = true;
                     }
+                }
+                foreach ($existing as $k => $v) {
+                    $existingKey = (string)$k;
+
+                    // Do not retain old flattened copies of any Dynamic Field.
+                    // The new dynamic_values array is rebuilt strictly from fields
+                    // currently assigned to saved Dynamic Tabs.
+                    if (array_key_exists($existingKey, $dynamicValues)) continue;
+                    if (isset($previousDynamicFieldKeys[$existingKey])) continue;
+                    if (array_key_exists($existingKey, $storedDynamicFields)) continue;
+
+                    // Root-level author/status/engine metadata is handled separately.
+                    // In particular, an Engine value from a field no longer enabled
+                    // by a tab must not survive an edit.
+                    if (in_array($existingKey, ['author', 'status', 'dynamic_values', 'operation_status', 'engine'], true)) {
+                        continue;
+                    }
+
+                    $newConfig[$k] = $v;
                 }
                 $settings[$editIndex] = $newConfig;
             } else {
@@ -3758,8 +3843,8 @@
     }
 
     // ===== SERENUM DYNAMIC TAB LAYOUT =====
-    // Presentation metadata only. Existing Dynamic Field controls and their
-    // dynamic_values storage keys remain unchanged.
+    // Dynamic Tabs define both the project-form layout and the allowed Dynamic
+    // Field keys. The original field keys remain the storage/submission keys.
     function escapeSerenumHtml(value) {
         return String(value ?? '').replace(/[&<>"']/g, function(ch) {
             return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
@@ -3799,16 +3884,10 @@
             tabs.push({tab_id:id, tab_name:name, dynamic_fields_display:displayedFields});
         });
 
-        // Fields added after the tabs were configured stay accessible in a small
-        // automatic folder instead of disappearing from the New Project form.
-        const unassigned = fieldKeys.filter(key => !assigned.has(key));
-        if (unassigned.length) {
-            let otherFieldsId = 'other_fields';
-            let otherFieldsSuffix = 2;
-            while (usedIds.has(otherFieldsId)) otherFieldsId = 'other_fields_' + otherFieldsSuffix++;
-            tabs.push({tab_id:otherFieldsId, tab_name:'Other Fields', dynamic_fields_display:unassigned, generated:true});
-        }
-        return tabs.length ? tabs : [{tab_id:'all_fields', tab_name:'All Fields', dynamic_fields_display:fieldKeys.slice(), generated:true}];
+        // Once Dynamic Tabs exist, only fields explicitly assigned to one of
+        // those tabs are enabled. Unassigned fields stay in Setup but are not
+        // rendered in the New Project form and cannot enter pending records.
+        return tabs;
     }
 
     function getSerenumTabPanelId(tabId) {
@@ -4093,7 +4172,7 @@
     function deleteDynamicTab(index) {
         if (!Array.isArray(configData.dynamic_tabs) || !configData.dynamic_tabs[index]) return;
         const tabName = String(configData.dynamic_tabs[index].tab_name || 'this tab');
-        showModal('Delete Dynamic Tab', 'Delete "' + tabName + '"? Its Dynamic Fields will remain in Setup and become available under Other Fields.', function() {
+        showModal('Delete Dynamic Tab', 'Delete "' + tabName + '"? Its Dynamic Fields will remain in Setup but will no longer appear in New Project until assigned to another Dynamic Tab.', function() {
             configData.dynamic_tabs.splice(index, 1);
             loadDynamicTabs();
         });
@@ -4161,13 +4240,8 @@
                 }
             });
         });
-        fieldKeys.forEach(function(key) {
-            key = String(key);
-            if (!seenRenderFieldKeys.has(key)) {
-                seenRenderFieldKeys.add(key);
-                orderedRenderFieldKeys.push(key);
-            }
-        });
+        // Do not append unassigned Dynamic Fields here. The effective tab list
+        // is the allow-list for what may appear in a project and be submitted.
 
         for (const key of orderedRenderFieldKeys) {
             const targetTabId = fieldToTab.get(String(key)) || effectiveTabs[0].tab_id;
@@ -4881,8 +4955,25 @@
         let authorValue = '';
         let engineValue = '';
 
+        // A field is enabled when it is assigned to any saved Dynamic Tab.
+        // When no Dynamic Tabs have ever been configured, the helper exposes the
+        // legacy All Fields tab so existing installations keep their old behaviour.
+        const enabledFieldKeys = new Set();
+        getSerenumEffectiveDynamicTabs().forEach(function(tab) {
+            (Array.isArray(tab.dynamic_fields_display) ? tab.dynamic_fields_display : []).forEach(function(key) {
+                key = String(key);
+                if (Object.prototype.hasOwnProperty.call(fields, key)) enabledFieldKeys.add(key);
+            });
+        });
+        const submittedFieldKeys = Object.keys(fields).filter(key => enabledFieldKeys.has(key));
+
+        if (!submittedFieldKeys.length) {
+            showModal('No Dynamic Fields Enabled', 'Assign at least one Dynamic Field to a Dynamic Tab in Setup Config before submitting a pending record.');
+            return;
+        }
+
         const normalizeFieldName = value => String(value || '').toLowerCase().replace(/[^a-z0-9]/g, '');
-        for (const key of Object.keys(fields)) {
+        for (const key of submittedFieldKeys) {
             const field = fields[key] || {};
             const elementType = field.element_type || 'input';
             const allowList = !!field.allow_list;
@@ -4994,7 +5085,7 @@
             return;
         }
 
-        const engineFieldKey = Object.keys(fields).find(key => {
+        const engineFieldKey = submittedFieldKeys.find(key => {
             const field = fields[key] || {};
             const names = [key, field.title].map(normalizeFieldName);
             return names.some(name => name === 'engine' || name === 'enginetype' || name === 'processingengine' || name.includes('engine'));
