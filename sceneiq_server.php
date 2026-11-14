@@ -1661,8 +1661,97 @@
 
     // Set dashboard view. Fall back to All Accounts if an unexpected value arrives.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['set_dashboard_view'])) {
-        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'accounts'), ['initialize', 'accounts', 'copy_data'], true) ? $_POST['view'] : 'accounts';
+        $allowedDashboardViews = ['initialize', 'accounts', 'copy_data', 'all_pending', 'all_completed', 'all_aborted'];
+        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'accounts'), $allowedDashboardViews, true) ? $_POST['view'] : 'accounts';
         $redirect = true;
+    }
+
+    // Load project entries from every account for one global status workspace.
+    // Each returned entry contains only the original project record plus separate
+    // account metadata. The account metadata is never included in copied JSON.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['load_global_status_entries'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        $postedToken = (string)($_POST['sceneiq_copy_csrf_token'] ?? '');
+        $requestedStatus = strtolower(trim((string)($_POST['global_status'] ?? '')));
+
+        if (empty($_SESSION['sceneiq_copy_csrf_token']) || !hash_equals($_SESSION['sceneiq_copy_csrf_token'], $postedToken)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Security check failed. Refresh the page and try again.']);
+            exit;
+        }
+
+        try {
+            if (!in_array($requestedStatus, ['pending', 'completed', 'aborted'], true)) {
+                throw new InvalidArgumentException('The requested global status is invalid.');
+            }
+
+            // Match each account's normal project-row order, then group accounts
+            // deterministically so every record appears once in the global export.
+            $orderSql = 'p.`user_id` ASC, p.`display_order` ASC, p.`id` ASC';
+            $globalStmt = $pdo->prepare(
+                'SELECT p.`id`, p.`user_id`, p.`status`, p.`entry_data_json`, p.`operation_status`, p.`display_order`, '
+                . 'u.`username`, u.`email` '
+                . 'FROM `sceneiq_project_entries` p '
+                . 'INNER JOIN `users` u ON u.`id` = p.`user_id` '
+                . 'WHERE p.`status` = :status AND p.`deleted_at` IS NULL '
+                . 'ORDER BY ' . $orderSql
+            );
+            $globalStmt->execute([':status' => $requestedStatus]);
+            $globalRows = $globalStmt->fetchAll(PDO::FETCH_ASSOC);
+
+            $records = [];
+            $fieldDefinitionsByUser = [];
+            foreach ($globalRows as $row) {
+                $ownerId = (int)$row['user_id'];
+                try {
+                    $entry = sceneiqDecodeTableJson($row['entry_data_json'] ?? '', []);
+                } catch (Throwable $decodeError) {
+                    error_log('SceneIQ global status entry decode failed for record ' . (int)$row['id'] . ': ' . $decodeError->getMessage());
+                    continue;
+                }
+                if (!is_array($entry)) {
+                    error_log('SceneIQ global status entry ' . (int)$row['id'] . ' is not a JSON object/array and was skipped.');
+                    continue;
+                }
+
+                // Match sceneiqGetProjectEntries(): status and operation_status come
+                // from the relational columns, while all user-supplied record fields
+                // remain unchanged in the record payload.
+                $entry['status'] = (string)$row['status'];
+                $entry['operation_status'] = $row['operation_status'] ?? ($entry['operation_status'] ?? '');
+
+                if (!array_key_exists((string)$ownerId, $fieldDefinitionsByUser)) {
+                    try {
+                        $fieldDefinitionsByUser[(string)$ownerId] = sceneiqGetDynamicFields($pdo, $ownerId);
+                    } catch (Throwable $definitionError) {
+                        error_log('SceneIQ global copy field definitions failed for user ' . $ownerId . ': ' . $definitionError->getMessage());
+                        $fieldDefinitionsByUser[(string)$ownerId] = [];
+                    }
+                }
+
+                $records[] = [
+                    'recordId' => (int)$row['id'],
+                    'entryNumber' => (int)$row['display_order'] + 1,
+                    'userId' => $ownerId,
+                    'username' => (string)($row['username'] ?? ('Account ' . $ownerId)),
+                    'email' => (string)($row['email'] ?? ''),
+                    'record' => $entry
+                ];
+            }
+
+            echo json_encode([
+                'success' => true,
+                'status' => $requestedStatus,
+                'records' => $records,
+                'fieldDefinitionsByUser' => $fieldDefinitionsByUser,
+                'count' => count($records)
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            error_log('SceneIQ global status load failed: ' . $e->getMessage());
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        }
+        exit;
     }
 
     // Load source-account choices for the custom multi-selection copy modal.
@@ -2538,7 +2627,7 @@
     }
 
     $dashboardView = isset($_SESSION['dashboard_view']) ? $_SESSION['dashboard_view'] : 'accounts';
-    if (!in_array($dashboardView, ['initialize', 'accounts', 'copy_data'], true)) { $dashboardView = 'accounts'; }
+    if (!in_array($dashboardView, ['initialize', 'accounts', 'copy_data', 'all_pending', 'all_completed', 'all_aborted'], true)) { $dashboardView = 'accounts'; }
 
     $selectedUser = null;
     $userConfig = null;
@@ -5923,6 +6012,9 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>" onclick="switchDashboardTab('accounts', this)">All Accounts</button>
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>" onclick="switchDashboardTab('initialize', this)">Initialize Account</button>
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'copy_data') ? 'active' : ''; ?>" onclick="switchDashboardTab('copy_data', this)">Copy Data</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'all_pending') ? 'active' : ''; ?>" onclick="switchDashboardTab('all_pending', this)">All Pending</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'all_completed') ? 'active' : ''; ?>" onclick="switchDashboardTab('all_completed', this)">All Completed</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'all_aborted') ? 'active' : ''; ?>" onclick="switchDashboardTab('all_aborted', this)">All Aborted</button>
                             </div>
                             
                             <div id="dash_tab_accounts" class="dashboard-content <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>">
@@ -5959,6 +6051,33 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
                                 </div>
                             </div>
                             
+                            <div id="dash_tab_all_pending" class="dashboard-content <?php echo ($dashboardView === 'all_pending') ? 'active' : ''; ?>">
+                                <h3 style="margin:4px 0 6px;color:#1a1a2e;">All Users — Pending</h3>
+                                <p style="color:#6b7280;margin:0 0 14px;">Every pending project record from every account.</p>
+                                <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllGlobalStatusEntries('pending', this)">📋 Copy All Pending Data</button>
+                                </div>
+                                <div id="globalPendingEntriesList"><p style="color:#6b7280;text-align:center;padding:20px;">Open this tab to load all pending records.</p></div>
+                            </div>
+
+                            <div id="dash_tab_all_completed" class="dashboard-content <?php echo ($dashboardView === 'all_completed') ? 'active' : ''; ?>">
+                                <h3 style="margin:4px 0 6px;color:#1a1a2e;">All Users — Completed</h3>
+                                <p style="color:#6b7280;margin:0 0 14px;">Every completed project record from every account.</p>
+                                <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllGlobalStatusEntries('completed', this)">📋 Copy All Completed Data</button>
+                                </div>
+                                <div id="globalCompletedEntriesList"><p style="color:#6b7280;text-align:center;padding:20px;">Open this tab to load all completed records.</p></div>
+                            </div>
+
+                            <div id="dash_tab_all_aborted" class="dashboard-content <?php echo ($dashboardView === 'all_aborted') ? 'active' : ''; ?>">
+                                <h3 style="margin:4px 0 6px;color:#1a1a2e;">All Users — Aborted</h3>
+                                <p style="color:#6b7280;margin:0 0 14px;">Every aborted project record from every account.</p>
+                                <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
+                                    <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllGlobalStatusEntries('aborted', this)">📋 Copy All Aborted Data</button>
+                                </div>
+                                <div id="globalAbortedEntriesList"><p style="color:#6b7280;text-align:center;padding:20px;">Open this tab to load all aborted records.</p></div>
+                            </div>
+
                             <div id="dash_tab_copy_data" class="dashboard-content <?php echo ($dashboardView === 'copy_data') ? 'active' : ''; ?>">
                                 <section class="copy-data-panel">
                                     <h3>Copy Data Between Accounts</h3>
@@ -6439,6 +6558,7 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     var globalDynamicFields = <?php echo json_encode($globalDynamicFields, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
     var userSettings = <?php echo json_encode($userSettings, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
     var userDynamicTabs = <?php echo json_encode($userDynamicTabs, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
+    var sceneIQCopyCsrfToken = <?php echo json_encode((string)($_SESSION['sceneiq_copy_csrf_token'] ?? ''), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
     var _pendingSaveData = null;
 
     var sceneIQLoadingDepth = 0;
@@ -7164,6 +7284,10 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
         targetPanel.classList.add('active');
         if (btn) btn.classList.add('active');
 
+        if (tabName === 'all_pending' || tabName === 'all_completed' || tabName === 'all_aborted') {
+            loadGlobalStatusEntries(tabName.replace('all_', '')).catch(function() {});
+        }
+
         var formData = new FormData();
         formData.append('set_dashboard_view', 'true');
         formData.append('view', tabName);
@@ -7541,13 +7665,15 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     // Copy every record in the selected status as separate JSON objects.
     // Objects are comma-separated, with no surrounding JSON array, matching
     // the requested export format. Internal UI-only keys such as _index are excluded.
-    function normalizeRecordTypesForCopy(record) {
+    function normalizeRecordTypesForCopy(record, fieldDefinitions) {
         var normalized = {};
+        var definitionsForRecord = (fieldDefinitions && typeof fieldDefinitions === 'object')
+            ? fieldDefinitions
+            : ((typeof globalDynamicFields !== 'undefined' && globalDynamicFields) ? globalDynamicFields : {});
         Object.keys(record || {}).forEach(function(key) {
             if (key.charAt(0) === '_') return;
             var value = record[key];
-            var definition = (typeof globalDynamicFields !== 'undefined' && globalDynamicFields)
-                ? globalDynamicFields[key] : null;
+            var definition = definitionsForRecord[key] || null;
             var dataType = definition && definition.data_type ? String(definition.data_type).toLowerCase() : 'string';
 
             // Repair older records that were stored as strings before JSON field types
@@ -7677,6 +7803,196 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
         copyToClipboard(JSON.stringify(record, null, 2), button);
     }
 
+    // Global status workspaces are loaded on demand so opening All Accounts does
+    // not preload every project record. The cache is separated by status, and each
+    // record retains its owning account's field definitions for accurate JSON copy.
+    var sceneIQGlobalStatusCache = { pending: null, completed: null, aborted: null };
+    var sceneIQGlobalStatusLoading = { pending: null, completed: null, aborted: null };
+    var sceneIQGlobalFieldDefinitionsByUser = {};
+
+    function globalStatusContainerId(status) {
+        return status === 'pending' ? 'globalPendingEntriesList' :
+            (status === 'completed' ? 'globalCompletedEntriesList' : 'globalAbortedEntriesList');
+    }
+
+    function globalStatusLabel(status) {
+        return status.charAt(0).toUpperCase() + status.slice(1);
+    }
+
+    function loadGlobalStatusEntries(status, forceReload) {
+        if (!Object.prototype.hasOwnProperty.call(sceneIQGlobalStatusCache, status)) return Promise.reject(new Error('Invalid status.'));
+        var container = document.getElementById(globalStatusContainerId(status));
+        if (!container) return Promise.resolve([]);
+
+        if (!forceReload && Array.isArray(sceneIQGlobalStatusCache[status])) {
+            renderGlobalStatusEntries(status);
+            return Promise.resolve(sceneIQGlobalStatusCache[status]);
+        }
+        if (sceneIQGlobalStatusLoading[status]) return sceneIQGlobalStatusLoading[status];
+
+        container.innerHTML = '<p style="color:#6b7280;text-align:center;padding:20px;">Loading all ' + globalStatusLabel(status).toLowerCase() + ' records from every account...</p>';
+        var formData = new FormData();
+        formData.append('load_global_status_entries', '1');
+        formData.append('global_status', status);
+        formData.append('sceneiq_copy_csrf_token', sceneIQCopyCsrfToken);
+
+        sceneIQGlobalStatusLoading[status] = fetch(window.location.href.split('#')[0], {
+            method: 'POST',
+            body: formData,
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'global-status-load' }
+        }).then(function(response) {
+            return response.json().then(function(data) {
+                if (!response.ok || !data || data.success !== true) {
+                    throw new Error((data && data.message) || 'The global records could not be loaded.');
+                }
+                return data;
+            });
+        }).then(function(data) {
+            sceneIQGlobalStatusCache[status] = Array.isArray(data.records) ? data.records : [];
+            var incomingDefinitions = data.fieldDefinitionsByUser && typeof data.fieldDefinitionsByUser === 'object'
+                ? data.fieldDefinitionsByUser : {};
+            Object.keys(incomingDefinitions).forEach(function(userId) {
+                sceneIQGlobalFieldDefinitionsByUser[String(userId)] = incomingDefinitions[userId] || {};
+            });
+            renderGlobalStatusEntries(status);
+            return sceneIQGlobalStatusCache[status];
+        }).catch(function(error) {
+            console.error('SceneIQ global ' + status + ' records failed to load:', error);
+            container.innerHTML = '';
+            var errorNode = document.createElement('p');
+            errorNode.style.cssText = 'color:#b91c1c;text-align:center;padding:20px;';
+            errorNode.textContent = error.message || 'The records could not be loaded.';
+            container.appendChild(errorNode);
+            throw error;
+        }).finally(function() {
+            sceneIQGlobalStatusLoading[status] = null;
+        });
+
+        return sceneIQGlobalStatusLoading[status];
+    }
+
+    function getGlobalRecordFieldDefinitions(item) {
+        if (!item || item.userId == null) return {};
+        return sceneIQGlobalFieldDefinitionsByUser[String(item.userId)] || {};
+    }
+
+    function renderGlobalStatusEntries(status) {
+        var container = document.getElementById(globalStatusContainerId(status));
+        var items = sceneIQGlobalStatusCache[status];
+        if (!container || !Array.isArray(items)) return;
+
+        container.innerHTML = '';
+        if (!items.length) {
+            var emptyNode = document.createElement('p');
+            emptyNode.style.cssText = 'color:#6b7280;text-align:center;padding:20px;';
+            emptyNode.textContent = 'No ' + status + ' entries found across all accounts.';
+            container.appendChild(emptyNode);
+            return;
+        }
+
+        var statusColors = { pending: '#f59e0b', completed: '#10b981', aborted: '#ef4444' };
+        var label = globalStatusLabel(status);
+        items.forEach(function(item, position) {
+            var card = document.createElement('div');
+            card.className = 'config-item';
+
+            var header = document.createElement('div');
+            header.className = 'item-header';
+            var identity = document.createElement('div');
+            identity.style.cssText = 'display:flex;flex-direction:column;gap:4px;min-width:0;';
+            var accountName = document.createElement('span');
+            accountName.className = 'item-id';
+            accountName.textContent = String(item.username || ('Account ' + item.userId));
+            var accountEmail = document.createElement('span');
+            accountEmail.style.cssText = 'font-size:12px;color:#6b7280;overflow-wrap:anywhere;';
+            accountEmail.textContent = String(item.email || '');
+            var entryNumber = document.createElement('span');
+            entryNumber.style.cssText = 'font-size:12px;color:#6b7280;';
+            entryNumber.textContent = 'Entry #' + String(item.entryNumber || (position + 1)) + ' · Record ID ' + String(item.recordId || '');
+            identity.appendChild(accountName);
+            if (item.email) identity.appendChild(accountEmail);
+            identity.appendChild(entryNumber);
+
+            var statusBadge = document.createElement('span');
+            statusBadge.className = 'item-status';
+            statusBadge.style.background = statusColors[status] || '#6b7280';
+            statusBadge.textContent = label;
+            header.appendChild(identity);
+            header.appendChild(statusBadge);
+            card.appendChild(header);
+
+            var definitions = getGlobalRecordFieldDefinitions(item);
+            var fields = document.createElement('div');
+            fields.innerHTML = renderEntryFields(item.record || {}, 'global_' + status + '_' + position, definitions);
+            card.appendChild(fields);
+
+            var actions = document.createElement('div');
+            actions.className = 'item-actions';
+            var copyButton = document.createElement('button');
+            copyButton.type = 'button';
+            copyButton.className = 'btn btn-secondary btn-sm';
+            copyButton.textContent = '📋 Copy Entry';
+            copyButton.addEventListener('click', function() {
+                copyGlobalStatusEntry(status, position, copyButton);
+            });
+            actions.appendChild(copyButton);
+            card.appendChild(actions);
+            container.appendChild(card);
+        });
+    }
+
+    function copyGlobalStatusEntry(status, position, button) {
+        var items = sceneIQGlobalStatusCache[status];
+        var item = Array.isArray(items) ? items[Number(position)] : null;
+        if (!item || !item.record || typeof item.record !== 'object') {
+            showDialog('Copy Error', 'This global entry could not be found. Reload the status tab and try again.');
+            return;
+        }
+        var record = normalizeRecordTypesForCopy(item.record, getGlobalRecordFieldDefinitions(item));
+        copyToClipboard(JSON.stringify(record, null, 2), button);
+    }
+
+    function copyAllGlobalStatusEntries(status, button) {
+        var items = sceneIQGlobalStatusCache[status];
+        if (!Array.isArray(items)) {
+            loadGlobalStatusEntries(status).catch(function() {});
+            showDialog('Loading records', 'The all-account ' + status + ' records are still loading. Try Copy All again once the list appears.');
+            return;
+        }
+
+        var records = items.map(function(item) {
+            return normalizeRecordTypesForCopy(item.record || {}, getGlobalRecordFieldDefinitions(item));
+        });
+        if (!records.length) {
+            showDialog('Info', 'There are no ' + status + ' records across all accounts to copy.');
+            return;
+        }
+
+        // Keep precisely the same output convention as the selected-account action:
+        // Pending is a valid root-level JSON array; Completed and Aborted are
+        // comma-separated JSON objects without a wrapping array.
+        var formatted;
+        if (status === 'pending') {
+            formatted = JSON.stringify(records, null, 2);
+        } else {
+            formatted = records.map(function(record) {
+                return JSON.stringify(record, null, 2);
+            }).join(',\\n');
+        }
+        copyToClipboard(formatted, button);
+    }
+
+    // A persisted global-status tab must also load its records after a full page refresh.
+    // This runs after the cache variables above have been initialized.
+    if (Number(selectedUserId || 0) <= 0) {
+        ['pending', 'completed', 'aborted'].forEach(function(status) {
+            var panel = document.getElementById('dash_tab_all_' + status);
+            if (panel && panel.classList.contains('active')) loadGlobalStatusEntries(status).catch(function() {});
+        });
+    }
+
     function renderStatusEntries(status, containerId) {
         var container = document.getElementById(containerId);
         if (!container) return;
@@ -7745,10 +8061,10 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     // ===== RENDER ENTRY FIELDS =====
     // ============================================================
 
-    function renderEntryFields(entry, index) {
+    function renderEntryFields(entry, index, fieldDefinitions) {
         // Repair legacy values at render time too, so the field-level Copy button
         // copies a real JSON object/array instead of the old escaped string.
-        entry = normalizeRecordTypesForCopy(entry || {});
+        entry = normalizeRecordTypesForCopy(entry || {}, fieldDefinitions);
         var displayFields = Object.keys(entry).filter(function(k) {
             return k !== 'status' && k !== 'operation_status' && k !== '_user' && k !== '_user_id' && k !== '_index' && k !== '_object';
         });
