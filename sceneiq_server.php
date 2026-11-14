@@ -1150,6 +1150,107 @@
         return $normalized;
     }
 
+    /** Keep Dynamic Tabs linked when an edited field key is renamed. */
+    function sceneiqReplaceDynamicFieldKeyInTabs(array &$tabs, $oldKey, $newKey) {
+        foreach ($tabs as &$tab) {
+            if (!is_array($tab)) continue;
+            if (isset($tab['dynamic_fields_display']) && is_array($tab['dynamic_fields_display'])) {
+                foreach ($tab['dynamic_fields_display'] as &$fieldKey) {
+                    if ((string)$fieldKey === (string)$oldKey) $fieldKey = (string)$newKey;
+                }
+                unset($fieldKey);
+            }
+            if (isset($tab['sub_tabs']) && is_array($tab['sub_tabs'])) {
+                sceneiqReplaceDynamicFieldKeyInTabs($tab['sub_tabs'], $oldKey, $newKey);
+            }
+        }
+        unset($tab);
+    }
+
+    /**
+     * Validate a submitted Dynamic Content definition without throwing away
+     * configurable properties. Keep the complete definition so fields edited in
+     * the browser (including URLs, JSON types, paragraph options and copy lists)
+     * round-trip to the relational tables exactly as configured.
+     */
+    function sceneiqPrepareSubmittedDynamicField(array $fieldData, $requestedKey) {
+        $fieldKey = strtolower(trim((string)$requestedKey));
+        $fieldKey = preg_replace('/\s+/', '_', $fieldKey);
+        $fieldKey = preg_replace('/[^a-z0-9_]/', '', $fieldKey);
+        if ($fieldKey === '') {
+            throw new InvalidArgumentException('Enter a valid Dynamic Content field key.');
+        }
+        if (strlen($fieldKey) > 191) {
+            throw new InvalidArgumentException('Dynamic Content field keys must not exceed 191 bytes.');
+        }
+
+        $fieldData['field-name'] = $fieldKey;
+        $fieldData['field-title'] = trim(sceneiqValueToText($fieldData['field-title'] ?? $fieldKey, $fieldKey));
+        if ($fieldData['field-title'] === '') $fieldData['field-title'] = $fieldKey;
+
+        $fieldType = strtolower(trim((string)($fieldData['field_type'] ?? 'individual')));
+        $fieldData['field_type'] = in_array($fieldType, ['object', 'objects'], true) ? 'objects' : 'individual';
+
+        if ($fieldData['field_type'] === 'objects') {
+            $submittedSubFields = $fieldData['fieldkeyvalue'] ?? [];
+            if (is_string($submittedSubFields)) {
+                $decoded = json_decode($submittedSubFields, true);
+                $submittedSubFields = (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) ? $decoded : [];
+            }
+            if (!is_array($submittedSubFields)) {
+                throw new InvalidArgumentException('Object field sub-fields must be a valid collection.');
+            }
+
+            $normalizedSubFields = [];
+            foreach ($submittedSubFields as $rawSubKey => $rawSubField) {
+                $subKey = strtolower(trim((string)$rawSubKey));
+                $subKey = preg_replace('/\s+/', '_', $subKey);
+                $subKey = preg_replace('/[^a-z0-9_]/', '', $subKey);
+                if ($subKey === '') {
+                    throw new InvalidArgumentException('Every sub-field must have a valid field key.');
+                }
+                if (strlen($subKey) > 191) {
+                    throw new InvalidArgumentException('Dynamic Content subfield keys must not exceed 191 bytes: ' . substr($subKey, 0, 80));
+                }
+                if (array_key_exists($subKey, $normalizedSubFields)) {
+                    throw new InvalidArgumentException('Duplicate sub-field key: ' . $subKey);
+                }
+                if (!is_array($rawSubField)) $rawSubField = [];
+
+                $rawSubField['field-name'] = $subKey;
+                $rawSubField['field-title'] = trim(sceneiqValueToText($rawSubField['field-title'] ?? $subKey, $subKey));
+                if ($rawSubField['field-title'] === '') $rawSubField['field-title'] = $subKey;
+                $rawSubField['field_type'] = 'individual';
+                $rawSubField['element_type'] = sceneiqValueToText($rawSubField['element_type'] ?? 'input', 'input');
+                $subDataType = strtolower(trim(sceneiqValueToText($rawSubField['data_type'] ?? 'string', 'string')));
+                if (($rawSubField['element_type'] ?? '') === 'multiple-selections') $subDataType = 'json';
+                $rawSubField['data_type'] = $subDataType === 'integer' ? 'int' : (in_array($subDataType, ['string', 'int', 'json'], true) ? $subDataType : 'string');
+                $rawSubField['default_value'] = sceneiqValueToText($rawSubField['default_value'] ?? '');
+                $rawSubField['default_values'] = is_array($rawSubField['default_values'] ?? null) ? $rawSubField['default_values'] : [];
+                $rawSubField['button_url'] = sceneiqValueToText($rawSubField['button_url'] ?? '');
+                $rawSubField['separate_paragraphs'] = (($rawSubField['separate_paragraphs'] ?? 'no') === 'yes') ? 'yes' : 'no';
+                $rawSubField['copy_button_for_each_of'] = is_array($rawSubField['copy_button_for_each_of'] ?? null) ? $rawSubField['copy_button_for_each_of'] : [];
+                $normalizedSubFields[$subKey] = $rawSubField;
+            }
+
+            $fieldData['fieldkeyvalue'] = $normalizedSubFields;
+            return $fieldData;
+        }
+
+        $fieldData['element_type'] = sceneiqValueToText($fieldData['element_type'] ?? 'input', 'input');
+        $dataType = strtolower(trim(sceneiqValueToText($fieldData['data_type'] ?? 'string', 'string')));
+        if ($fieldData['element_type'] === 'multiple-selections') $dataType = 'json';
+        $fieldData['data_type'] = $dataType === 'integer' ? 'int' : (in_array($dataType, ['string', 'int', 'json'], true) ? $dataType : 'string');
+        $fieldData['default_value'] = sceneiqValueToText($fieldData['default_value'] ?? '');
+        $fieldData['default_values'] = is_array($fieldData['default_values'] ?? null) ? $fieldData['default_values'] : [];
+        $fieldData['button_url'] = sceneiqValueToText($fieldData['button_url'] ?? '');
+        $fieldData['separate_paragraphs'] = (($fieldData['separate_paragraphs'] ?? 'no') === 'yes') ? 'yes' : 'no';
+        $fieldData['copy_button_mode'] = (($fieldData['copy_button_mode'] ?? 'individually') === 'bulk') ? 'bulk' : 'individually';
+        $fieldData['copy_button_for_each_of'] = is_array($fieldData['copy_button_for_each_of'] ?? null) ? $fieldData['copy_button_for_each_of'] : [];
+        unset($fieldData['fieldkeyvalue']);
+        return $fieldData;
+    }
+
     /**
      * Normalize root and nested tab records. Scalar legacy entries are retained as
      * simple tab names; invalid nested values cannot break PHP rendering.
@@ -1778,148 +1879,93 @@
         }
     }
 
-    // Update Global Dynamic Field
+    // Update one account-scoped Dynamic Content field.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['update_global_field'])) {
-        $userId = intval($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
-        if ($userId <= 0) { echo json_encode(['success' => false, 'message' => 'Select an account first.']); exit; }
-        $oldKey = $_POST['old_key'] ?? '';
-        $newKey = $_POST['new_key'] ?? '';
-        $fieldData = isset($_POST['field_data']) ? json_decode($_POST['field_data'], true) : [];
-        
-        error_log("=== UPDATE GLOBAL FIELD ===");
-        error_log("Old Key: " . $oldKey);
-        error_log("New Key: " . $newKey);
-        error_log("Field Data: " . json_encode($fieldData));
-        
-        if ($oldKey && $newKey && !empty($fieldData)) {
-            try {
-                $config = getUserConfig($pdo, $userId);
-                $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
-                $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
-                if (!is_array($settings)) $settings = [];
-                $settings = repairSettings($settings);
-                
-                $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
-                
-                // Remove old key if it exists
-                if (isset($dynamicFields[$oldKey])) {
-                    unset($dynamicFields[$oldKey]);
-                }
-                
-                // Add with new key. Object multiple-selection sub-fields must always
-                // retain JSON as their saved data type, including the edit/update path.
-                if (($fieldData['field_type'] ?? '') === 'objects' && isset($fieldData['fieldkeyvalue']) && is_array($fieldData['fieldkeyvalue'])) {
-                    foreach ($fieldData['fieldkeyvalue'] as &$updatedSubField) {
-                        if (is_array($updatedSubField) && ($updatedSubField['element_type'] ?? '') === 'multiple-selections') {
-                            $updatedSubField['data_type'] = 'json';
-                        }
-                    }
-                    unset($updatedSubField);
-                }
-                $dynamicFields[$newKey] = $fieldData;
-                
-                $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
-                error_log("Save result: " . ($result ? "TRUE" : "FALSE"));
-                
-                if ($result) {
-                    echo json_encode(['success' => true, 'message' => 'Field updated successfully!']);
-                    exit;
-                } else {
-                    echo json_encode(['success' => false, 'message' => 'Failed to update field.']);
-                    exit;
-                }
-            } catch (Exception $e) {
-                error_log("Exception: " . $e->getMessage());
-                echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
-                exit;
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        $userId = (int)($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
+        $oldKey = trim((string)($_POST['old_key'] ?? ''));
+        $newKey = trim((string)($_POST['new_key'] ?? ''));
+        $fieldData = isset($_POST['field_data']) ? json_decode((string)$_POST['field_data'], true) : null;
+
+        try {
+            if ($userId <= 0) throw new InvalidArgumentException('Select an account first.');
+            if (!is_array($fieldData) || !$fieldData) throw new InvalidArgumentException('The field editor did not provide valid field content.');
+            if ($oldKey === '') throw new InvalidArgumentException('The field being edited could not be identified.');
+
+            $config = getUserConfig($pdo, $userId);
+            if (!$config) throw new RuntimeException('The selected account configuration could not be loaded.');
+            $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
+            if (!array_key_exists($oldKey, $dynamicFields)) throw new RuntimeException('The field being edited no longer exists. Refresh the page and try again.');
+
+            $preparedField = sceneiqPrepareSubmittedDynamicField($fieldData, $newKey);
+            $preparedKey = (string)$preparedField['field-name'];
+            if ($preparedKey !== $oldKey && array_key_exists($preparedKey, $dynamicFields)) {
+                throw new InvalidArgumentException('Another Dynamic Content field already uses the key "' . $preparedKey . '". Choose a different key.');
             }
-        } else {
-            echo json_encode(['success' => false, 'message' => 'Invalid data.']);
-            exit;
+
+            $settings = repairSettings(sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []));
+            $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
+            if ($preparedKey !== $oldKey) {
+                sceneiqReplaceDynamicFieldKeyInTabs($dynamicTabs, $oldKey, $preparedKey);
+            }
+            unset($dynamicFields[$oldKey]);
+            $dynamicFields[$preparedKey] = $preparedField;
+            saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
+
+            $state = sceneiqBuildLiveState($pdo, $userId);
+            echo json_encode([
+                'success' => true,
+                'message' => 'Dynamic Content field updated and saved successfully.',
+                'state' => $state
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            error_log('SceneIQ Dynamic Content update failed for user ' . $userId . ': ' . $e->getMessage());
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
         }
+        exit;
     }
 
-    // Save single global dynamic field
+    // Save a new account-scoped Dynamic Content field.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_global_single_field'])) {
-        $userId = intval($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
-        if ($userId <= 0) { echo json_encode(['success' => false, 'message' => 'Select an account first.']); exit; }
-        $fieldData = isset($_POST['field_data']) ? json_decode($_POST['field_data'], true) : [];
-        
-        error_log("=== SAVE GLOBAL SINGLE FIELD ===");
-        error_log("Field Data: " . json_encode($fieldData));
-        
-        if (!empty($fieldData)) {
-            try {
-                $config = getUserConfig($pdo, $userId);
-                $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
-                $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
-                if (!is_array($settings)) $settings = [];
-                $settings = repairSettings($settings);
-                
-                $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
-                
-                if (isset($fieldData['field_type']) && $fieldData['field_type'] === 'objects') {
-                    $fieldKey = $fieldData['field-name'] ?? '';
-                    if ($fieldKey) {
-                        $subFields = $fieldData['fieldkeyvalue'] ?? [];
-                        if (!is_array($subFields)) $subFields = [];
-                        // Preserve each sub-field's data_type. Previously this save
-                        // path rebuilt object fields and silently discarded data_type,
-                        // causing JSON sub-fields to be stored as strings.
-                        foreach ($subFields as &$subField) {
-                            if (!is_array($subField)) $subField = [];
-                            $subType = strtolower((string)($subField['data_type'] ?? 'string'));
-                            // Multiple selections always store an array, so their data type is JSON.
-                            if (($subField['element_type'] ?? '') === 'multiple-selections') {
-                                $subType = 'json';
-                            }
-                            $subField['data_type'] = in_array($subType, ['string', 'int', 'integer', 'json'], true)
-                                ? ($subType === 'integer' ? 'int' : $subType)
-                                : 'string';
-                        }
-                        unset($subField);
-                        $dynamicFields[$fieldKey] = [
-                            'field-title' => $fieldData['field-title'] ?? $fieldKey,
-                            'field_type' => 'objects',
-                            'fieldkeyvalue' => $subFields
-                        ];
-                    }
-                } else {
-                    $fieldKey = $fieldData['field-name'] ?? '';
-                    if ($fieldKey) {
-                        $dynamicFields[$fieldKey] = [
-                            'field-title' => $fieldData['field-title'] ?? $fieldKey,
-                            'field_type' => 'individual',
-                            'element_type' => $fieldData['element_type'] ?? 'input',
-                            'data_type' => in_array(($fieldData['data_type'] ?? 'string'), ['string','int','json'], true) ? $fieldData['data_type'] : 'string',
-                            'default_value' => $fieldData['default_value'] ?? '',
-                            'default_values' => $fieldData['default_values'] ?? [],
-                        ];
-                    }
-                }
-                
-                $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
-                error_log("Save result: " . ($result ? "TRUE" : "FALSE"));
-                
-                if ($result) {
-                    $_SESSION['flash_success'] = 'Field saved successfully!';
-                    echo json_encode(['success' => true, 'message' => 'Field saved successfully']);
-                    exit;
-                } else {
-                    $_SESSION['flash_error'] = 'Failed to save field.';
-                    echo json_encode(['success' => false, 'message' => 'Failed to save field']);
-                    exit;
-                }
-            } catch (Exception $e) {
-                error_log("Exception: " . $e->getMessage());
-                echo json_encode(['success' => false, 'message' => 'Error: ' . $e->getMessage()]);
-                exit;
+        header('Content-Type: application/json; charset=utf-8');
+        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+        $userId = (int)($_POST['user_id'] ?? ($_SESSION['selected_user_id'] ?? 0));
+        $fieldData = isset($_POST['field_data']) ? json_decode((string)$_POST['field_data'], true) : null;
+
+        try {
+            if ($userId <= 0) throw new InvalidArgumentException('Select an account first.');
+            if (!is_array($fieldData) || !$fieldData) throw new InvalidArgumentException('The field editor did not provide valid field content.');
+
+            $fieldKey = (string)($fieldData['field-name'] ?? '');
+            $preparedField = sceneiqPrepareSubmittedDynamicField($fieldData, $fieldKey);
+            $preparedKey = (string)$preparedField['field-name'];
+
+            $config = getUserConfig($pdo, $userId);
+            if (!$config) throw new RuntimeException('The selected account configuration could not be loaded.');
+            $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
+            if (array_key_exists($preparedKey, $dynamicFields)) {
+                throw new InvalidArgumentException('A Dynamic Content field already uses the key "' . $preparedKey . '". Choose a different key.');
             }
-        } else {
-            error_log("ERROR: Invalid data");
-            echo json_encode(['success' => false, 'message' => 'Invalid data']);
-            exit;
+
+            $settings = repairSettings(sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []));
+            $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
+            $dynamicFields[$preparedKey] = $preparedField;
+            saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
+
+            $state = sceneiqBuildLiveState($pdo, $userId);
+            echo json_encode([
+                'success' => true,
+                'message' => 'New Dynamic Content field saved successfully.',
+                'state' => $state
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            error_log('SceneIQ Dynamic Content create failed for user ' . $userId . ': ' . $e->getMessage());
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
         }
+        exit;
     }
 
     // Delete Global Dynamic Field
@@ -2582,6 +2628,24 @@
         /* Prevent the legacy tab layout from flashing before the final folder UI initializes. */
         body.sceneiq-folder-pending .custom-body { visibility: hidden !important; }
         body.sceneiq-folder-ready .custom-body { visibility: visible !important; }
+
+        /* Visible feedback while the account workspace or any configuration save is pending. */
+        #sceneiq-loading-indicator {
+            position: fixed; inset: 0; z-index: 2147483000; display: none;
+            align-items: center; justify-content: center; flex-direction: column; gap: 14px;
+            padding: 24px; background: transparent; color: #f8fafc;
+            text-align: center; backdrop-filter: none;
+        }
+        body.sceneiq-folder-pending #sceneiq-loading-indicator,
+        body.sceneiq-operation-loading #sceneiq-loading-indicator { display: flex; }
+        #sceneiq-loading-indicator .sceneiq-loader-spinner {
+            width: 42px; height: 42px; border: 4px solid rgba(255,255,255,.25);
+            border-top-color: #5eead4; border-radius: 50%; animation: sceneiq-loader-spin .8s linear infinite;
+        }
+        @keyframes sceneiq-loader-spin { to { transform: rotate(360deg); } }
+        @media (prefers-reduced-motion: reduce) {
+            #sceneiq-loading-indicator .sceneiq-loader-spinner { animation-duration: 2s; }
+        }
         .copy-button-copied { background:#dcfce7 !important; border-color:#16a34a !important; color:#166534 !important; }
 
         /* ===== RESET & BODY ===== */
@@ -5647,6 +5711,9 @@ window.sceneIQAccountSwitcherUsers = <?php
 window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
 </script>
 <body class="<?php echo $selectedUserId > 0 ? 'sceneiq-folder-pending' : ''; ?>">
+    <div id="sceneiq-loading-indicator" role="status" aria-live="polite" aria-atomic="true">
+        <div class="sceneiq-loader-spinner" aria-hidden="true"></div>
+    </div>
     <div class="custom-body">
         <?php if ($selectedUserId > 0 && $selectedUser): ?>
             <div class="main-header account-selected-header"
@@ -6373,6 +6440,20 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     var userSettings = <?php echo json_encode($userSettings, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
     var userDynamicTabs = <?php echo json_encode($userDynamicTabs, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
     var _pendingSaveData = null;
+
+    var sceneIQLoadingDepth = 0;
+    function sceneIQBeginLoading(message, detail) {
+        sceneIQLoadingDepth++;
+        var titleNode = document.getElementById('sceneiq-loading-title');
+        var detailNode = document.getElementById('sceneiq-loading-detail');
+        if (titleNode) titleNode.textContent = message || 'Loading configuration';
+        if (detailNode) detailNode.textContent = detail || 'Please wait while SceneIQ applies your changes...';
+        document.body.classList.add('sceneiq-operation-loading');
+    }
+    function sceneIQEndLoading() {
+        sceneIQLoadingDepth = Math.max(0, sceneIQLoadingDepth - 1);
+        if (sceneIQLoadingDepth === 0) document.body.classList.remove('sceneiq-operation-loading');
+    }
 
     // ============================================================
     // ===== BACKGROUND SYNC FUNCTIONS - KEEPS DATA FRESH =====
@@ -8871,235 +8952,207 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     // ============================================================
 
     var subFields = [];
+    var nextSubFieldIndex = 0;
 
     function editGlobalDynamicField(fieldKey) {
-        var field = globalDynamicFields[fieldKey];
+        var field = globalDynamicFields && globalDynamicFields[fieldKey];
         if (!field) {
-            showDialog('Error', 'Field not found.');
+            showDialog('Error', 'Field not found. Refresh Dynamic Content and try again.');
             return;
         }
+
         subFields = [];
-        window._dfDefaultValues = [];
+        nextSubFieldIndex = 0;
+        window._dfDefaultValues = Array.isArray(field.default_values) ? field.default_values.slice() : [];
+
         var isObjects = field.field_type === 'objects';
-        var title = field['field-title'] || '';
-        var elementType = field.element_type || 'input';
-        var defaultValue = field.default_value || '';
-        var defaultValues = field.default_values || [];
-        if (isObjects) {
-            var subFieldData = field.fieldkeyvalue || {};
-            var subKeys = Object.keys(subFieldData);
-            subKeys.forEach(function(sk, idx) {
-                var sub = subFieldData[sk];
-                subFields.push({
-                    defaultValues: sub.default_values || [],
-                    default_value: sub.default_value || ''
-                });
-            });
-        } else {
-            window._dfDefaultValues = defaultValues;
-        }
-        renderEditFieldDialog(fieldKey, field, title, isObjects, elementType, defaultValue);
+        var subFieldData = isObjects && field.fieldkeyvalue && typeof field.fieldkeyvalue === 'object'
+            ? field.fieldkeyvalue : {};
+        Object.keys(subFieldData).forEach(function(subKey) {
+            var sub = subFieldData[subKey] || {};
+            var index = nextSubFieldIndex++;
+            subFields[index] = {
+                key: subKey,
+                defaultValues: Array.isArray(sub.default_values) ? sub.default_values.slice() : [],
+                default_value: sub.default_value || '',
+                copy_button_for_each_of: sub.copy_button_for_each_of || {}
+            };
+        });
+
+        renderEditFieldDialog(
+            fieldKey,
+            field,
+            field['field-title'] || '',
+            isObjects,
+            field.element_type || 'input',
+            field.default_value || ''
+        );
     }
 
-    // ===== UPDATE renderEditFieldDialog FUNCTION =====
-    // Replace the entire function with this version
+    function buildSubFieldEditorMarkup(subKey, sub, index) {
+        sub = sub || {};
+        var safeKey = escapeHtml(String(subKey || ''));
+        var safeTitle = escapeHtml(String(sub['field-title'] || subKey || ''));
+        var safeDefault = escapeHtml(String(sub.default_value || ''));
+        var safeUrl = escapeHtml(String(sub.button_url || ''));
+        var safeCopy = sub.copy_button_for_each_of && typeof sub.copy_button_for_each_of === 'object'
+            ? Object.keys(sub.copy_button_for_each_of).sort(function(a, b) { return Number(a) - Number(b); })
+                .map(function(k) { return String(sub.copy_button_for_each_of[k] || ''); }).filter(Boolean).join('\n')
+            : '';
+        var element = String(sub.element_type || 'input');
+        var dataType = String(sub.data_type || 'string');
+        var values = Array.isArray(sub.default_values) ? sub.default_values : [];
+
+        return '<div class="sub-field-group" id="sub_field_' + index + '" data-index="' + index + '">' +
+            '<button type="button" class="remove-sub-field" onclick="removeSubField(' + index + ')" aria-label="Remove sub-field">×</button>' +
+            '<div class="form-group" style="margin-bottom:10px;"><label>Display Title</label>' +
+            '<input type="text" id="sub_title_' + index + '" value="' + safeTitle + '" placeholder="Enter display title..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></div>' +
+            '<div class="form-group" style="margin-bottom:10px;"><label>Field Key</label>' +
+            '<input type="text" id="sub_key_' + index + '" value="' + safeKey + '" placeholder="Enter field key..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></div>' +
+            '<div class="form-group"><label>Element Type</label>' +
+            '<select id="sub_element_' + index + '" onchange="toggleSubDefaultValueInput(' + index + ')" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<option value="input" ' + (element === 'input' ? 'selected' : '') + '>Input</option>' +
+            '<option value="select" ' + (element === 'select' ? 'selected' : '') + '>Select</option>' +
+            '<option value="multiple-selections" ' + (element === 'multiple-selections' ? 'selected' : '') + '>Multiple selections</option>' +
+            '<option value="textarea" ' + (element === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
+            '<option value="date-time-input" ' + (element === 'date-time-input' ? 'selected' : '') + '>Date &amp; Time</option>' +
+            '<option value="button" ' + (element === 'button' ? 'selected' : '') + '>Button</option>' +
+            '<option value="copy_button_for_each_of" ' + (element === 'copy_button_for_each_of' ? 'selected' : '') + '>Copy Button For Each Sentence</option>' +
+            '</select></div>' +
+            '<div class="form-group"><label>Saved Data Type</label>' +
+            '<select id="sub_data_type_' + index + '" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<option value="string" ' + (dataType === 'string' ? 'selected' : '') + '>String</option>' +
+            '<option value="int" ' + (dataType === 'int' || dataType === 'integer' ? 'selected' : '') + '>Integer</option>' +
+            '<option value="json" ' + (dataType === 'json' ? 'selected' : '') + '>JSON</option>' +
+            '</select></div>' +
+            '<div class="form-group" id="sub_default_value_container_' + index + '"><label>Default Value</label>' +
+            '<div id="sub_default_value_input_container_' + index + '"><input type="text" id="sub_default_value_' + index + '" value="' + safeDefault + '" placeholder="Enter default value..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></div>' +
+            '<div id="sub_default_value_textarea_container_' + index + '" style="display:none;"><textarea id="sub_default_value_textarea_' + index + '" rows="3" placeholder="Enter default value..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' + safeDefault + '</textarea></div></div>' +
+            '<div class="form-group" id="sub_select_values_container_' + index + '" style="display:none;"><label>Select Options</label>' +
+            '<div style="display:flex;gap:8px;"><input type="text" id="sub_default_value_input_' + index + '" placeholder="Enter option..." style="flex:1;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<button type="button" class="btn btn-secondary" onclick="addSubDefaultValue(' + index + ')">Add</button></div>' +
+            '<div id="sub_default_values_list_' + index + '" style="margin-top:8px;"></div></div>' +
+            '<div class="form-group" id="sub_multiple_selection_container_' + index + '" style="display:none;"><label>Multiple selections values</label>' +
+            '<textarea id="sub_multiple_selection_text_' + index + '" rows="3" placeholder="Value A, Value B, Value C..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
+            '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addSubMultipleSelectionValues(' + index + ')">Add</button>' +
+            '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
+            '<div id="sub_multiple_selection_values_list_' + index + '" style="margin-top:8px;"></div></div>' +
+            '<div class="form-group" id="sub_url_container_' + index + '" style="display:none;"><label>Button URL (onclick value)</label>' +
+            '<input type="url" id="sub_url_value_' + index + '" value="' + safeUrl + '" placeholder="https://example.com" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<small style="color:#6b7280;">This URL opens in a new tab when the button is clicked.</small></div>' +
+            '<div class="form-group" id="sub_separate_paragraphs_container_' + index + '" style="display:none;"><label>Separate paragraphs into individual display items?</label>' +
+            '<select id="sub_separate_paragraphs_' + index + '" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+            '<option value="no" ' + (sub.separate_paragraphs !== 'yes' ? 'selected' : '') + '>No</option><option value="yes" ' + (sub.separate_paragraphs === 'yes' ? 'selected' : '') + '>Yes</option></select></div>' +
+            '<div class="form-group" id="sub_copy_sentences_container_' + index + '" style="display:none;"><label>Copy sentences (one per line)</label>' +
+            '<textarea id="sub_copy_sentences_' + index + '" rows="4" placeholder="Enter one sentence per line..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' + escapeHtml(safeCopy) + '</textarea></div>' +
+            '</div>';
+    }
 
     function renderEditFieldDialog(fieldKey, field, title, isObjects, elementType, defaultValue) {
-        var category = isObjects ? 'objects' : 'individual';
+        var buttonUrl = escapeHtml(String(field.button_url || ''));
+        var safeTitle = escapeHtml(String(title || ''));
+        var safeKey = escapeHtml(String(fieldKey || ''));
+        var safeDefault = escapeHtml(String(defaultValue || ''));
+        var defaultValues = Array.isArray(field.default_values) ? field.default_values : [];
+        var subFieldData = isObjects && field.fieldkeyvalue && typeof field.fieldkeyvalue === 'object' ? field.fieldkeyvalue : {};
         var subFieldsHtml = '';
-        var buttonUrl = field.button_url || '';
-        
-        if (isObjects) {
-            var subFieldData = field.fieldkeyvalue || {};
-            var subKeys = Object.keys(subFieldData);
-            subKeys.forEach(function(sk, idx) {
-                var sub = subFieldData[sk];
-                var subElement = sub.element_type || 'input';
-                var subDefaultValue = sub.default_value || '';
-                var subDefaultValues = sub.default_values || [];
-                var subButtonUrl = sub.button_url || '';
-                subFieldsHtml += 
-                    '<div class="sub-field-group" id="sub_field_' + idx + '">' +
-                    '<button type="button" class="remove-sub-field" onclick="removeSubField(' + idx + ')">×</button>' +
-                    '<div class="form-group" style="margin-bottom:10px;">' +
-                    '<label>Display Title</label>' +
-                    '<input type="text" id="sub_title_' + idx + '" value="' + (sub['field-title'] || sk) + '" placeholder="Enter display title..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '</div>' +
-                    '<div class="form-group" style="margin-bottom:10px;">' +
-                    '<label>Field Key</label>' +
-                    '<input type="text" id="sub_key_' + idx + '" value="' + sk + '" placeholder="Enter field key..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                    '<label>Element Type</label>' +
-                    '<select id="sub_element_' + idx + '" onchange="toggleSubDefaultValueInput(' + idx + ')" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '<option value="input" ' + (subElement === 'input' ? 'selected' : '') + '>Input</option>' +
-                    '<option value="select" ' + (subElement === 'select' ? 'selected' : '') + '>Select</option>' +
-                    '<option value="multiple-selections" ' + (subElement === 'multiple-selections' ? 'selected' : '') + '>Multiple selections</option>' +
-                    '<option value="textarea" ' + (subElement === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
-                    '<option value="date-time-input" ' + (subElement === 'date-time-input' ? 'selected' : '') + '>Date & Time</option>' +
-                    '<option value="button" ' + (subElement === 'button' ? 'selected' : '') + '>Button</option>' +
-                    '</select>' +
-                    '</div>' +
-                    '<div class="form-group">' +
-                    '<label>Saved Data Type</label>' +
-                    '<select id="sub_data_type_' + idx + '" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
-                    '<option value="string" ' + ((sub.data_type || 'string') === 'string' ? 'selected' : '') + '>String</option>' +
-                    '<option value="int" ' + (sub.data_type === 'int' ? 'selected' : '') + '>Integer</option>' +
-                    '<option value="json" ' + (sub.data_type === 'json' ? 'selected' : '') + '>JSON</option>' +
-                    '</select></div>' +
-                    '<div class="form-group" id="sub_default_value_container_' + idx + '">' +
-                    '<label>Default Value</label>' +
-                    '<div id="sub_default_value_input_container_' + idx + '">' +
-                    '<input type="text" id="sub_default_value_' + idx + '" value="' + subDefaultValue + '" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '</div>' +
-                    '<div id="sub_default_value_textarea_container_' + idx + '" style="display:none;">' +
-                    '<textarea id="sub_default_value_textarea_' + idx + '" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' + subDefaultValue + '</textarea>' +
-                    '</div>' +
-                    '</div>' +
-                    '<div class="form-group" id="sub_select_values_container_' + idx + '" style="display:none;">' +
-                    '<label>Select Options</label>' +
-                    '<div style="display:flex; gap:8px;">' +
-                    '<input type="text" id="sub_default_value_input_' + idx + '" placeholder="Enter option..." style="flex:1; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '<button type="button" class="btn btn-secondary" onclick="addSubDefaultValue(' + idx + ')">Add</button>' +
-                    '</div>' +
-                    '<div id="sub_default_values_list_' + idx + '" style="margin-top:8px;"></div>' +
-                    '</div>' +
-                    '<div class="form-group" id="sub_multiple_selection_container_' + idx + '" style="display:none;">' +
-                    '<label>Multiple selections values</label>' +
-                    '<textarea id="sub_multiple_selection_text_' + idx + '" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
-                    '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addSubMultipleSelectionValues(' + idx + ')">Add</button>' +
-                    '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
-                    '<div id="sub_multiple_selection_values_list_' + idx + '" style="margin-top:8px;"></div>' +
-                    '</div>' +
-                    '<div class="form-group" id="sub_url_container_' + idx + '" style="' + (subElement === 'button' ? 'display:block;' : 'display:none;') + '">' +
-                    '<label>Button URL (onclick value)</label>' +
-                    '<div id="sub_url_input_container_' + idx + '">' +
-                    '<input type="url" id="sub_url_value_' + idx + '" value="' + subButtonUrl + '" placeholder="Enter URL (e.g., https://example.com)..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-                    '<small style="color:#6b7280;">This URL will be opened in a new window/tab when the button is clicked.</small>' +
-                    '</div>' +
-                    '</div>' +
-                    '</div>';
-            });
-        }
-        
-        var defaultValuesHtml = '';
-        var defaultValues = field.default_values || [];
-        defaultValues.forEach(function(val, idx) {
-            defaultValuesHtml += '<span class="value-tag">' + val + ' <span class="remove-value" onclick="removeDefaultValue(' + idx + ')">×</span></span>';
+        Object.keys(subFieldData).forEach(function(subKey, idx) {
+            subFieldsHtml += buildSubFieldEditorMarkup(subKey, subFieldData[subKey] || {}, idx);
         });
-        
-        var content = 
-            '<div class="form-group">' +
-            '<label>Display Title</label>' +
-            '<input type="text" id="df_title" value="' + title + '" placeholder="Enter display title..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
+
+        var defaultValuesHtml = defaultValues.map(function(value) {
+            return '<span class="value-tag">' + escapeHtml(String(value)) + '</span>';
+        }).join('');
+        var content =
+            '<div class="form-group"><label>Display Title</label>' +
+                '<input type="text" id="df_title" value="' + safeTitle + '" placeholder="Enter display title..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></div>' +
+            '<div class="form-group"><label>Field Key</label>' +
+                '<input type="text" id="df_key" value="' + safeKey + '" placeholder="Enter field key (no spaces)..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                '<small style="color:#6b7280;">Used for storage. Spaces are converted to underscores.</small></div>' +
+            '<div class="form-group"><label>Field Category</label>' +
+                '<select id="df_category" onchange="toggleFieldCategory()" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                    '<option value="individual" ' + (!isObjects ? 'selected' : '') + '>Individual Field</option>' +
+                    '<option value="objects" ' + (isObjects ? 'selected' : '') + '>Objects Field</option>' +
+                '</select></div>' +
+            '<div id="individual_fields_container" style="display:' + (isObjects ? 'none' : 'block') + ';">' +
+                '<div class="form-group"><label>Element Type</label>' +
+                    '<select id="df_element_type" onchange="toggleDefaultValueInput();toggleCopySentencesConfig()" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                        '<option value="input" ' + (elementType === 'input' ? 'selected' : '') + '>Input</option>' +
+                        '<option value="select" ' + (elementType === 'select' ? 'selected' : '') + '>Select</option>' +
+                        '<option value="multiple-selections" ' + (elementType === 'multiple-selections' ? 'selected' : '') + '>Multiple selections</option>' +
+                        '<option value="textarea" ' + (elementType === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
+                        '<option value="date-time-input" ' + (elementType === 'date-time-input' ? 'selected' : '') + '>Date &amp; Time</option>' +
+                        '<option value="button" ' + (elementType === 'button' ? 'selected' : '') + '>Button</option>' +
+                        '<option value="copy_button_for_each_of" ' + (elementType === 'copy_button_for_each_of' ? 'selected' : '') + '>Copy Button For Each Sentence</option>' +
+                    '</select></div>' +
+                '<div class="form-group"><label>Saved Data Type</label>' +
+                    '<select id="df_data_type" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                        '<option value="string" ' + ((field.data_type || 'string') === 'string' ? 'selected' : '') + '>String (text)</option>' +
+                        '<option value="int" ' + (field.data_type === 'int' || field.data_type === 'integer' ? 'selected' : '') + '>Integer</option>' +
+                        '<option value="json" ' + (field.data_type === 'json' ? 'selected' : '') + '>JSON</option>' +
+                    '</select><small style="color:#6b7280;">Choose JSON for structured values. JSON input must be valid.</small></div>' +
+                '<div class="form-group" id="df_default_value_container"><label>Default Value</label>' +
+                    '<div id="df_default_value_input_container"><input type="text" id="df_default_value" value="' + (elementType !== 'textarea' && elementType !== 'button' ? safeDefault : '') + '" placeholder="Enter default value..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></div>' +
+                    '<div id="df_default_value_textarea_container"><textarea id="df_default_value_textarea" oninput="toggleSeparateParagraphOption()" rows="3" placeholder="Enter default value..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' + (elementType === 'textarea' ? safeDefault : '') + '</textarea></div>' +
+                    '<div class="form-group" id="df_separate_paragraphs_container"><label>Separate paragraphs into individual display items?</label>' +
+                        '<select id="df_separate_paragraphs" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"><option value="no" ' + (field.separate_paragraphs !== 'yes' ? 'selected' : '') + '>No</option><option value="yes" ' + (field.separate_paragraphs === 'yes' ? 'selected' : '') + '>Yes</option></select>' +
+                        '<small style="color:#6b7280;">When enabled, each non-empty paragraph is displayed separately.</small></div>' +
+                '</div>' +
+                '<div class="form-group" id="df_copy_sentences_container" style="display:none;border:1px solid #cbd5e1;border-radius:10px;padding:12px;background:#f8fafc;">' +
+                    '<label>Add sentences with options of</label><select id="df_copy_sentence_mode" onchange="toggleCopySentenceMode()" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;margin:8px 0 12px;"><option value="individually">Individually</option><option value="bulk">Bulk</option></select>' +
+                    '<div id="df_copy_individual_panel"><button type="button" class="btn btn-secondary btn-sm" onclick="addCopySentenceInput()">+ Add individual element</button><div id="df_copy_individual_list" style="margin-top:10px;"></div></div>' +
+                    '<div id="df_copy_bulk_panel" style="display:none;"><label>Add Bulk sentences</label><textarea id="df_copy_bulk_text" rows="6" placeholder="One sentence per line..." style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;"></textarea></div></div>' +
+                '<div class="form-group" id="df_select_values_container" style="display:none;"><label>Select Options</label>' +
+                    '<div style="display:flex;gap:8px;"><input type="text" id="df_default_value_input" placeholder="Enter option..." style="flex:1;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                    '<button type="button" class="btn btn-secondary" onclick="addDefaultValue()">Add</button></div><div id="df_default_values_list" style="margin-top:8px;">' + defaultValuesHtml + '</div></div>' +
+                '<div class="form-group" id="df_multiple_selection_container" style="display:none;"><label>Multiple selections values</label>' +
+                    '<textarea id="df_multiple_selection_text" rows="3" placeholder="Value A, Value B, Value C..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
+                    '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addMultipleSelectionValues()">Add</button>' +
+                    '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
+                    '<div id="df_multiple_selection_values_list" style="margin-top:8px;">' + defaultValuesHtml + '</div></div>' +
+                '<div class="form-group" id="df_url_container" style="display:none;"><label>Button URL (onclick value)</label>' +
+                    '<input type="url" id="df_url_value" value="' + buttonUrl + '" placeholder="https://example.com" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
+                    '<small style="color:#6b7280;">This URL opens in a new tab when the button is clicked.</small></div>' +
             '</div>' +
-            '<div class="form-group">' +
-            '<label>Field Key</label>' +
-            '<input type="text" id="df_key" value="' + fieldKey + '" placeholder="Enter field key (no spaces)..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<small style="color:#6b7280;">Used for storage. Spaces will be replaced with underscores.</small>' +
+            '<div id="objects_fields_container" style="display:' + (isObjects ? 'block' : 'none') + ';">' +
+                '<h4 style="margin-bottom:10px;">Sub Fields</h4><div id="sub_fields_list">' + subFieldsHtml + '</div>' +
+                '<div style="display:flex;gap:10px;margin-top:10px;flex-wrap:wrap;"><button type="button" class="btn btn-secondary btn-sm" onclick="addSubField()">+ Add Sub Field</button></div>' +
             '</div>' +
-            '<div class="form-group">' +
-            '<label>Field Category</label>' +
-            '<select id="df_category" onchange="toggleFieldCategory()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<option value="individual" ' + (!isObjects ? 'selected' : '') + '>Individual Field</option>' +
-            '<option value="objects" ' + (isObjects ? 'selected' : '') + '>Objects Field</option>' +
-            '</select>' +
-            '</div>' +
-            '<div id="individual_fields_container" style="' + (isObjects ? 'display:none;' : 'display:block;') + '">' +
-            '<div class="form-group">' +
-            '<label>Element Type</label>' +
-            '<select id="df_element_type" onchange="toggleDefaultValueInput(); toggleCopySentencesConfig()" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<option value="input" ' + (elementType === 'input' ? 'selected' : '') + '>Input</option>' +
-            '<option value="select" ' + (elementType === 'select' ? 'selected' : '') + '>Select</option>' +
-            '<option value="multiple-selections" ' + (elementType === 'multiple-selections' ? 'selected' : '') + '>Multiple selections</option>' +
-            '<option value="textarea" ' + (elementType === 'textarea' ? 'selected' : '') + '>Textarea</option>' +
-            '<option value="date-time-input" ' + (elementType === 'date-time-input' ? 'selected' : '') + '>Date & Time</option>' +
-            '<option value="button" ' + (elementType === 'button' ? 'selected' : '') + '>Button</option>' +
-            '<option value="copy_button_for_each_of" ' + (elementType === 'copy_button_for_each_of' ? 'selected' : '') + '>Copy Button For Each Sentence</option>' +
-            '</select>' +
-            '</div>' +
-            '<div class="form-group">' +
-            '<label>Saved Data Type</label>' +
-            '<select id="df_data_type" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
-            '<option value="string" ' + ((field.data_type || 'string') === 'string' ? 'selected' : '') + '>String (text)</option>' +
-            '<option value="int" ' + (field.data_type === 'int' ? 'selected' : '') + '>Integer (whole number)</option>' +
-            '<option value="json" ' + (field.data_type === 'json' ? 'selected' : '') + '>JSON (object, array, number, boolean or null)</option>' +
-            '</select><small style="color:#6b7280;">JSON must be valid JSON, for example {"script_json":{"characters_prompt":[]}}. Strings are saved as text; integers as numbers.</small>' +
-            '</div>' +
-            '<div class="form-group" id="df_default_value_container" style="' + ((elementType === 'button' || elementType === 'copy_button_for_each_of') ? 'display:none;' : 'display:block;') + '">' +
-            '<label>Default Value</label>' +
-            '<div id="df_default_value_input_container" ' + (elementType === 'textarea' ? 'style="display:none;"' : 'style="display:block;"') + '>' +
-            '<input type="text" id="df_default_value" value="' + (elementType !== 'button' && elementType !== 'textarea' ? defaultValue : '') + '" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '</div>' +
-            '<div id="df_default_value_textarea_container" ' + (elementType === 'textarea' ? 'style="display:block;"' : 'style="display:none;"') + '>' +
-            '<textarea id="df_default_value_textarea" oninput="toggleSeparateParagraphOption()" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' + (elementType === 'textarea' ? defaultValue : '') + '</textarea>' +
-            '</div>' +
-            '<div class="form-group" id="df_separate_paragraphs_container" style="' + (elementType === 'textarea' && defaultValue ? 'display:block;' : 'display:none;') + '">' +
-            '<label>Separate paragraphs into individual display items?</label>' +
-            '<select id="df_separate_paragraphs" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"><option value="no">No</option><option value="yes" ' + (field.separate_paragraphs === 'yes' ? 'selected' : '') + '>Yes</option></select>' +
-            '<small style="color:#6b7280;">When Yes, each non-empty line/paragraph is displayed separately with its own copy button.</small></div>' +
-            '</div>' +
-                        '<div class="form-group" id="df_copy_sentences_container" style="display:none;border:1px solid #cbd5e1;border-radius:10px;padding:12px;background:#f8fafc;">' +
-            '<label>Add sentences with options of</label><select id="df_copy_sentence_mode" onchange="toggleCopySentenceMode()" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;margin:8px 0 12px;"><option value="individually">Individually</option><option value="bulk">Bulk</option></select>' +
-            '<div id="df_copy_individual_panel"><button type="button" class="btn btn-secondary btn-sm" onclick="addCopySentenceInput()">+ Add individual element</button><div id="df_copy_individual_list" style="margin-top:10px;"></div></div>' +
-            '<div id="df_copy_bulk_panel" style="display:none;"><label>Add Bulk sentences</label><textarea id="df_copy_bulk_text" rows="6" placeholder="I am sentence a&#10;I am sentence b" style="width:100%;padding:10px;border:1px solid #cbd5e1;border-radius:8px;"></textarea><small>Each non-empty line is saved as a separate sentence.</small></div></div>' +
-            '<div class="form-group" id="df_select_values_container" style="' + (elementType === 'select' ? 'display:block;' : 'display:none;') + '">' +
-            '<label>Select Options</label>' +
-            '<div style="display:flex; gap:8px;">' +
-            '<input type="text" id="df_default_value_input" placeholder="Enter option..." style="flex:1; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<button type="button" class="btn btn-secondary" onclick="addDefaultValue()">Add</button>' +
-            '</div>' +
-            '<div id="df_default_values_list" style="margin-top:8px;">' + defaultValuesHtml + '</div>' +
-            '</div>' +
-            '<div class="form-group" id="df_multiple_selection_container" style="' + (elementType === 'multiple-selections' ? 'display:block;' : 'display:none;') + '">' +
-            '<label>Multiple selections values</label>' +
-            '<textarea id="df_multiple_selection_text" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
-            '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addMultipleSelectionValues()">Add</button>' +
-            '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
-            '<div id="df_multiple_selection_values_list" style="margin-top:8px;">' + defaultValuesHtml + '</div>' +
-            '</div>' +
-            '<div class="form-group" id="df_url_container" style="' + (elementType === 'button' ? 'display:block;' : 'display:none;') + '">' +
-            '<label>Button URL (onclick value)</label>' +
-            '<div id="df_url_input_container">' +
-            '<input type="url" id="df_url_value" value="' + buttonUrl + '" placeholder="Enter URL (e.g., https://example.com)..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<small style="color:#6b7280;">This URL will be opened in a new window/tab when the button is clicked.</small>' +
-            '</div>' +
-            '</div>' +
-            '</div>' +
-            '<div id="objects_fields_container" style="' + (isObjects ? 'display:block;' : 'display:none;') + '">' +
-            '<h4 style="margin-bottom:10px;"> Sub Fields</h4>' +
-            '<div id="sub_fields_list">' + subFieldsHtml + '</div>' +
-            '<div style="display:flex; gap:10px; margin-top:10px; flex-wrap:wrap;">' +
-            '<button type="button" class="btn btn-secondary btn-sm" onclick="addSubField()">+ Add Sub Field</button>' +
-            '</div>' +
-            '</div>' +
-            '<div style="display:flex; gap:10px; margin-top:20px;">' +
-            '<button type="button" class="btn btn-success" onclick="updateDynamicField(\'' + fieldKey + '\')"> Update Field</button>' +
-            '<button type="button" class="btn btn-secondary" onclick="closeDialog()">Cancel</button>' +
+            '<div style="display:flex;gap:10px;margin-top:20px;flex-wrap:wrap;">' +
+                '<button type="button" class="btn btn-success" id="df_update_field_button">Update Field</button>' +
+                '<button type="button" class="btn btn-secondary" onclick="closeDialog()">Cancel</button>' +
             '</div>';
-        
+
         showDialog('Edit Dynamic Field', '', null, content);
+        var updateButton = document.getElementById('df_update_field_button');
+        if (updateButton) updateButton.addEventListener('click', function() { updateDynamicField(fieldKey, false); });
         var editDataTypeControl = document.getElementById('df_data_type');
         if (editDataTypeControl && elementType === 'multiple-selections') {
-            // JSON is forced only while this element type is active; restore string if changed away.
-            editDataTypeControl.dataset.previousType = 'string';
+            editDataTypeControl.dataset.previousType = field.data_type && field.data_type !== 'json' ? field.data_type : 'string';
         }
         toggleFieldCategory();
         toggleDefaultValueInput();
         loadCopySentenceInputs(field);
-        if (isObjects) {
-            var subFieldData2 = field.fieldkeyvalue || {};
-            var subKeys2 = Object.keys(subFieldData2);
-            subKeys2.forEach(function(sk, idx) {
-                var sub = subFieldData2[sk];
-                subFields[idx] = {
-                    defaultValues: sub.default_values || [],
-                    default_value: sub.default_value || ''
-                };
-                renderSubFieldDefaultValues(idx);
-                toggleSubDefaultValueInput(idx);
-            });
-        }
+        // Render existing select/multiple-selection options with working remove
+        // controls; the edit dialog must make saved values editable, not read-only.
+        renderDefaultValuesList();
+        document.querySelectorAll('#sub_fields_list .sub-field-group').forEach(function(group) {
+            var index = Number(group.getAttribute('data-index'));
+            renderSubFieldDefaultValues(index);
+            toggleSubDefaultValueInput(index);
+        });
+    }
+
+    function setDynamicFieldEditorCategory(category) {
+        var select = document.getElementById('df_category');
+        if (!select) return;
+        select.value = category === 'objects' ? 'objects' : 'individual';
+        toggleFieldCategory();
+    }
+
+    function addSubFieldFromEditor() {
+        setDynamicFieldEditorCategory('objects');
+        addSubField();
     }
 
     function toggleFieldCategory() {
@@ -9157,43 +9210,56 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     }
 
     function toggleDefaultValueInput() {
-        var elementType = document.getElementById('df_element_type').value;
-        var separateBox = document.getElementById('df_separate_paragraphs_container');
-        if (separateBox) separateBox.style.display = (elementType === 'textarea' && document.getElementById('df_default_value_textarea') && document.getElementById('df_default_value_textarea').value.trim() !== '') ? 'block' : 'none';
-        var defaultValueContainer = document.getElementById('df_default_value_container');
-        var defaultValueInput = document.getElementById('df_default_value_input_container');
-        var defaultValueTextarea = document.getElementById('df_default_value_textarea_container');
-        var selectValuesContainer = document.getElementById('df_select_values_container');
+        var elementControl = document.getElementById('df_element_type');
+        if (!elementControl) return;
+        var elementType = elementControl.value;
+        var defaultContainer = document.getElementById('df_default_value_container');
+        var inputContainer = document.getElementById('df_default_value_input_container');
+        var textareaContainer = document.getElementById('df_default_value_textarea_container');
+        var selectContainer = document.getElementById('df_select_values_container');
+        var multipleContainer = document.getElementById('df_multiple_selection_container');
         var urlContainer = document.getElementById('df_url_container');
-        
-        // Hide all first
-        if (defaultValueContainer) defaultValueContainer.style.display = 'none';
-        if (selectValuesContainer) selectValuesContainer.style.display = 'none';
-        if (urlContainer) urlContainer.style.display = 'none';
-        if (defaultValueInput) defaultValueInput.style.display = 'none';
-        if (defaultValueTextarea) defaultValueTextarea.style.display = 'none';
-        
+        var separateContainer = document.getElementById('df_separate_paragraphs_container');
+        var copyContainer = document.getElementById('df_copy_sentences_container');
+        var dataType = document.getElementById('df_data_type');
+
+        [defaultContainer, selectContainer, multipleContainer, urlContainer, separateContainer, copyContainer].forEach(function(node) {
+            if (node) node.style.display = 'none';
+        });
+        if (inputContainer) inputContainer.style.display = 'none';
+        if (textareaContainer) textareaContainer.style.display = 'none';
+
+        if (dataType) {
+            if (elementType === 'multiple-selections') {
+                if (!dataType.dataset.previousType) dataType.dataset.previousType = dataType.value || 'string';
+                dataType.value = 'json';
+                dataType.disabled = true;
+            } else {
+                dataType.disabled = false;
+                if (dataType.dataset.previousType) {
+                    dataType.value = dataType.dataset.previousType;
+                    delete dataType.dataset.previousType;
+                }
+            }
+        }
+
         if (elementType === 'select') {
-            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (selectValuesContainer) selectValuesContainer.style.display = 'block';
+            if (defaultContainer) defaultContainer.style.display = 'block';
+            if (inputContainer) inputContainer.style.display = 'block';
+            if (selectContainer) selectContainer.style.display = 'block';
+        } else if (elementType === 'multiple-selections') {
+            if (multipleContainer) multipleContainer.style.display = 'block';
         } else if (elementType === 'textarea') {
-            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (defaultValueInput) defaultValueInput.style.display = 'none';
-            if (defaultValueTextarea) defaultValueTextarea.style.display = 'block';
-        } else if (elementType === 'copy_button_for_each_of') {
-            if (defaultValueContainer) defaultValueContainer.style.display = 'none';
-            if (selectValuesContainer) selectValuesContainer.style.display = 'none';
-            if (urlContainer) urlContainer.style.display = 'none';
+            if (defaultContainer) defaultContainer.style.display = 'block';
+            if (textareaContainer) textareaContainer.style.display = 'block';
+            if (separateContainer) separateContainer.style.display = 'block';
         } else if (elementType === 'button') {
-            // Show URL container for button type
             if (urlContainer) urlContainer.style.display = 'block';
-            // Hide default value container for button
-            if (defaultValueContainer) defaultValueContainer.style.display = 'none';
+        } else if (elementType === 'copy_button_for_each_of') {
+            if (copyContainer) copyContainer.style.display = 'block';
         } else {
-            // Input, date-time-input, etc.
-            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (defaultValueInput) defaultValueInput.style.display = 'block';
-            if (defaultValueTextarea) defaultValueTextarea.style.display = 'none';
+            if (defaultContainer) defaultContainer.style.display = 'block';
+            if (inputContainer) inputContainer.style.display = 'block';
         }
     }
 
@@ -9201,139 +9267,87 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     // Replace the entire function with this version
 
     function addSubField() {
-        var index = subFields.length;
-        var html = 
-            '<div class="sub-field-group" id="sub_field_' + index + '">' +
-            '<button type="button" class="remove-sub-field" onclick="removeSubField(' + index + ')">×</button>' +
-            '<div class="form-group" style="margin-bottom:10px;">' +
-            '<label>Display Title</label>' +
-            '<input type="text" id="sub_title_' + index + '" placeholder="Enter display title..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '</div>' +
-            '<div class="form-group" style="margin-bottom:10px;">' +
-            '<label>Field Key</label>' +
-            '<input type="text" id="sub_key_' + index + '" placeholder="Enter field key..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '</div>' +
-            '<div class="form-group">' +
-            '<label>Element Type</label>' +
-            '<select id="sub_element_' + index + '" onchange="toggleSubDefaultValueInput(' + index + ')" style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<option value="input">Input</option>' +
-            '<option value="select">Select</option>' +
-            '<option value="multiple-selections">Multiple selections</option>' +
-            '<option value="textarea">Textarea</option>' +
-            '<option value="date-time-input">Date & Time</option>' +
-            '<option value="button">Button</option>' +
-            '<option value="copy_button_for_each_of">Copy Button For Each Sentence</option>' +
-            '</select>' +
-            '</div>' +
-            '<div class="form-group">' +
-            '<label>Saved Data Type</label>' +
-            '<select id="sub_data_type_' + index + '" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;">' +
-            '<option value="string" selected>String</option><option value="int">Integer</option><option value="json">JSON</option>' +
-            '</select></div>' +
-            '<div class="form-group" id="sub_default_value_container_' + index + '">' +
-            '<label>Default Value</label>' +
-            '<div id="sub_default_value_input_container_' + index + '">' +
-            '<input type="text" id="sub_default_value_' + index + '" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '</div>' +
-            '<div id="sub_default_value_textarea_container_' + index + '" style="display:none;">' +
-            '<textarea id="sub_default_value_textarea_' + index + '" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;"></textarea>' +
-            '</div>' +
-            '</div>' +
-            '<div class="form-group" id="sub_select_values_container_' + index + '" style="display:none;">' +
-            '<label>Select Options</label>' +
-            '<div style="display:flex; gap:8px;">' +
-            '<input type="text" id="sub_default_value_input_' + index + '" placeholder="Enter option..." style="flex:1; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<button type="button" class="btn btn-secondary" onclick="addSubDefaultValue(' + index + ')">Add</button>' +
-            '</div>' +
-            '<div id="sub_default_values_list_' + index + '" style="margin-top:8px;"></div>' +
-            '</div>' +
-            '<div class="form-group" id="sub_multiple_selection_container_' + index + '" style="display:none;">' +
-            '<label>Multiple selections values</label>' +
-            '<textarea id="sub_multiple_selection_text_' + index + '" rows="3" placeholder="I am value a, I am value b, I am value c..." style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"></textarea>' +
-            '<button type="button" class="btn btn-secondary" style="margin-top:8px;" onclick="addSubMultipleSelectionValues(' + index + ')">Add</button>' +
-            '<small style="display:block;color:#6b7280;margin-top:6px;">Separate values with commas. Without a comma, the entire text is added as one value.</small>' +
-            '<div id="sub_multiple_selection_values_list_' + index + '" style="margin-top:8px;"></div>' +
-            '</div>' +
-            '<div class="form-group" id="sub_url_container_' + index + '" style="display:none;">' +
-            '<label>Button URL (onclick value)</label>' +
-            '<div id="sub_url_input_container_' + index + '">' +
-            '<input type="url" id="sub_url_value_' + index + '" placeholder="Enter URL (e.g., https://example.com)..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
-            '<small style="color:#6b7280;">This URL will be opened in a new window/tab when the button is clicked.</small>' +
-            '</div>' +
-            '</div>' +
-            '</div>';
-        
-        subFields.push({ defaultValues: [], default_value: '', button_url: '' });
-        document.getElementById('sub_fields_list').insertAdjacentHTML('beforeend', html);
+        var index = nextSubFieldIndex++;
+        subFields[index] = { defaultValues: [], default_value: '', copy_button_for_each_of: {} };
+        var list = document.getElementById('sub_fields_list');
+        if (!list) return;
+        list.insertAdjacentHTML('beforeend', buildSubFieldEditorMarkup('', {
+            'field-title': '',
+            element_type: 'input',
+            data_type: 'string',
+            default_value: '',
+            default_values: [],
+            button_url: '',
+            separate_paragraphs: 'no',
+            copy_button_for_each_of: {}
+        }, index));
         renderSubFieldDefaultValues(index);
         toggleSubDefaultValueInput(index);
     }
 
-    // ===== UPDATE toggleSubDefaultValueInput FUNCTION =====
-    // Replace the entire function with this version
-
     function toggleSubDefaultValueInput(index) {
-        var elementTypeControl = document.getElementById('sub_element_' + index);
-        if (!elementTypeControl) return;
-        var elementType = elementTypeControl.value;
-        var defaultValueContainer = document.getElementById('sub_default_value_container_' + index);
-        var defaultValueInputContainer = document.getElementById('sub_default_value_input_container_' + index);
-        var defaultValueTextareaContainer = document.getElementById('sub_default_value_textarea_container_' + index);
-        var selectValuesContainer = document.getElementById('sub_select_values_container_' + index);
-        var multipleSelectionContainer = document.getElementById('sub_multiple_selection_container_' + index);
+        var elementControl = document.getElementById('sub_element_' + index);
+        if (!elementControl) return;
+        var elementType = elementControl.value;
+        var defaultContainer = document.getElementById('sub_default_value_container_' + index);
+        var inputContainer = document.getElementById('sub_default_value_input_container_' + index);
+        var textareaContainer = document.getElementById('sub_default_value_textarea_container_' + index);
+        var selectContainer = document.getElementById('sub_select_values_container_' + index);
+        var multipleContainer = document.getElementById('sub_multiple_selection_container_' + index);
         var urlContainer = document.getElementById('sub_url_container_' + index);
-        var dataTypeSelect = document.getElementById('sub_data_type_' + index);
+        var separateContainer = document.getElementById('sub_separate_paragraphs_container_' + index);
+        var copyContainer = document.getElementById('sub_copy_sentences_container_' + index);
+        var dataType = document.getElementById('sub_data_type_' + index);
 
-        // Hide optional controls first, then show only the control for this element type.
-        if (defaultValueContainer) defaultValueContainer.style.display = 'none';
-        if (selectValuesContainer) selectValuesContainer.style.display = 'none';
-        if (multipleSelectionContainer) multipleSelectionContainer.style.display = 'none';
-        if (urlContainer) urlContainer.style.display = 'none';
-        if (defaultValueInputContainer) defaultValueInputContainer.style.display = 'none';
-        if (defaultValueTextareaContainer) defaultValueTextareaContainer.style.display = 'none';
+        [defaultContainer, selectContainer, multipleContainer, urlContainer, separateContainer, copyContainer].forEach(function(node) {
+            if (node) node.style.display = 'none';
+        });
+        if (inputContainer) inputContainer.style.display = 'none';
+        if (textareaContainer) textareaContainer.style.display = 'none';
 
-        if (dataTypeSelect) {
+        if (dataType) {
             if (elementType === 'multiple-selections') {
-                if (!dataTypeSelect.dataset.previousType) {
-                    dataTypeSelect.dataset.previousType = dataTypeSelect.value || 'string';
-                }
-                dataTypeSelect.value = 'json';
-                dataTypeSelect.disabled = true;
+                if (!dataType.dataset.previousType) dataType.dataset.previousType = dataType.value || 'string';
+                dataType.value = 'json';
+                dataType.disabled = true;
             } else {
-                dataTypeSelect.disabled = false;
-                if (dataTypeSelect.dataset.previousType) {
-                    dataTypeSelect.value = dataTypeSelect.dataset.previousType;
-                    delete dataTypeSelect.dataset.previousType;
+                dataType.disabled = false;
+                if (dataType.dataset.previousType) {
+                    dataType.value = dataType.dataset.previousType;
+                    delete dataType.dataset.previousType;
                 }
             }
         }
 
-        if (elementType === 'multiple-selections') {
-            if (multipleSelectionContainer) multipleSelectionContainer.style.display = 'block';
-        } else if (elementType === 'select') {
-            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (selectValuesContainer) selectValuesContainer.style.display = 'block';
+        if (elementType === 'select') {
+            if (defaultContainer) defaultContainer.style.display = 'block';
+            if (inputContainer) inputContainer.style.display = 'block';
+            if (selectContainer) selectContainer.style.display = 'block';
+        } else if (elementType === 'multiple-selections') {
+            if (multipleContainer) multipleContainer.style.display = 'block';
         } else if (elementType === 'textarea') {
-            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (defaultValueTextareaContainer) defaultValueTextareaContainer.style.display = 'block';
+            if (defaultContainer) defaultContainer.style.display = 'block';
+            if (textareaContainer) textareaContainer.style.display = 'block';
+            if (separateContainer) separateContainer.style.display = 'block';
         } else if (elementType === 'button') {
             if (urlContainer) urlContainer.style.display = 'block';
+        } else if (elementType === 'copy_button_for_each_of') {
+            if (copyContainer) copyContainer.style.display = 'block';
         } else {
-            if (defaultValueContainer) defaultValueContainer.style.display = 'block';
-            if (defaultValueInputContainer) defaultValueInputContainer.style.display = 'block';
+            if (defaultContainer) defaultContainer.style.display = 'block';
+            if (inputContainer) inputContainer.style.display = 'block';
         }
     }
 
     function removeSubField(index) {
         var element = document.getElementById('sub_field_' + index);
-        if (element) {
-            element.remove();
-            subFields[index] = null;
-        }
+        if (element) element.remove();
+        if (Object.prototype.hasOwnProperty.call(subFields, index)) subFields[index] = null;
     }
 
     function addSubDefaultValue(index) {
         var input = document.getElementById('sub_default_value_input_' + index);
+        if (!input) return;
         var value = input.value.trim();
         if (value) {
             if (!subFields[index]) subFields[index] = { defaultValues: [], default_value: '' };
@@ -9354,6 +9368,8 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     }
 
     function renderSubFieldDefaultValues(index) {
+        if (!subFields[index]) subFields[index] = { defaultValues: [], default_value: '', copy_button_for_each_of: {} };
+        if (!Array.isArray(subFields[index].defaultValues)) subFields[index].defaultValues = [];
         var containers = [
             document.getElementById('sub_default_values_list_' + index),
             document.getElementById('sub_multiple_selection_values_list_' + index)
@@ -9486,143 +9502,174 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
     // ===== UPDATE updateDynamicField FUNCTION =====
     // Replace the entire function with this version
 
-    function updateDynamicField(oldKey) {
-        var title = document.getElementById('df_title').value.trim();
-        var key = document.getElementById('df_key').value.trim();
-        var category = document.getElementById('df_category').value;
-        
-        if (!title || !key) {
-            showDialog('Error', 'Please enter both title and key.');
-            return;
-        }
-        key = key.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-        
-        var fieldData = {};
-        if (category === 'individual') {
-            var elementType = document.getElementById('df_element_type').value;
+    function collectDynamicFieldEditorData() {
+        var titleControl = document.getElementById('df_title');
+        var keyControl = document.getElementById('df_key');
+        var categoryControl = document.getElementById('df_category');
+        if (!titleControl || !keyControl || !categoryControl) throw new Error('The Dynamic Content editor is not fully loaded.');
+
+        var title = titleControl.value.trim();
+        var key = keyControl.value.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+        if (!title || !key) throw new Error('Please enter both a display title and a valid field key.');
+        if (key.length > 191) throw new Error('Field keys must not exceed 191 characters.');
+
+        if (categoryControl.value === 'individual') {
+            var elementControl = document.getElementById('df_element_type');
+            if (!elementControl) throw new Error('Choose an element type before saving.');
+            var elementType = elementControl.value;
             var defaultValue = '';
             var buttonUrl = '';
-            
             if (elementType === 'textarea') {
-                defaultValue = document.getElementById('df_default_value_textarea').value.trim();
-            } else if (elementType === 'select' || elementType === 'multiple-selections') {
-                // Select and multiple-selections use configured option lists, not a scalar default value.
+                var textarea = document.getElementById('df_default_value_textarea');
+                defaultValue = textarea ? textarea.value : '';
             } else if (elementType === 'button') {
-                buttonUrl = document.getElementById('df_url_value').value.trim();
-                // ADD PROTOCOL IF MISSING
-                if (buttonUrl && !buttonUrl.match(/^https?:\/\//i)) {
-                    buttonUrl = 'https://' + buttonUrl;
-                }
-            } else {
-                defaultValue = document.getElementById('df_default_value').value.trim();
+                var url = document.getElementById('df_url_value');
+                buttonUrl = url ? url.value.trim() : '';
+                if (buttonUrl && !/^https?:\/\//i.test(buttonUrl)) buttonUrl = 'https://' + buttonUrl;
+            } else if (elementType !== 'select' && elementType !== 'multiple-selections' && elementType !== 'copy_button_for_each_of') {
+                var input = document.getElementById('df_default_value');
+                defaultValue = input ? input.value : '';
             }
-            
-            var defaultValues = window._dfDefaultValues || [];
-            var copySentenceMode = (document.getElementById('df_copy_sentence_mode') || {}).value || 'individually';
-            var additions = getCopySentenceInputs();
-            var remainingExisting = copySentenceMode === 'individually' ? getRemainingExistingCopySentences() : [];
-            // Bulk always replaces the complete saved list. Individual mode preserves
-            // existing sentences unless manually deleted, then appends newly entered ones.
-            var copySentenceRecord = elementType === 'copy_button_for_each_of'
-                ? mergeCopySentenceRecords(copySentenceMode === 'bulk' ? [] : remainingExisting, additions)
-                : {};
 
-            fieldData = {
+            var copyMode = (document.getElementById('df_copy_sentence_mode') || {}).value || 'individually';
+            var copyRecord = {};
+            if (elementType === 'copy_button_for_each_of') {
+                var additions = getCopySentenceInputs();
+                var existing = copyMode === 'individually' ? getRemainingExistingCopySentences() : [];
+                copyRecord = mergeCopySentenceRecords(copyMode === 'bulk' ? [] : existing, additions);
+            }
+            var paragraphControl = document.getElementById('df_separate_paragraphs');
+            return {
                 'field-title': title,
                 'field-name': key,
                 'field_type': 'individual',
                 'element_type': elementType,
                 'data_type': elementType === 'multiple-selections' ? 'json' : ((document.getElementById('df_data_type') || {}).value || 'string'),
                 'default_value': defaultValue,
-                'default_values': defaultValues,
+                'default_values': Array.isArray(window._dfDefaultValues) ? window._dfDefaultValues.slice() : [],
                 'button_url': buttonUrl,
-                'separate_paragraphs': (elementType === 'textarea' && document.getElementById('df_separate_paragraphs')) ? document.getElementById('df_separate_paragraphs').value : 'no',
-                'copy_button_mode': copySentenceMode,
-                'copy_button_for_each_of': copySentenceRecord
-            };
-        } else {
-            var subFieldData = {};
-            var subFieldElements = document.querySelectorAll('.sub-field-group');
-            subFieldElements.forEach(function(el, idx) {
-                var subTitle = document.getElementById('sub_title_' + idx);
-                var subKey = document.getElementById('sub_key_' + idx);
-                var subElement = document.getElementById('sub_element_' + idx);
-                if (subTitle && subKey && subElement) {
-                    var st = subTitle.value.trim();
-                    var sk = subKey.value.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-                    var se = subElement.value;
-                    var sdv = subFields[idx] ? subFields[idx].defaultValues || [] : [];
-                    var sDefaultValue = '';
-                    var sButtonUrl = '';
-                    
-                    if (se === 'textarea') {
-                        var textarea = document.getElementById('sub_default_value_textarea_' + idx);
-                        if (textarea) sDefaultValue = textarea.value.trim();
-                    } else if (se === 'button') {
-                        var urlInput = document.getElementById('sub_url_value_' + idx);
-                        if (urlInput) {
-                            sButtonUrl = urlInput.value.trim();
-                            // ADD PROTOCOL IF MISSING
-                            if (sButtonUrl && !sButtonUrl.match(/^https?:\/\//i)) {
-                                sButtonUrl = 'https://' + sButtonUrl;
-                            }
-                        }
-                    } else if (se !== 'select' && se !== 'multiple-selections') {
-                        var input = document.getElementById('sub_default_value_' + idx);
-                        if (input) sDefaultValue = input.value.trim();
-                    }
-                    
-                    if (st && sk) {
-                        subFieldData[sk] = {
-                            'field-title': st,
-                            'field-name': sk,
-                            'field_type': 'individual',
-                            'element_type': se,
-                            'data_type': se === 'multiple-selections' ? 'json' : ((document.getElementById('sub_data_type_' + idx) || {}).value || 'string'),
-                            'default_value': sDefaultValue,
-                            'default_values': sdv,
-                            'button_url': sButtonUrl
-                        };
-                    }
-                }
-            });
-            fieldData = {
-                'field-title': title,
-                'field-name': key,
-                'field_type': 'objects',
-                'fieldkeyvalue': subFieldData
+                'separate_paragraphs': elementType === 'textarea' && paragraphControl ? paragraphControl.value : 'no',
+                'copy_button_mode': copyMode,
+                'copy_button_for_each_of': copyRecord
             };
         }
-        
-        var finalKey = key;
-        var formData = new FormData();
-        formData.append('update_global_field', 'true');
-        formData.append('user_id', selectedUserId);
-        formData.append('old_key', oldKey);
-        formData.append('new_key', finalKey);
-        formData.append('field_data', JSON.stringify(fieldData));
-        
-        showDialog('Saving', 'Updating field...');
-        fetch(window.location.href, {
-            method: 'POST',
-            body: formData,
-            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
-            credentials: 'same-origin'
-        })
-        .then(function(response) { return response.json(); })
-        .then(async function(data) {
-            if (data.success) {
-                closeDialog();
-                await sceneIQRefreshAfterSave(data.state, data.message, { refreshProjectMarkup: true });
-            } else {
-                closeDialog();
-                showDialog('Error', data.message);
+
+        var subFieldData = {};
+        var groups = document.querySelectorAll('#sub_fields_list .sub-field-group');
+        groups.forEach(function(group) {
+            var index = Number(group.getAttribute('data-index'));
+            if (!Number.isFinite(index)) {
+                var match = String(group.id || '').match(/sub_field_(\d+)/);
+                index = match ? Number(match[1]) : -1;
             }
-        })
-        .catch(function(error) {
-            closeDialog();
-            showDialog('Error', 'Failed to update: ' + error.message);
+            if (index < 0) return;
+
+            var titleInput = document.getElementById('sub_title_' + index);
+            var keyInput = document.getElementById('sub_key_' + index);
+            var elementInput = document.getElementById('sub_element_' + index);
+            if (!titleInput || !keyInput || !elementInput) return;
+
+            var subTitle = titleInput.value.trim();
+            var subKey = keyInput.value.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            if (!subTitle || !subKey) throw new Error('Every sub-field needs both a display title and a valid field key.');
+            if (subKey.length > 191) throw new Error('Sub-field keys must not exceed 191 characters.');
+            if (Object.prototype.hasOwnProperty.call(subFieldData, subKey)) throw new Error('Duplicate sub-field key: ' + subKey);
+
+            var subElement = elementInput.value;
+            var subDefault = '';
+            var subUrl = '';
+            if (subElement === 'textarea') {
+                var subTextarea = document.getElementById('sub_default_value_textarea_' + index);
+                subDefault = subTextarea ? subTextarea.value : '';
+            } else if (subElement === 'button') {
+                var subUrlInput = document.getElementById('sub_url_value_' + index);
+                subUrl = subUrlInput ? subUrlInput.value.trim() : '';
+                if (subUrl && !/^https?:\/\//i.test(subUrl)) subUrl = 'https://' + subUrl;
+            } else if (subElement !== 'select' && subElement !== 'multiple-selections' && subElement !== 'copy_button_for_each_of') {
+                var subDefaultInput = document.getElementById('sub_default_value_' + index);
+                subDefault = subDefaultInput ? subDefaultInput.value : '';
+            }
+
+            var copyRecord = {};
+            if (subElement === 'copy_button_for_each_of') {
+                var copyText = document.getElementById('sub_copy_sentences_' + index);
+                var lines = copyText ? copyText.value.split(/\r?\n/).map(function(value) { return value.trim(); }).filter(Boolean) : [];
+                copyRecord = mergeCopySentenceRecords([], lines);
+            }
+            var paragraph = document.getElementById('sub_separate_paragraphs_' + index);
+            var subDefaults = subFields[index] && Array.isArray(subFields[index].defaultValues) ? subFields[index].defaultValues.slice() : [];
+            var subDataType = (document.getElementById('sub_data_type_' + index) || {}).value || 'string';
+
+            subFieldData[subKey] = {
+                'field-title': subTitle,
+                'field-name': subKey,
+                'field_type': 'individual',
+                'element_type': subElement,
+                'data_type': subElement === 'multiple-selections' ? 'json' : subDataType,
+                'default_value': subDefault,
+                'default_values': subDefaults,
+                'button_url': subUrl,
+                'separate_paragraphs': subElement === 'textarea' && paragraph ? paragraph.value : 'no',
+                'copy_button_for_each_of': copyRecord
+            };
         });
+
+        return {
+            'field-title': title,
+            'field-name': key,
+            'field_type': 'objects',
+            'fieldkeyvalue': subFieldData
+        };
+    }
+
+    async function persistDynamicFieldDefinition(action, fieldData, oldKey, addAnotherAfterSave) {
+        var formData = new FormData();
+        formData.append(action, 'true');
+        formData.append('user_id', String(selectedUserId));
+        formData.append('field_data', JSON.stringify(fieldData));
+        if (action === 'update_global_field') {
+            formData.append('old_key', String(oldKey || ''));
+            formData.append('new_key', String(fieldData['field-name'] || ''));
+        }
+
+        sceneIQBeginLoading('Saving Dynamic Content', 'Saving the field definition and refreshing the account configuration...');
+        try {
+            var response = await fetch(window.location.href.split('#')[0], {
+                method: 'POST',
+                body: formData,
+                headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
+                credentials: 'same-origin',
+                cache: 'no-store'
+            });
+            var data;
+            try { data = await response.json(); }
+            catch (parseError) { throw new Error('The server did not return a valid save response. Check the PHP error log.'); }
+            if (!response.ok || !data || data.success !== true) {
+                throw new Error((data && data.message) || 'The Dynamic Content field could not be saved.');
+            }
+
+            closeDialog();
+            await sceneIQRefreshAfterSave(data.state || null, data.message || 'Dynamic Content saved successfully.', { refreshProjectMarkup: true });
+            if (addAnotherAfterSave) addGlobalDynamicField();
+            return true;
+        } catch (error) {
+            console.error('SceneIQ Dynamic Content save failed:', error);
+            showDialog('Save failed', error.message || 'The Dynamic Content field could not be saved.');
+            return false;
+        } finally {
+            sceneIQEndLoading();
+        }
+    }
+
+    async function updateDynamicField(oldKey, addAnotherAfterSave) {
+        var fieldData;
+        try {
+            fieldData = collectDynamicFieldEditorData();
+        } catch (error) {
+            showDialog('Check field details', error.message);
+            return;
+        }
+        await persistDynamicFieldDefinition('update_global_field', fieldData, oldKey, !!addAnotherAfterSave);
     }
 
     function deleteGlobalDynamicField(key) {
@@ -9654,6 +9701,7 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
 
     function addGlobalDynamicField() {
         subFields = [];
+        nextSubFieldIndex = 0;
         window._dfDefaultValues = [];
         renderAddFieldDialog();
     }
@@ -9773,7 +9821,12 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
             '<input type="text" id="df_default_value" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;">' +
             '</div>' +
             '<div id="df_default_value_textarea_container" style="display:none;">' +
-            '<textarea id="df_default_value_textarea" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;"></textarea>' +
+            '<textarea id="df_default_value_textarea" oninput="toggleSeparateParagraphOption()" rows="3" placeholder="Enter default value..." style="width:100%; padding:10px; border:2px solid #e5e7eb; border-radius:8px;"></textarea>' +
+            '</div>' +
+            '<div class="form-group" id="df_separate_paragraphs_container" style="display:none;">' +
+            '<label>Separate paragraphs into individual display items?</label>' +
+            '<select id="df_separate_paragraphs" style="width:100%;padding:10px;border:2px solid #e5e7eb;border-radius:8px;"><option value="no" selected>No</option><option value="yes">Yes</option></select>' +
+            '<small style="color:#6b7280;">When enabled, each non-empty paragraph is displayed separately.</small>' +
             '</div>' +
             '</div>' +
                         '<div class="form-group" id="df_copy_sentences_container" style="display:none;border:1px solid #cbd5e1;border-radius:10px;padding:12px;background:#f8fafc;">' +
@@ -9822,141 +9875,15 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
         renderDefaultValuesList();
     }
 
-    function saveDynamicField() {
-        var title = document.getElementById('df_title').value.trim();
-        var key = document.getElementById('df_key').value.trim();
-        var category = document.getElementById('df_category').value;
-        
-        if (!title || !key) {
-            showDialog('Error', 'Please enter both title and key.');
+    async function saveDynamicField(addAnotherAfterSave) {
+        var fieldData;
+        try {
+            fieldData = collectDynamicFieldEditorData();
+        } catch (error) {
+            showDialog('Check field details', error.message);
             return;
         }
-        key = key.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-        
-        var fieldData = {};
-        if (category === 'individual') {
-            var elementType = document.getElementById('df_element_type').value;
-            var defaultValue = '';
-            var buttonUrl = '';
-            
-            if (elementType === 'textarea') {
-                defaultValue = document.getElementById('df_default_value_textarea').value.trim();
-            } else if (elementType === 'select' || elementType === 'multiple-selections') {
-                // Select and multiple-selections use configured option lists, not a scalar default value.
-            } else if (elementType === 'button') {
-                buttonUrl = document.getElementById('df_url_value').value.trim();
-                // ADD PROTOCOL IF MISSING
-                if (buttonUrl && !buttonUrl.match(/^https?:\/\//i)) {
-                    buttonUrl = 'https://' + buttonUrl;
-                }
-            } else {
-                defaultValue = document.getElementById('df_default_value').value.trim();
-            }
-            
-            var defaultValues = window._dfDefaultValues || [];
-            var copySentenceMode = (document.getElementById('df_copy_sentence_mode') || {}).value || 'individually';
-            var additions = getCopySentenceInputs();
-            var remainingExisting = copySentenceMode === 'individually' ? getRemainingExistingCopySentences() : [];
-            // Bulk always replaces the complete saved list. Individual mode preserves
-            // existing sentences unless manually deleted, then appends newly entered ones.
-            var copySentenceRecord = elementType === 'copy_button_for_each_of'
-                ? mergeCopySentenceRecords(copySentenceMode === 'bulk' ? [] : remainingExisting, additions)
-                : {};
-
-            
-            fieldData = {
-                'field-title': title,
-                'field-name': key,
-                'field_type': 'individual',
-                'element_type': elementType,
-                'data_type': elementType === 'multiple-selections' ? 'json' : ((document.getElementById('df_data_type') || {}).value || 'string'),
-                'default_value': defaultValue,
-                'default_values': defaultValues,
-                'button_url': buttonUrl,
-                'separate_paragraphs': (elementType === 'textarea' && document.getElementById('df_separate_paragraphs')) ? document.getElementById('df_separate_paragraphs').value : 'no',
-                'copy_button_mode': copySentenceMode,
-                'copy_button_for_each_of': copySentenceRecord
-            };
-        } else {
-            var subFieldData = {};
-            var subFieldElements = document.querySelectorAll('.sub-field-group');
-            subFieldElements.forEach(function(el, idx) {
-                var subTitle = document.getElementById('sub_title_' + idx);
-                var subKey = document.getElementById('sub_key_' + idx);
-                var subElement = document.getElementById('sub_element_' + idx);
-                if (subTitle && subKey && subElement) {
-                    var st = subTitle.value.trim();
-                    var sk = subKey.value.trim().toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-                    var se = subElement.value;
-                    var sdv = subFields[idx] ? subFields[idx].defaultValues || [] : [];
-                    var sDefaultValue = '';
-                    var sButtonUrl = '';
-                    
-                    if (se === 'textarea') {
-                        var textarea = document.getElementById('sub_default_value_textarea_' + idx);
-                        if (textarea) sDefaultValue = textarea.value.trim();
-                    } else if (se === 'button') {
-                        var urlInput = document.getElementById('sub_url_value_' + idx);
-                        if (urlInput) {
-                            sButtonUrl = urlInput.value.trim();
-                            // ADD PROTOCOL IF MISSING
-                            if (sButtonUrl && !sButtonUrl.match(/^https?:\/\//i)) {
-                                sButtonUrl = 'https://' + sButtonUrl;
-                            }
-                        }
-                    } else if (se !== 'select' && se !== 'multiple-selections') {
-                        var input = document.getElementById('sub_default_value_' + idx);
-                        if (input) sDefaultValue = input.value.trim();
-                    }
-                    
-                    if (st && sk) {
-                        subFieldData[sk] = {
-                            'field-title': st,
-                            'field-name': sk,
-                            'field_type': 'individual',
-                            'element_type': se,
-                            'data_type': se === 'multiple-selections' ? 'json' : ((document.getElementById('sub_data_type_' + idx) || {}).value || 'string'),
-                            'default_value': sDefaultValue,
-                            'default_values': sdv,
-                            'button_url': sButtonUrl
-                        };
-                    }
-                }
-            });
-            fieldData = {
-                'field-title': title,
-                'field-name': key,
-                'field_type': 'objects',
-                'fieldkeyvalue': subFieldData
-            };
-        }
-        
-        var formData = new FormData();
-        formData.append('save_global_single_field', 'true');
-        formData.append('user_id', selectedUserId);
-        formData.append('field_data', JSON.stringify(fieldData));
-        
-        showDialog('Saving', 'Saving field...');
-        fetch(window.location.href, {
-            method: 'POST',
-            body: formData,
-            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
-            credentials: 'same-origin'
-        })
-        .then(function(response) { return response.json(); })
-        .then(async function(data) {
-            if (data.success) {
-                closeDialog();
-                await sceneIQRefreshAfterSave(data.state, data.message, { refreshProjectMarkup: true });
-            } else {
-                closeDialog();
-                showDialog('Error', data.message);
-            }
-        })
-        .catch(function(error) {
-            closeDialog();
-            showDialog('Error', 'Failed to save: ' + error.message);
-        });
+        await persistDynamicFieldDefinition('save_global_single_field', fieldData, null, !!addAnotherAfterSave);
     }
 
     // ============================================================
@@ -12536,6 +12463,7 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
             'save_global_dynamic_fields','save_dynamic_tabs','save_submit_tabs',
             'delete_dynamic_tab','delete_global_dynamic_field','delete_account_dynamic_data'
         ].indexOf(action) !== -1;
+        sceneIQBeginLoading('Saving configuration', 'Applying your changes and refreshing the account workspace...');
         try {
             var formData = new FormData(form);
             if (submitter && submitter.name && !formData.has(submitter.name)) formData.append(submitter.name, submitter.value || '1');
@@ -12557,6 +12485,7 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
             console.error('SceneIQ background save failed:', error);
             showLiveSaveToast(error.message || 'The save failed.', true);
         } finally {
+            sceneIQEndLoading();
             delete form.dataset.sceneiqAjaxBusy;
             buttons.forEach(function (button, index) {
                 button.disabled = previous[index] ? previous[index].disabled : false;
@@ -12578,7 +12507,27 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
 
 })();
 </script>
-
+<script id="sceneiq-folder-loader-fallback">
+(function () {
+    'use strict';
+    window.addEventListener('load', function () {
+        window.setTimeout(function () {
+            if (document.body.classList.contains('sceneiq-folder-pending')) {
+                var title = document.getElementById('sceneiq-loading-title');
+                var detail = document.getElementById('sceneiq-loading-detail');
+                if (title) title.textContent = 'Workspace is taking longer than expected';
+                if (detail) detail.textContent = 'The page is still waiting for its workspace controls. Refresh the page if this message remains.';
+                // Keep the loader visible while startup is genuinely pending.
+                // Hiding it here previously exposed an empty workspace and made
+                // a slow configuration load look like a failed/blank page.
+                document.body.classList.add('sceneiq-folder-pending');
+                var loader = document.getElementById('sceneiq-loading-indicator');
+                if (loader) loader.style.display = 'flex';
+            }
+        }, 12000);
+    }, { once: true });
+})();
+</script>
 
 <script id="sceneiq-account-copy-controller">
 (function () {
@@ -12766,13 +12715,20 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
         data.append('sceneiq_copy_csrf_token', csrfToken);
         var response;
         var result;
+        if (typeof window.sceneIQBeginLoading === 'function') {
+            window.sceneIQBeginLoading('Copying Dynamic Content', 'Copying the selected field and refreshing the account data...');
+        }
         try {
             response = await fetch(window.location.href.split('#')[0], { method: 'POST', body: data, credentials: 'same-origin', cache: 'no-store', headers: {'X-Requested-With':'XMLHttpRequest','X-SceneIQ-Request':'save'} });
             result = await response.json();
             if (!response.ok || !result || result.success !== true) throw new Error((result && result.message) || 'The field could not be copied.');
             if (typeof window.sceneIQRefreshAfterSave === 'function') await window.sceneIQRefreshAfterSave(result.state, result.message);
             else notify('Field copied', result.message);
-        } catch (error) { notify('Copy failed', error.message || 'The field could not be copied.'); }
+        } catch (error) {
+            notify('Copy failed', error.message || 'The field could not be copied.');
+        } finally {
+            if (typeof window.sceneIQEndLoading === 'function') window.sceneIQEndLoading();
+        }
     }
 
     modeButtons.forEach(function (button) {
