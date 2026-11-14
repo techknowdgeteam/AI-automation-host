@@ -6052,8 +6052,6 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
                             </div>
                             
                             <div id="dash_tab_all_pending" class="dashboard-content <?php echo ($dashboardView === 'all_pending') ? 'active' : ''; ?>">
-                                <h3 style="margin:4px 0 6px;color:#1a1a2e;">All Users — Pending</h3>
-                                <p style="color:#6b7280;margin:0 0 14px;">Every pending project record from every account.</p>
                                 <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
                                     <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllGlobalStatusEntries('pending', this)">📋 Copy All Pending Data</button>
                                 </div>
@@ -6061,8 +6059,6 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
                             </div>
 
                             <div id="dash_tab_all_completed" class="dashboard-content <?php echo ($dashboardView === 'all_completed') ? 'active' : ''; ?>">
-                                <h3 style="margin:4px 0 6px;color:#1a1a2e;">All Users — Completed</h3>
-                                <p style="color:#6b7280;margin:0 0 14px;">Every completed project record from every account.</p>
                                 <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
                                     <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllGlobalStatusEntries('completed', this)">📋 Copy All Completed Data</button>
                                 </div>
@@ -6070,8 +6066,6 @@ window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
                             </div>
 
                             <div id="dash_tab_all_aborted" class="dashboard-content <?php echo ($dashboardView === 'all_aborted') ? 'active' : ''; ?>">
-                                <h3 style="margin:4px 0 6px;color:#1a1a2e;">All Users — Aborted</h3>
-                                <p style="color:#6b7280;margin:0 0 14px;">Every aborted project record from every account.</p>
                                 <div class="status-copy-toolbar" style="display:flex;justify-content:flex-end;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:14px;">
                                     <button type="button" class="btn btn-secondary btn-sm" onclick="copyAllGlobalStatusEntries('aborted', this)">📋 Copy All Aborted Data</button>
                                 </div>
