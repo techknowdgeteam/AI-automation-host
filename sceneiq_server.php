@@ -1,6 +1,10 @@
 <?php
     // sceneiq_server.php - Server Admin Interface for SceneIQ
     session_start();
+    // SceneIQ uses a single-page folder workspace. Do not let the browser briefly
+    // display a cached copy of an older stylesheet or older page markup.
+    header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+    header('Pragma: no-cache');
     if (empty($_SESSION['password_csrf_token'])) {
         $_SESSION['password_csrf_token'] = bin2hex(random_bytes(32));
     }
@@ -10,10 +14,30 @@
     if (empty($_SESSION['entry_upload_csrf_token'])) {
         $_SESSION['entry_upload_csrf_token'] = bin2hex(random_bytes(32));
     }
+    if (empty($_SESSION['sceneiq_storage_recovery_csrf_token'])) {
+        $_SESSION['sceneiq_storage_recovery_csrf_token'] = bin2hex(random_bytes(32));
+    }
+    if (empty($_SESSION['sceneiq_copy_csrf_token'])) {
+        $_SESSION['sceneiq_copy_csrf_token'] = bin2hex(random_bytes(32));
+    }
 
-    // Enable error reporting for debugging
+    // Log PHP errors. If a fatal error still occurs during page rendering, show a
+    // small diagnostic banner instead of leaving a partially-rendered, dead page.
     error_reporting(E_ALL);
-    ini_set('display_errors', 1);
+    ini_set('display_errors', 0);
+    register_shutdown_function(function () {
+        $lastError = error_get_last();
+        if (!$lastError || !in_array($lastError['type'], [E_ERROR, E_PARSE, E_CORE_ERROR, E_COMPILE_ERROR, E_USER_ERROR], true)) {
+            return;
+        }
+        error_log('SceneIQ fatal error: ' . ($lastError['message'] ?? 'Unknown fatal') .
+            ' in ' . ($lastError['file'] ?? 'unknown file') . ':' . ($lastError['line'] ?? 0));
+        if (($_SERVER['REQUEST_METHOD'] ?? 'GET') === 'GET') {
+            echo '<div style="position:fixed;z-index:2147483647;left:12px;right:12px;bottom:12px;padding:14px 16px;border:1px solid #fca5a5;border-radius:10px;background:#fff1f2;color:#991b1b;font:14px/1.5 Segoe UI,Arial,sans-serif;box-shadow:0 8px 30px rgba(0,0,0,.2)">';
+            echo '<strong>SceneIQ could not finish loading.</strong> A server-side PHP error stopped this page. Check the hosting PHP error log for the exact file and line. Your existing account data has not been deleted.';
+            echo '</div>';
+        }
+    });
 
     // Database configuration
     $host = 'sql201.infinityfree.com';
@@ -52,254 +76,703 @@
     }
 
     function deleteUser($pdo, $userId) {
-        $stmt = $pdo->prepare("DELETE FROM users WHERE id = :id");
-        return $stmt->execute([':id' => $userId]);
-    }
-
-    function getGlobalConfig($pdo) {
-        $stmt = $pdo->prepare("SELECT id, settings, dynamic_fields FROM sceneiq_config WHERE user_id = 0 ORDER BY id DESC LIMIT 1");
-        $stmt->execute();
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-
-    function getUserConfig($pdo, $userId) {
-        $stmt = $pdo->prepare("SELECT id, settings, dynamic_fields, dynamic_tabs FROM sceneiq_config WHERE user_id = :user_id ORDER BY id DESC LIMIT 1");
-        $stmt->execute([':user_id' => $userId]);
-        return $stmt->fetch(PDO::FETCH_ASSOC);
-    }
-
-    function saveGlobalConfig($pdo, $settings, $dynamicFields) {
-        $config = getGlobalConfig($pdo);
-        
-        if ($config) {
-            $stmt = $pdo->prepare("UPDATE sceneiq_config SET settings = :settings, dynamic_fields = :dynamic_fields WHERE id = :id");
-            return $stmt->execute([
-                ':settings' => json_encode($settings),
-                ':dynamic_fields' => json_encode($dynamicFields),
-                ':id' => $config['id']
-            ]);
-        } else {
-            $stmt = $pdo->prepare("INSERT INTO sceneiq_config (user_id, settings, dynamic_fields) VALUES (0, :settings, :dynamic_fields)");
-            return $stmt->execute([
-                ':settings' => json_encode($settings),
-                ':dynamic_fields' => json_encode($dynamicFields)
-            ]);
-        }
-    }
-
-    // JSON configuration is stored in LONGTEXT columns and written in small UTF-8-safe
-    // pieces. This avoids sending a huge SQL parameter in one request and prevents
-    // MySQL TEXT (64 KB) column-size errors when settings contain large entries.
-    function ensureSceneIQJsonColumnsLongText($pdo) {
-        static $checked = false;
-        if ($checked) return;
-
-        $requiredColumns = ['settings', 'dynamic_fields', 'dynamic_tabs'];
-        $columnRows = $pdo->query("SHOW COLUMNS FROM `sceneiq_config`")->fetchAll(PDO::FETCH_ASSOC);
-        $columnMap = [];
-        foreach ($columnRows as $row) {
-            if (isset($row['Field'])) {
-                $columnMap[strtolower($row['Field'])] = $row;
-            }
-        }
-
-        foreach ($requiredColumns as $columnName) {
-            if (!isset($columnMap[$columnName])) {
-                throw new RuntimeException('The sceneiq_config.' . $columnName . ' column could not be found.');
-            }
-
-            $currentType = strtolower((string)($columnMap[$columnName]['Type'] ?? ''));
-            if (strpos($currentType, 'longtext') !== false) {
-                continue;
-            }
-
-            $nullability = strtoupper((string)($columnMap[$columnName]['Null'] ?? 'YES')) === 'NO'
-                ? 'NOT NULL'
-                : 'NULL';
-
-            // Column names come only from the fixed whitelist above.
-            $pdo->exec('ALTER TABLE `sceneiq_config` MODIFY COLUMN `' . $columnName . '` LONGTEXT ' . $nullability);
-        }
-
-        $checked = true;
-    }
-
-    // Return a UTF-8-safe byte chunk. Chunks are concatenated by MySQL, so no JSON
-    // parsing occurs until the complete value has been written.
-    function getUtf8SafeJsonChunk($value, $offset, $maxBytes) {
-        $totalLength = strlen($value);
-        if ($offset >= $totalLength) return '';
-
-        $chunk = substr($value, $offset, min($maxBytes, $totalLength - $offset));
-        while ($chunk !== '' && preg_match('//u', $chunk) !== 1) {
-            $chunk = substr($chunk, 0, -1);
-        }
-
-        if ($chunk === '') {
-            throw new RuntimeException('Unable to split the saved JSON into valid UTF-8 chunks.');
-        }
-        return $chunk;
-    }
-
-    function appendJsonColumnRemainder($pdo, $rowId, $columnName, $jsonValue, $offset, $chunkBytes) {
-        $statement = $pdo->prepare(
-            'UPDATE `sceneiq_config` SET `' . $columnName . '` = CONCAT(COALESCE(`' . $columnName . '`, \'\'), :chunk) WHERE id = :id'
-        );
-
-        $totalLength = strlen($jsonValue);
-        while ($offset < $totalLength) {
-            $chunk = getUtf8SafeJsonChunk($jsonValue, $offset, $chunkBytes);
-            $statement->execute([
-                ':chunk' => $chunk,
-                ':id' => $rowId
-            ]);
-            $offset += strlen($chunk);
-        }
-    }
-
-    function encodeSceneIQJson($value, $label) {
+        $pdo->beginTransaction();
         try {
-            return json_encode(
-                $value,
-                JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR
-            );
-        } catch (JsonException $e) {
-            throw new RuntimeException('Could not encode ' . $label . ' as JSON: ' . $e->getMessage(), 0, $e);
-        }
-    }
-
-function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs = null) {
-        $userId = (int)$userId;
-
-        if ($userId <= 0) {
-            throw new InvalidArgumentException('A valid account is required to save configuration.');
-        }
-
-        if (!is_array($settings)) {
-            $settings = [];
-        }
-        if (!is_array($dynamicFields)) {
-            $dynamicFields = [];
-        }
-        if ($dynamicTabs === null || !is_array($dynamicTabs)) {
-            $dynamicTabs = [];
-        }
-
-        // Preserve the existing submit-tab defaults.
-        foreach ($dynamicTabs as &$tab) {
-            if (is_array($tab) && !isset($tab['submit_tab'])) {
-                $tab['submit_tab'] = true;
-            }
-        }
-        unset($tab);
-
-        // Keep the existing columns as LONGTEXT. MariaDB may retain their
-        // JSON_VALID CHECK constraints, so each SQL write below sends a
-        // COMPLETE valid JSON document rather than an incomplete fragment.
-        ensureSceneIQJsonColumnsLongText($pdo);
-
-        $jsonColumns = [
-            'settings' => encodeSceneIQJson($settings, 'settings'),
-            'dynamic_fields' => encodeSceneIQJson($dynamicFields, 'dynamic fields'),
-            'dynamic_tabs' => encodeSceneIQJson($dynamicTabs, 'dynamic tabs')
-        ];
-
-        // Validate each complete document in PHP before sending it to MariaDB.
-        foreach ($jsonColumns as $columnName => $jsonValue) {
-            json_decode($jsonValue);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                throw new RuntimeException(
-                    'The complete ' . $columnName . ' JSON is invalid: ' . json_last_error_msg()
-                );
-            }
-        }
-
-        // A single prepared statement must fit within MariaDB's max_allowed_packet.
-        // The browser upload remains chunked; only the final database write is whole.
-        try {
-            $maxAllowedPacket = (int)$pdo->query('SELECT @@max_allowed_packet')->fetchColumn();
-        } catch (Throwable $packetError) {
-            $maxAllowedPacket = 0; // Let MariaDB report the packet error if the variable is unavailable.
-        }
-
-        $payloadBytes =
-            strlen($jsonColumns['settings']) +
-            strlen($jsonColumns['dynamic_fields']) +
-            strlen($jsonColumns['dynamic_tabs']) +
-            8192; // SQL and protocol overhead allowance.
-
-        if ($maxAllowedPacket > 0 && $payloadBytes > $maxAllowedPacket) {
-            $payloadMb = number_format($payloadBytes / 1048576, 2);
-            $limitMb = number_format($maxAllowedPacket / 1048576, 2);
-
-            throw new RuntimeException(
-                'The complete configuration is approximately ' . $payloadMb .
-                ' MB, but this database connection allows about ' . $limitMb .
-                ' MB per SQL packet. The browser upload completed, but the database packet limit must be increased or the entry storage must be moved to a separate chunk table.'
-            );
-        }
-
-        $config = getUserConfig($pdo, $userId);
-        $ownsTransaction = !$pdo->inTransaction();
-
-        try {
-            if ($ownsTransaction) {
-                $pdo->beginTransaction();
-            }
-
-            if ($config) {
-                $statement = $pdo->prepare(
-                    'UPDATE `sceneiq_config`
-                     SET `settings` = :settings,
-                         `dynamic_fields` = :dynamic_fields,
-                         `dynamic_tabs` = :dynamic_tabs
-                     WHERE `id` = :id'
-                );
-
-                $statement->bindValue(':settings', $jsonColumns['settings'], PDO::PARAM_STR);
-                $statement->bindValue(':dynamic_fields', $jsonColumns['dynamic_fields'], PDO::PARAM_STR);
-                $statement->bindValue(':dynamic_tabs', $jsonColumns['dynamic_tabs'], PDO::PARAM_STR);
-                $statement->bindValue(':id', (int)$config['id'], PDO::PARAM_INT);
-                $statement->execute();
-
-                if ($statement->rowCount() === 0) {
-                    // rowCount() may be zero when the exact same values already exist.
-                    $check = $pdo->prepare('SELECT `id` FROM `sceneiq_config` WHERE `id` = :id LIMIT 1');
-                    $check->execute([':id' => (int)$config['id']]);
-                    if (!$check->fetchColumn()) {
-                        throw new RuntimeException('The existing account configuration row could not be found.');
-                    }
-                }
-            } else {
-                $statement = $pdo->prepare(
-                    'INSERT INTO `sceneiq_config`
-                        (`user_id`, `settings`, `dynamic_fields`, `dynamic_tabs`)
-                     VALUES
-                        (:user_id, :settings, :dynamic_fields, :dynamic_tabs)'
-                );
-
-                $statement->bindValue(':user_id', $userId, PDO::PARAM_INT);
-                $statement->bindValue(':settings', $jsonColumns['settings'], PDO::PARAM_STR);
-                $statement->bindValue(':dynamic_fields', $jsonColumns['dynamic_fields'], PDO::PARAM_STR);
-                $statement->bindValue(':dynamic_tabs', $jsonColumns['dynamic_tabs'], PDO::PARAM_STR);
-                $statement->execute();
-            }
-
-            // MariaDB's existing JSON_VALID CHECK constraints validate the
-            // complete values during this one UPDATE/INSERT.
-            if ($ownsTransaction) {
-                $pdo->commit();
-            }
-
-            return true;
-
+            sceneiqDeleteUserTableData($pdo, (int)$userId);
+            $stmt = $pdo->prepare("DELETE FROM users WHERE id = :id");
+            $ok = $stmt->execute([':id' => $userId]);
+            $pdo->commit();
+            return $ok;
         } catch (Throwable $e) {
-            if ($ownsTransaction && $pdo->inTransaction()) {
-                $pdo->rollBack();
-            }
+            if ($pdo->inTransaction()) $pdo->rollBack();
             throw $e;
         }
     }
+
+    /**
+     * SceneIQ relational storage layer.
+     * JSON is used only for flexible field properties and individual project payloads;
+     * each account field, tab and project is a separate database row.
+     */
+    function sceneiqEnsureTableStorageSchema(PDO $pdo) {
+        $ddl = [];
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_dynamic_fields` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `field_key` VARCHAR(191) NOT NULL,
+            `field_title` VARCHAR(255) NOT NULL DEFAULT '',
+            `field_type` VARCHAR(32) NOT NULL DEFAULT 'individual',
+            `element_type` VARCHAR(64) NOT NULL DEFAULT 'input',
+            `data_type` VARCHAR(32) NOT NULL DEFAULT 'string',
+            `default_value` LONGTEXT NULL,
+            `default_values_json` LONGTEXT NULL,
+            `button_url` TEXT NULL,
+            `separate_paragraphs` VARCHAR(32) NOT NULL DEFAULT 'no',
+            `copy_button_for_each_of_json` LONGTEXT NULL,
+            `definition_json` LONGTEXT NOT NULL,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` DATETIME NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_field_user_key` (`user_id`, `field_key`),
+            KEY `idx_sceneiq_fields_user_active` (`user_id`, `deleted_at`, `sort_order`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_dynamic_field_subfields` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `field_id` BIGINT UNSIGNED NOT NULL,
+            `subfield_key` VARCHAR(191) NOT NULL,
+            `field_title` VARCHAR(255) NOT NULL DEFAULT '',
+            `element_type` VARCHAR(64) NOT NULL DEFAULT 'input',
+            `data_type` VARCHAR(32) NOT NULL DEFAULT 'string',
+            `default_value` LONGTEXT NULL,
+            `default_values_json` LONGTEXT NULL,
+            `button_url` TEXT NULL,
+            `separate_paragraphs` VARCHAR(32) NOT NULL DEFAULT 'no',
+            `copy_button_for_each_of_json` LONGTEXT NULL,
+            `definition_json` LONGTEXT NOT NULL,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` DATETIME NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_subfield_key` (`field_id`, `subfield_key`),
+            KEY `idx_sceneiq_subfields_user_field` (`user_id`, `field_id`, `deleted_at`),
+            CONSTRAINT `fk_sceneiq_subfield_field` FOREIGN KEY (`field_id`) REFERENCES `sceneiq_dynamic_fields` (`id`) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_dynamic_tabs` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `parent_tab_id` BIGINT UNSIGNED NULL,
+            `tab_key` VARCHAR(191) NOT NULL,
+            `tab_name` VARCHAR(255) NOT NULL DEFAULT '',
+            `submit_tab` TINYINT(1) NOT NULL DEFAULT 1,
+            `sub_tabs_mode` VARCHAR(32) NOT NULL DEFAULT 'none',
+            `additional_features_json` LONGTEXT NULL,
+            `tab_config_json` LONGTEXT NOT NULL,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` DATETIME NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_tab_user_key` (`user_id`, `tab_key`),
+            KEY `idx_sceneiq_tabs_parent` (`user_id`, `parent_tab_id`, `deleted_at`, `sort_order`),
+            CONSTRAINT `fk_sceneiq_tab_parent` FOREIGN KEY (`parent_tab_id`) REFERENCES `sceneiq_dynamic_tabs` (`id`) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_dynamic_tab_fields` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `tab_id` BIGINT UNSIGNED NOT NULL,
+            `field_id` BIGINT UNSIGNED NULL,
+            `field_key` VARCHAR(191) NOT NULL,
+            `sort_order` INT NOT NULL DEFAULT 0,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_tab_field` (`tab_id`, `field_key`),
+            KEY `idx_sceneiq_tab_fields_user` (`user_id`, `tab_id`, `sort_order`),
+            KEY `idx_sceneiq_tab_fields_field` (`field_id`),
+            CONSTRAINT `fk_sceneiq_tab_field_tab` FOREIGN KEY (`tab_id`) REFERENCES `sceneiq_dynamic_tabs` (`id`) ON DELETE CASCADE,
+            CONSTRAINT `fk_sceneiq_tab_field_definition` FOREIGN KEY (`field_id`) REFERENCES `sceneiq_dynamic_fields` (`id`) ON DELETE SET NULL
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_project_entries` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `status` ENUM('pending','completed','aborted') NOT NULL DEFAULT 'pending',
+            `entry_data_json` LONGTEXT NOT NULL,
+            `operation_status` LONGTEXT NULL,
+            `display_order` INT NOT NULL DEFAULT 0,
+            `version` INT UNSIGNED NOT NULL DEFAULT 1,
+            `legacy_config_id` BIGINT NULL,
+            `legacy_entry_index` INT NULL,
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `updated_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            `deleted_at` DATETIME NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_legacy_entry` (`user_id`, `legacy_config_id`, `legacy_entry_index`),
+            KEY `idx_sceneiq_projects_user_status` (`user_id`, `status`, `deleted_at`, `display_order`),
+            KEY `idx_sceneiq_projects_updated` (`user_id`, `updated_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_project_status_history` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `project_entry_id` BIGINT UNSIGNED NOT NULL,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `previous_status` VARCHAR(20) NOT NULL,
+            `new_status` VARCHAR(20) NOT NULL,
+            `changed_by` VARCHAR(191) NULL,
+            `changed_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            KEY `idx_sceneiq_status_history_entry` (`project_entry_id`, `changed_at`),
+            KEY `idx_sceneiq_status_history_user` (`user_id`, `changed_at`),
+            CONSTRAINT `fk_sceneiq_status_history_entry` FOREIGN KEY (`project_entry_id`) REFERENCES `sceneiq_project_entries` (`id`) ON DELETE CASCADE
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_data_revisions` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `entity_type` VARCHAR(40) NOT NULL,
+            `entity_id` BIGINT UNSIGNED NOT NULL,
+            `revision_no` INT UNSIGNED NOT NULL,
+            `record_json` LONGTEXT NOT NULL,
+            `change_reason` VARCHAR(191) NOT NULL DEFAULT 'update',
+            `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_revision` (`entity_type`, `entity_id`, `revision_no`),
+            KEY `idx_sceneiq_revisions_user` (`user_id`, `entity_type`, `created_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        $ddl[] = "CREATE TABLE IF NOT EXISTS `sceneiq_table_migration_log` (
+            `id` BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            `user_id` BIGINT UNSIGNED NOT NULL,
+            `legacy_config_id` BIGINT NOT NULL,
+            `migration_status` VARCHAR(24) NOT NULL DEFAULT 'started',
+            `fields_migrated` INT UNSIGNED NOT NULL DEFAULT 0,
+            `tabs_migrated` INT UNSIGNED NOT NULL DEFAULT 0,
+            `projects_migrated` INT UNSIGNED NOT NULL DEFAULT 0,
+            `message` LONGTEXT NULL,
+            `started_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            `completed_at` DATETIME NULL,
+            PRIMARY KEY (`id`),
+            UNIQUE KEY `uq_sceneiq_migration_user_config` (`user_id`,`legacy_config_id`),
+            KEY `idx_sceneiq_migration_status` (`migration_status`,`started_at`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        foreach ($ddl as $sql) $pdo->exec($sql);
+    }
+
+    function sceneiqEncodeTableJson($value) {
+        return json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE | JSON_THROW_ON_ERROR);
+    }
+
+    function sceneiqDecodeTableJson($value, $fallback = []) {
+        if (is_array($value)) return $value;
+        if (!is_string($value) || trim($value) === '') return $fallback;
+        try {
+            $decoded = json_decode($value, true, 512, JSON_THROW_ON_ERROR);
+            return is_array($decoded) ? $decoded : $fallback;
+        } catch (Throwable $e) {
+            throw new RuntimeException('A table-based SceneIQ JSON record is invalid: ' . $e->getMessage(), 0, $e);
+        }
+    }
+
+    function sceneiqCreateRevision(PDO $pdo, $userId, $entityType, $entityId, $recordJson, $reason = 'update') {
+        if (!is_string($recordJson) || $recordJson === '') return;
+        $next = $pdo->prepare('SELECT COALESCE(MAX(`revision_no`),0)+1 FROM `sceneiq_data_revisions` WHERE `entity_type`=:type AND `entity_id`=:id');
+        $next->execute([':type' => $entityType, ':id' => (int)$entityId]);
+        $revisionNo = (int)$next->fetchColumn();
+        $insert = $pdo->prepare('INSERT INTO `sceneiq_data_revisions` (`user_id`,`entity_type`,`entity_id`,`revision_no`,`record_json`,`change_reason`) VALUES (:user_id,:type,:id,:revision,:record,:reason)');
+        $insert->execute([':user_id'=>(int)$userId, ':type'=>$entityType, ':id'=>(int)$entityId, ':revision'=>$revisionNo, ':record'=>$recordJson, ':reason'=>(string)$reason]);
+    }
+
+    function sceneiqGetDynamicFields(PDO $pdo, $userId) {
+        $stmt = $pdo->prepare('SELECT `id`,`field_key`,`definition_json`,`sort_order` FROM `sceneiq_dynamic_fields` WHERE `user_id`=:user_id AND `deleted_at` IS NULL ORDER BY `sort_order`,`id`');
+        $stmt->execute([':user_id'=>(int)$userId]);
+        $fields = [];
+        $sub = $pdo->prepare('SELECT `subfield_key`,`definition_json` FROM `sceneiq_dynamic_field_subfields` WHERE `field_id`=:field_id AND `deleted_at` IS NULL ORDER BY `sort_order`,`id`');
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            try { $definition = sceneiqDecodeTableJson($row['definition_json'], []); }
+            catch (Throwable $e) { error_log('SceneIQ invalid field definition ' . (int)$row['id'] . ': ' . $e->getMessage()); continue; }
+            $sub->execute([':field_id'=>(int)$row['id']]);
+            $subfields = [];
+            foreach ($sub->fetchAll(PDO::FETCH_ASSOC) as $subRow) {
+                $subfields[$subRow['subfield_key']] = sceneiqDecodeTableJson($subRow['definition_json'], []);
+            }
+            if (($definition['field_type'] ?? 'individual') === 'objects') $definition['fieldkeyvalue'] = $subfields;
+            $fields[$row['field_key']] = $definition;
+        }
+        return $fields;
+    }
+
+    function sceneiqGetDynamicTabs(PDO $pdo, $userId) {
+        $stmt = $pdo->prepare('SELECT * FROM `sceneiq_dynamic_tabs` WHERE `user_id`=:user_id AND `deleted_at` IS NULL ORDER BY `sort_order`,`id`');
+        $stmt->execute([':user_id'=>(int)$userId]);
+        $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        if (!$rows) return [];
+        $mapping = $pdo->prepare('SELECT `field_key` FROM `sceneiq_dynamic_tab_fields` WHERE `tab_id`=:tab_id ORDER BY `sort_order`,`id`');
+        $nodes = []; $children = [];
+        foreach ($rows as $row) {
+            $id = (int)$row['id'];
+            $data = sceneiqDecodeTableJson($row['tab_config_json'], []);
+            unset($data['sub_tabs'], $data['dynamic_fields_display']);
+            $mapping->execute([':tab_id'=>$id]);
+            $displayFields = array_map(function($v) { return $v['field_key']; }, $mapping->fetchAll(PDO::FETCH_ASSOC));
+            $data['tab_name'] = (string)$row['tab_name'];
+            $data['submit_tab'] = (bool)$row['submit_tab'];
+            $data['sub_tabs_mode'] = (string)$row['sub_tabs_mode'];
+            $data['dynamic_fields_display'] = $displayFields;
+            $data['sub_tabs'] = [];
+            $data['_table_id'] = $id;
+            $data['_tab_key'] = (string)$row['tab_key'];
+            $nodes[$id] = $data;
+            $parentId = $row['parent_tab_id'] === null ? 0 : (int)$row['parent_tab_id'];
+            $children[$parentId][] = $id;
+        }
+        $build = function($id) use (&$build, &$nodes, &$children) {
+            $node = $nodes[$id];
+            $node['sub_tabs'] = [];
+            foreach (($children[$id] ?? []) as $childId) $node['sub_tabs'][] = $build($childId);
+            return $node;
+        };
+        $result = [];
+        foreach (($children[0] ?? []) as $rootId) $result[] = $build($rootId);
+        return $result;
+    }
+
+    function sceneiqGetProjectEntries(PDO $pdo, $userId) {
+        $stmt = $pdo->prepare('SELECT `id`,`status`,`entry_data_json`,`operation_status`,`display_order` FROM `sceneiq_project_entries` WHERE `user_id`=:user_id AND `deleted_at` IS NULL ORDER BY `display_order`,`id`');
+        $stmt->execute([':user_id'=>(int)$userId]);
+        $entries = [];
+        foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            try { $entry = sceneiqDecodeTableJson($row['entry_data_json'], []); }
+            catch (Throwable $e) { error_log('SceneIQ invalid project entry ' . (int)$row['id'] . ': ' . $e->getMessage()); continue; }
+            if (!is_array($entry)) continue;
+            $entry['status'] = (string)$row['status'];
+            $entry['operation_status'] = $row['operation_status'] ?? ($entry['operation_status'] ?? '');
+            $entry['_db_id'] = (int)$row['id'];
+            $entry['_index'] = (int)$row['id'];
+            $entry['_position'] = (int)$row['display_order'];
+            $entries[] = $entry;
+        }
+        return $entries;
+    }
+
+    function getUserConfig($pdo, $userId) {
+        $userId = (int)$userId;
+        return [
+            'id' => $userId,
+            'user_id' => $userId,
+            'settings' => sceneiqEncodeTableJson(sceneiqGetProjectEntries($pdo, $userId)),
+            'dynamic_fields' => sceneiqEncodeTableJson(sceneiqGetDynamicFields($pdo, $userId)),
+            'dynamic_tabs' => sceneiqEncodeTableJson(sceneiqGetDynamicTabs($pdo, $userId))
+        ];
+    }
+
+    /** Return the latest relational records after an AJAX save without reloading the page. */
+    function sceneiqBuildLiveState(PDO $pdo, $userId) {
+        $userId = (int)$userId;
+        if ($userId <= 0) {
+            return ['userId' => 0, 'userSettings' => [], 'dynamicFields' => new stdClass(), 'dynamicTabs' => []];
+        }
+        $config = getUserConfig($pdo, $userId);
+        if (!$config) {
+            return ['userId' => $userId, 'userSettings' => [], 'dynamicFields' => new stdClass(), 'dynamicTabs' => []];
+        }
+        return [
+            'userId' => $userId,
+            'userSettings' => repairSettings(sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', [])),
+            'dynamicFields' => normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]'),
+            'dynamicTabs' => normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]')
+        ];
+    }
+
+    function sceneiqSaveProjectEntriesTable(PDO $pdo, $userId, array $entries) {
+        $userId = (int)$userId;
+        $existingStmt = $pdo->prepare('SELECT `id`,`entry_data_json`,`status`,`display_order` FROM `sceneiq_project_entries` WHERE `user_id`=:user_id AND `deleted_at` IS NULL ORDER BY `display_order`,`id` FOR UPDATE');
+        $existingStmt->execute([':user_id'=>$userId]);
+        $existingRows = $existingStmt->fetchAll(PDO::FETCH_ASSOC);
+        $existingById = []; foreach ($existingRows as $r) $existingById[(int)$r['id']] = $r;
+        $existingByPosition = []; foreach ($existingRows as $r) $existingByPosition[(int)$r['display_order']] = $r;
+        $used = []; $update = $pdo->prepare('UPDATE `sceneiq_project_entries` SET `status`=:status,`entry_data_json`=:data,`operation_status`=:operation_status,`display_order`=:position,`version`=`version`+1,`deleted_at`=NULL WHERE `id`=:id AND `user_id`=:user_id');
+        $insert = $pdo->prepare('INSERT INTO `sceneiq_project_entries` (`user_id`,`status`,`entry_data_json`,`operation_status`,`display_order`) VALUES (:user_id,:status,:data,:operation_status,:position)');
+        foreach (array_values($entries) as $position => $entry) {
+            if (!is_array($entry)) continue;
+            $entryId = (int)($entry['_db_id'] ?? 0);
+            if ($entryId <= 0 && isset($existingByPosition[$position])) $entryId = (int)$existingByPosition[$position]['id'];
+            $status = strtolower(trim((string)($entry['status'] ?? 'pending')));
+            if (!in_array($status, ['pending','completed','aborted'], true)) $status = 'pending';
+            $operationStatus = isset($entry['operation_status']) && is_scalar($entry['operation_status']) ? (string)$entry['operation_status'] : '';
+            $storedEntry = $entry;
+            unset($storedEntry['_db_id'], $storedEntry['_index'], $storedEntry['_position']);
+            $storedEntry['status'] = $status;
+            $storedEntry['operation_status'] = $operationStatus;
+            $json = sceneiqEncodeTableJson($storedEntry);
+            if ($entryId > 0 && isset($existingById[$entryId])) {
+                $old = $existingById[$entryId];
+                $oldJson = (string)$old['entry_data_json'];
+                $contentChanged = !hash_equals(hash('sha256',$oldJson), hash('sha256',$json)) || $old['status'] !== $status;
+                $positionChanged = (int)$old['display_order'] !== (int)$position;
+                if ($contentChanged) {
+                    sceneiqCreateRevision($pdo, $userId, 'project_entry', $entryId, $oldJson, 'project entry update');
+                    if ($old['status'] !== $status) {
+                        $history = $pdo->prepare('INSERT INTO `sceneiq_project_status_history` (`project_entry_id`,`user_id`,`previous_status`,`new_status`,`changed_by`) VALUES (:entry,:user,:old,:new,:by)');
+                        $history->execute([':entry'=>$entryId,':user'=>$userId,':old'=>$old['status'],':new'=>$status,':by'=>'admin']);
+                    }
+                }
+                if ($contentChanged || $positionChanged) {
+                    $update->execute([':status'=>$status,':data'=>$json,':operation_status'=>$operationStatus,':position'=>$position,':id'=>$entryId,':user_id'=>$userId]);
+                }
+                $used[$entryId] = true;
+            } else {
+                $insert->execute([':user_id'=>$userId,':status'=>$status,':data'=>$json,':operation_status'=>$operationStatus,':position'=>$position]);
+                $used[(int)$pdo->lastInsertId()] = true;
+            }
+        }
+        $softDelete = $pdo->prepare('UPDATE `sceneiq_project_entries` SET `deleted_at`=NOW() WHERE `id`=:id AND `user_id`=:user_id AND `deleted_at` IS NULL');
+        foreach ($existingRows as $row) {
+            $id = (int)$row['id'];
+            if (!isset($used[$id])) {
+                sceneiqCreateRevision($pdo, $userId, 'project_entry', $id, (string)$row['entry_data_json'], 'project entry removed');
+                $softDelete->execute([':id'=>$id,':user_id'=>$userId]);
+            }
+        }
+    }
+
+    function sceneiqSaveDynamicFieldsTable(PDO $pdo, $userId, array $fields) {
+        $userId = (int)$userId;
+        $existingStmt = $pdo->prepare('SELECT `id`,`field_key`,`definition_json` FROM `sceneiq_dynamic_fields` WHERE `user_id`=:user_id');
+        $existingStmt->execute([':user_id'=>$userId]);
+        $existing = []; foreach ($existingStmt->fetchAll(PDO::FETCH_ASSOC) as $r) $existing[$r['field_key']] = $r;
+        $active = [];
+        $position = 0;
+        foreach ($fields as $fieldKey => $definition) {
+            $position++;
+            if (!is_array($definition)) $definition = ['field-title'=>(string)$fieldKey,'default_value'=>(string)$definition];
+            $fieldKey = (string)$fieldKey;
+            if ($fieldKey === '') continue;
+            if (strlen($fieldKey) > 191) throw new InvalidArgumentException('Dynamic Content field keys must not exceed 191 bytes: ' . substr($fieldKey,0,80));
+            $definition['field-title'] = (string)($definition['field-title'] ?? $fieldKey);
+            $definition['field_type'] = in_array(($definition['field_type'] ?? 'individual'), ['object','objects'], true) ? 'objects' : 'individual';
+            $definition['element_type'] = (string)($definition['element_type'] ?? 'input');
+            $definition['data_type'] = (string)($definition['data_type'] ?? 'string');
+            $subFields = is_array($definition['fieldkeyvalue'] ?? null) ? $definition['fieldkeyvalue'] : [];
+            $json = sceneiqEncodeTableJson($definition);
+            $defaults = sceneiqEncodeTableJson(is_array($definition['default_values'] ?? null) ? $definition['default_values'] : []);
+            $copyOf = sceneiqEncodeTableJson(is_array($definition['copy_button_for_each_of'] ?? null) ? $definition['copy_button_for_each_of'] : []);
+            if (isset($existing[$fieldKey])) {
+                $id = (int)$existing[$fieldKey]['id'];
+                if (!hash_equals(hash('sha256',(string)$existing[$fieldKey]['definition_json']), hash('sha256',$json))) sceneiqCreateRevision($pdo,$userId,'dynamic_field',$id,(string)$existing[$fieldKey]['definition_json'],'dynamic field update');
+                $stmt = $pdo->prepare('UPDATE `sceneiq_dynamic_fields` SET `field_title`=:title,`field_type`=:type,`element_type`=:element,`data_type`=:dtype,`default_value`=:default_value,`default_values_json`=:defaults,`button_url`=:url,`separate_paragraphs`=:paragraphs,`copy_button_for_each_of_json`=:copyof,`definition_json`=:definition,`sort_order`=:position,`deleted_at`=NULL WHERE `id`=:id AND `user_id`=:user_id');
+                $stmt->execute([':title'=>$definition['field-title'],':type'=>$definition['field_type'],':element'=>$definition['element_type'],':dtype'=>$definition['data_type'],':default_value'=>isset($definition['default_value'])?(string)$definition['default_value']:'',':defaults'=>$defaults,':url'=>(string)($definition['button_url']??''),':paragraphs'=>(string)($definition['separate_paragraphs']??'no'),':copyof'=>$copyOf,':definition'=>$json,':position'=>$position,':id'=>$id,':user_id'=>$userId]);
+            } else {
+                $stmt = $pdo->prepare('INSERT INTO `sceneiq_dynamic_fields` (`user_id`,`field_key`,`field_title`,`field_type`,`element_type`,`data_type`,`default_value`,`default_values_json`,`button_url`,`separate_paragraphs`,`copy_button_for_each_of_json`,`definition_json`,`sort_order`) VALUES (:user_id,:key,:title,:type,:element,:dtype,:default_value,:defaults,:url,:paragraphs,:copyof,:definition,:position)');
+                $stmt->execute([':user_id'=>$userId,':key'=>$fieldKey,':title'=>$definition['field-title'],':type'=>$definition['field_type'],':element'=>$definition['element_type'],':dtype'=>$definition['data_type'],':default_value'=>isset($definition['default_value'])?(string)$definition['default_value']:'',':defaults'=>$defaults,':url'=>(string)($definition['button_url']??''),':paragraphs'=>(string)($definition['separate_paragraphs']??'no'),':copyof'=>$copyOf,':definition'=>$json,':position'=>$position]);
+                $id = (int)$pdo->lastInsertId();
+            }
+            $active[$fieldKey] = $id;
+            $existingSubStmt = $pdo->prepare('SELECT `id`,`subfield_key`,`definition_json` FROM `sceneiq_dynamic_field_subfields` WHERE `field_id`=:field_id');
+            $existingSubStmt->execute([':field_id'=>$id]);
+            $existingSubs = []; foreach ($existingSubStmt->fetchAll(PDO::FETCH_ASSOC) as $r) $existingSubs[$r['subfield_key']] = $r;
+            $subPosition = 0; $activeSubKeys = [];
+            foreach ($subFields as $subKey => $subDefinition) {
+                $subPosition++; $subKey = (string)$subKey;
+                if (strlen($subKey) > 191) throw new InvalidArgumentException('Dynamic Content subfield keys must not exceed 191 bytes: ' . substr($subKey,0,80));
+                if (!is_array($subDefinition)) $subDefinition = ['field-title'=>$subKey,'default_value'=>(string)$subDefinition];
+                $subDefinition['field-title'] = (string)($subDefinition['field-title'] ?? $subKey);
+                $subDefinition['element_type'] = (string)($subDefinition['element_type'] ?? 'input');
+                $subDefinition['data_type'] = (string)($subDefinition['data_type'] ?? 'string');
+                $subJson = sceneiqEncodeTableJson($subDefinition);
+                $subDefaults = sceneiqEncodeTableJson(is_array($subDefinition['default_values'] ?? null) ? $subDefinition['default_values'] : []);
+                if (isset($existingSubs[$subKey])) {
+                    $subId = (int)$existingSubs[$subKey]['id'];
+                    if (!hash_equals(hash('sha256',(string)$existingSubs[$subKey]['definition_json']),hash('sha256',$subJson))) sceneiqCreateRevision($pdo,$userId,'dynamic_subfield',$subId,(string)$existingSubs[$subKey]['definition_json'],'dynamic subfield update');
+                    $subCopyOf = sceneiqEncodeTableJson(is_array($subDefinition['copy_button_for_each_of'] ?? null) ? $subDefinition['copy_button_for_each_of'] : []);
+                    $subUpdate = $pdo->prepare('UPDATE `sceneiq_dynamic_field_subfields` SET `field_title`=:title,`element_type`=:element,`data_type`=:dtype,`default_value`=:default_value,`default_values_json`=:defaults,`button_url`=:url,`separate_paragraphs`=:paragraphs,`copy_button_for_each_of_json`=:copyof,`definition_json`=:definition,`sort_order`=:position,`deleted_at`=NULL WHERE `id`=:id');
+                    $subUpdate->execute([':title'=>$subDefinition['field-title'],':element'=>$subDefinition['element_type'],':dtype'=>$subDefinition['data_type'],':default_value'=>(string)($subDefinition['default_value']??''),':defaults'=>$subDefaults,':url'=>(string)($subDefinition['button_url']??''),':paragraphs'=>(string)($subDefinition['separate_paragraphs']??'no'),':copyof'=>$subCopyOf,':definition'=>$subJson,':position'=>$subPosition,':id'=>$subId]);
+                } else {
+                    $subCopyOf = sceneiqEncodeTableJson(is_array($subDefinition['copy_button_for_each_of'] ?? null) ? $subDefinition['copy_button_for_each_of'] : []);
+                    $subInsert = $pdo->prepare('INSERT INTO `sceneiq_dynamic_field_subfields` (`user_id`,`field_id`,`subfield_key`,`field_title`,`element_type`,`data_type`,`default_value`,`default_values_json`,`button_url`,`separate_paragraphs`,`copy_button_for_each_of_json`,`definition_json`,`sort_order`) VALUES (:user_id,:field_id,:key,:title,:element,:dtype,:default_value,:defaults,:url,:paragraphs,:copyof,:definition,:position)');
+                    $subInsert->execute([':user_id'=>$userId,':field_id'=>$id,':key'=>$subKey,':title'=>$subDefinition['field-title'],':element'=>$subDefinition['element_type'],':dtype'=>$subDefinition['data_type'],':default_value'=>(string)($subDefinition['default_value']??''),':defaults'=>$subDefaults,':url'=>(string)($subDefinition['button_url']??''),':paragraphs'=>(string)($subDefinition['separate_paragraphs']??'no'),':copyof'=>$subCopyOf,':definition'=>$subJson,':position'=>$subPosition]);
+                }
+                $activeSubKeys[$subKey] = true;
+            }
+            foreach ($existingSubs as $subKey => $subRow) {
+                if (!isset($activeSubKeys[$subKey])) {
+                    sceneiqCreateRevision($pdo,$userId,'dynamic_subfield',(int)$subRow['id'],(string)$subRow['definition_json'],'dynamic subfield removed');
+                    $pdo->prepare('UPDATE `sceneiq_dynamic_field_subfields` SET `deleted_at`=NOW() WHERE `id`=:id')->execute([':id'=>(int)$subRow['id']]);
+                }
+            }
+        }
+        foreach ($existing as $fieldKey => $row) {
+            if (!isset($active[$fieldKey])) {
+                sceneiqCreateRevision($pdo,$userId,'dynamic_field',(int)$row['id'],(string)$row['definition_json'],'dynamic field removed');
+                $pdo->prepare('UPDATE `sceneiq_dynamic_fields` SET `deleted_at`=NOW() WHERE `id`=:id AND `user_id`=:user_id')->execute([':id'=>(int)$row['id'],':user_id'=>$userId]);
+            }
+        }
+    }
+
+    function sceneiqSaveDynamicTabsTable(PDO $pdo, $userId, array $tabs) {
+        $userId = (int)$userId;
+        $existingStmt = $pdo->prepare('SELECT `id`,`tab_key`,`tab_config_json` FROM `sceneiq_dynamic_tabs` WHERE `user_id`=:user_id');
+        $existingStmt->execute([':user_id'=>$userId]);
+        $existingById = []; $existingByKey = [];
+        foreach ($existingStmt->fetchAll(PDO::FETCH_ASSOC) as $row) { $existingById[(int)$row['id']]=$row; $existingByKey[$row['tab_key']]=$row; }
+        $retained = [];
+        $saveOne = function(array &$tab, $parentId, $parentKey, $position) use (&$saveOne,$pdo,$userId,&$existingById,&$existingByKey,&$retained) {
+            $name = (string)($tab['tab_name'] ?? ('Tab '.$position));
+            $tabKey = (string)($tab['_tab_key'] ?? 'tab_' . substr(hash('sha256',$userId.'|'.$parentKey.'|'.$name.'|'.$position),0,48));
+            $id = (int)($tab['_table_id'] ?? 0);
+            if ($id <= 0 || !isset($existingById[$id])) {
+                $id = isset($existingByKey[$tabKey]) ? (int)$existingByKey[$tabKey]['id'] : 0;
+            }
+            $submit = array_key_exists('submit_tab',$tab) ? (!empty($tab['submit_tab'])?1:0) : 1;
+            $mode = (string)($tab['sub_tabs_mode'] ?? (!empty($tab['sub_tabs'])?'add':'none'));
+            $additional = is_array($tab['additional_features'] ?? null) ? sceneiqEncodeTableJson($tab['additional_features']) : null;
+            $config = $tab;
+            unset($config['sub_tabs'],$config['dynamic_fields_display'],$config['_table_id'],$config['_tab_key'],$config['_expanded']);
+            $configJson = sceneiqEncodeTableJson($config);
+            if ($id > 0 && isset($existingById[$id])) {
+                if (!hash_equals(hash('sha256',(string)$existingById[$id]['tab_config_json']),hash('sha256',$configJson))) sceneiqCreateRevision($pdo,$userId,'dynamic_tab',$id,(string)$existingById[$id]['tab_config_json'],'dynamic tab update');
+                $stmt = $pdo->prepare('UPDATE `sceneiq_dynamic_tabs` SET `parent_tab_id`=:parent,`tab_key`=:tab_key,`tab_name`=:name,`submit_tab`=:submit,`sub_tabs_mode`=:mode,`additional_features_json`=:additional,`tab_config_json`=:config,`sort_order`=:position,`deleted_at`=NULL WHERE `id`=:id AND `user_id`=:user_id');
+                $stmt->execute([':parent'=>$parentId,':tab_key'=>$tabKey,':name'=>$name,':submit'=>$submit,':mode'=>$mode,':additional'=>$additional,':config'=>$configJson,':position'=>$position,':id'=>$id,':user_id'=>$userId]);
+            } else {
+                $stmt = $pdo->prepare('INSERT INTO `sceneiq_dynamic_tabs` (`user_id`,`parent_tab_id`,`tab_key`,`tab_name`,`submit_tab`,`sub_tabs_mode`,`additional_features_json`,`tab_config_json`,`sort_order`) VALUES (:user_id,:parent,:tab_key,:name,:submit,:mode,:additional,:config,:position)');
+                $stmt->execute([':user_id'=>$userId,':parent'=>$parentId,':tab_key'=>$tabKey,':name'=>$name,':submit'=>$submit,':mode'=>$mode,':additional'=>$additional,':config'=>$configJson,':position'=>$position]);
+                $id = (int)$pdo->lastInsertId();
+            }
+            $retained[$id] = true;
+            $mapDelete = $pdo->prepare('DELETE FROM `sceneiq_dynamic_tab_fields` WHERE `tab_id`=:tab_id');
+            $mapDelete->execute([':tab_id'=>$id]);
+            $fieldLookup = $pdo->prepare('SELECT `id` FROM `sceneiq_dynamic_fields` WHERE `user_id`=:user_id AND `field_key`=:field_key AND `deleted_at` IS NULL LIMIT 1');
+            $mapInsert = $pdo->prepare('INSERT INTO `sceneiq_dynamic_tab_fields` (`user_id`,`tab_id`,`field_id`,`field_key`,`sort_order`) VALUES (:user_id,:tab_id,:field_id,:field_key,:sort_order)');
+            $seenKeys = [];
+            foreach (array_values(is_array($tab['dynamic_fields_display'] ?? null) ? $tab['dynamic_fields_display'] : []) as $fieldPosition=>$fieldKey) {
+                $fieldKey = (string)$fieldKey;
+                if ($fieldKey === '' || isset($seenKeys[$fieldKey])) continue;
+                $seenKeys[$fieldKey] = true;
+                $fieldLookup->execute([':user_id'=>$userId,':field_key'=>$fieldKey]);
+                $mappedFieldId = $fieldLookup->fetchColumn();
+                $mapInsert->execute([':user_id'=>$userId,':tab_id'=>$id,':field_id'=>($mappedFieldId === false ? null : (int)$mappedFieldId),':field_key'=>$fieldKey,':sort_order'=>$fieldPosition]);
+            }
+            $tab['_table_id'] = $id; $tab['_tab_key'] = $tabKey;
+            $children = is_array($tab['sub_tabs'] ?? null) ? $tab['sub_tabs'] : [];
+            foreach (array_values($children) as $childPosition=>&$child) {
+                if (is_array($child)) $saveOne($child,$id,$tabKey,$childPosition+1);
+            }
+            unset($child);
+        };
+        foreach (array_values($tabs) as $position=>$tab) {
+            if (is_array($tabs[$position])) $saveOne($tabs[$position],null,'root',$position+1);
+        }
+        $softDelete = $pdo->prepare('UPDATE `sceneiq_dynamic_tabs` SET `deleted_at`=NOW() WHERE `id`=:id AND `user_id`=:user_id');
+        foreach ($existingById as $id=>$row) if (!isset($retained[$id])) $softDelete->execute([':id'=>$id,':user_id'=>$userId]);
+    }
+
+    function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs = null) {
+        $userId = (int)$userId;
+        if ($userId <= 0) throw new InvalidArgumentException('A valid account is required to save configuration.');
+        $settings = repairSettings(sceneiqDecodeConfigColumn($settings, 'settings', []));
+        $dynamicFields = normalizeDynamicFieldDefinitions($dynamicFields);
+        $dynamicTabs = normalizeDynamicTabs($dynamicTabs ?? []);
+        $current = getUserConfig($pdo, $userId);
+        $currentSettings = repairSettings(sceneiqDecodeConfigColumn($current['settings'], 'settings', []));
+        $currentFields = normalizeDynamicFieldDefinitions($current['dynamic_fields']);
+        $currentTabs = normalizeDynamicTabs($current['dynamic_tabs']);
+        $ownsTransaction = !$pdo->inTransaction();
+        try {
+            if ($ownsTransaction) $pdo->beginTransaction();
+            if (sceneiqEncodeTableJson($settings) !== sceneiqEncodeTableJson($currentSettings)) sceneiqSaveProjectEntriesTable($pdo,$userId,$settings);
+            if (sceneiqEncodeTableJson($dynamicFields) !== sceneiqEncodeTableJson($currentFields)) sceneiqSaveDynamicFieldsTable($pdo,$userId,$dynamicFields);
+            if (sceneiqEncodeTableJson($dynamicTabs) !== sceneiqEncodeTableJson($currentTabs)) sceneiqSaveDynamicTabsTable($pdo,$userId,$dynamicTabs);
+            if ($ownsTransaction) $pdo->commit();
+            return true;
+        } catch (Throwable $e) {
+            if ($ownsTransaction && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
+        }
+    }
+
+    function sceneiqFindProjectEntryIndex(array $entries, $entryId) {
+        foreach ($entries as $i=>$entry) if (is_array($entry) && (int)($entry['_db_id'] ?? 0) === (int)$entryId) return $i;
+        return -1;
+    }
+
+    function sceneiqCopyTableData(PDO $pdo, $sourceUserId, $targetUserId, array $columns) {
+        $source = getUserConfig($pdo,$sourceUserId); $target = getUserConfig($pdo,$targetUserId);
+        if (!$source || !$target) throw new RuntimeException('Source or destination account data could not be loaded.');
+        $settings = sceneiqDecodeConfigColumn($target['settings'],'settings',[]);
+        $fields = in_array('dynamic_fields',$columns,true) ? normalizeDynamicFieldDefinitions($source['dynamic_fields']) : normalizeDynamicFieldDefinitions($target['dynamic_fields']);
+        $tabs = in_array('dynamic_tabs',$columns,true) ? normalizeDynamicTabs($source['dynamic_tabs']) : normalizeDynamicTabs($target['dynamic_tabs']);
+        return saveUserConfig($pdo,$targetUserId,$settings,$fields,$tabs);
+    }
+
+    /** Stable identity for a tab, including support for older tabs without _tab_key. */
+    function sceneiqCopyTabIdentity(array $tab, $path) {
+        $key = trim((string)($tab['_tab_key'] ?? ''));
+        return $key !== '' ? $key : '__legacy_' . hash('sha256', (string)$path . '|' . (string)($tab['tab_name'] ?? ''));
+    }
+
+    /** Flatten source tabs for the copy picker while preserving their hierarchy in labels. */
+    function sceneiqFlattenCopyTabs(array $tabs, $parentPath = '', $path = 'root') {
+        $result = [];
+        $position = 0;
+        foreach ($tabs as $tab) {
+            if (!is_array($tab)) continue;
+            $position++;
+            $tabPath = $path . '.' . $position;
+            $identity = sceneiqCopyTabIdentity($tab, $tabPath);
+            $name = trim((string)($tab['tab_name'] ?? ('Tab ' . $position)));
+            $label = $parentPath === '' ? $name : $parentPath . '  ›  ' . $name;
+            $result[] = ['key' => $identity, 'name' => $name, 'label' => $label];
+            $children = is_array($tab['sub_tabs'] ?? null) ? $tab['sub_tabs'] : [];
+            if ($children) {
+                $result = array_merge($result, sceneiqFlattenCopyTabs($children, $label, $tabPath));
+            }
+        }
+        return $result;
+    }
+
+    /**
+     * Merge only checked tabs. Unchecked destination tabs survive. A selected
+     * source tab with the same stable key replaces that destination tab in full.
+     * Selected descendants can be copied even where their source parent is not
+     * checked; in that case a lightweight parent container is created if needed.
+     */
+    function sceneiqMergeSelectedTabs(array $targetTabs, array $sourceTabs, array $selectedKeys, $path = 'root') {
+        $result = array_values(array_filter($targetTabs, 'is_array'));
+        $targetIndexByKey = [];
+        foreach ($result as $index => $targetTab) {
+            $targetPath = $path . '.' . ($index + 1);
+            $targetIndexByKey[sceneiqCopyTabIdentity($targetTab, $targetPath)] = $index;
+        }
+
+        $sourcePosition = 0;
+        foreach ($sourceTabs as $sourceTab) {
+            if (!is_array($sourceTab)) continue;
+            $sourcePosition++;
+            $sourcePath = $path . '.' . $sourcePosition;
+            $identity = sceneiqCopyTabIdentity($sourceTab, $sourcePath);
+            $targetIndex = array_key_exists($identity, $targetIndexByKey) ? $targetIndexByKey[$identity] : null;
+            $targetNode = ($targetIndex !== null) ? $result[$targetIndex] : null;
+            $targetChildren = (is_array($targetNode) && is_array($targetNode['sub_tabs'] ?? null)) ? $targetNode['sub_tabs'] : [];
+            $sourceChildren = is_array($sourceTab['sub_tabs'] ?? null) ? $sourceTab['sub_tabs'] : [];
+            $mergedChildren = sceneiqMergeSelectedTabs($targetChildren, $sourceChildren, $selectedKeys, $sourcePath);
+            $isSelected = isset($selectedKeys[$identity]);
+
+            if ($isSelected) {
+                // Replace the complete tab configuration, but do not discard
+                // destination-only children that the operator did not select.
+                $replacement = $sourceTab;
+                $replacement['sub_tabs'] = $mergedChildren;
+                if ($targetIndex !== null) {
+                    $result[$targetIndex] = $replacement;
+                } else {
+                    $targetIndexByKey[$identity] = count($result);
+                    $result[] = $replacement;
+                }
+            } elseif ($mergedChildren) {
+                if ($targetIndex !== null) {
+                    $result[$targetIndex]['sub_tabs'] = $mergedChildren;
+                } else {
+                    // A child was selected without its parent. Preserve only
+                    // enough parent structure to keep that copied child nested.
+                    $container = [
+                        'tab_name' => (string)($sourceTab['tab_name'] ?? 'Tab'),
+                        'sub_tabs_mode' => 'add',
+                        'dynamic_fields_display' => [],
+                        'sub_tabs' => $mergedChildren
+                    ];
+                    if (!empty($sourceTab['_tab_key'])) $container['_tab_key'] = $sourceTab['_tab_key'];
+                    $targetIndexByKey[$identity] = count($result);
+                    $result[] = $container;
+                }
+            }
+        }
+        return array_values($result);
+    }
+
+    /** Copy a selected subset of Dynamic Content definitions, replacing matching keys only. */
+    function sceneiqMergeSelectedFields(array $targetFields, array $sourceFields, array $selectedKeys) {
+        foreach ($selectedKeys as $fieldKey => $enabled) {
+            if (is_int($fieldKey)) {
+                $fieldKey = (string)$enabled;
+                $enabled = true;
+            }
+            $fieldKey = (string)$fieldKey;
+            if (!$enabled || !array_key_exists($fieldKey, $sourceFields)) continue;
+            // The entire definition is copied, including object subfields and all
+            // element settings. Same key = complete replacement; new key = append.
+            $targetFields[$fieldKey] = $sourceFields[$fieldKey];
+        }
+        return $targetFields;
+    }
+
+    /** Merge selected source data into one destination account without touching projects. */
+    function sceneiqCopySelectedDataToAccount(PDO $pdo, $sourceUserId, $targetUserId, array $selectedTabKeys, array $selectedFieldKeys, $copyTabs, $copyFields, ?array $sourceConfig = null) {
+        $sourceUserId = (int)$sourceUserId;
+        $targetUserId = (int)$targetUserId;
+        if ($sourceUserId <= 0 || $targetUserId <= 0 || $sourceUserId === $targetUserId) {
+            throw new InvalidArgumentException('Choose different valid source and destination accounts.');
+        }
+        if ($sourceConfig === null) $sourceConfig = getUserConfig($pdo, $sourceUserId);
+        $targetConfig = getUserConfig($pdo, $targetUserId);
+        if (!$sourceConfig || !$targetConfig) throw new RuntimeException('Source or destination account data could not be loaded.');
+
+        $sourceFields = normalizeDynamicFieldDefinitions($sourceConfig['dynamic_fields'] ?? '[]');
+        $targetFields = normalizeDynamicFieldDefinitions($targetConfig['dynamic_fields'] ?? '[]');
+        $sourceTabs = normalizeDynamicTabs($sourceConfig['dynamic_tabs'] ?? '[]');
+        $targetTabs = normalizeDynamicTabs($targetConfig['dynamic_tabs'] ?? '[]');
+        $settings = repairSettings(sceneiqDecodeConfigColumn($targetConfig['settings'] ?? '[]', 'settings', []));
+
+        $mergedFields = $copyFields
+            ? sceneiqMergeSelectedFields($targetFields, $sourceFields, $selectedFieldKeys)
+            : $targetFields;
+
+        if ($copyTabs) {
+            $selectedTabSet = [];
+            foreach ($selectedTabKeys as $tabKey) {
+                $tabKey = (string)$tabKey;
+                if ($tabKey !== '') $selectedTabSet[$tabKey] = true;
+            }
+            $mergedTabs = sceneiqMergeSelectedTabs($targetTabs, $sourceTabs, $selectedTabSet);
+        } else {
+            $mergedTabs = $targetTabs;
+        }
+
+        return saveUserConfig($pdo, $targetUserId, $settings, $mergedFields, $mergedTabs);
+    }
+
+    /**
+     * Copy selected items to multiple destinations atomically. If any destination
+     * fails, the transaction rolls back for every destination in this operation.
+     */
+    function sceneiqCopySelectedDataToAccounts(PDO $pdo, $sourceUserId, array $targetUserIds, array $selectedTabKeys, array $selectedFieldKeys, $copyTabs, $copyFields) {
+        $sourceUserId = (int)$sourceUserId;
+        $sourceConfig = getUserConfig($pdo, $sourceUserId);
+        if (!$sourceConfig) throw new RuntimeException('The source account data could not be loaded.');
+        $targets = [];
+        foreach ($targetUserIds as $targetId) {
+            $targetId = (int)$targetId;
+            if ($targetId > 0 && $targetId !== $sourceUserId) $targets[$targetId] = $targetId;
+        }
+        if (!$targets) throw new InvalidArgumentException('Select at least one destination account.');
+
+        $ownsTransaction = !$pdo->inTransaction();
+        try {
+            if ($ownsTransaction) $pdo->beginTransaction();
+            foreach ($targets as $targetId) {
+                if (!getUserById($pdo, $targetId)) throw new RuntimeException('A selected destination account no longer exists.');
+                sceneiqCopySelectedDataToAccount(
+                    $pdo, $sourceUserId, $targetId, $selectedTabKeys, $selectedFieldKeys,
+                    (bool)$copyTabs, (bool)$copyFields, $sourceConfig
+                );
+            }
+            if ($ownsTransaction) $pdo->commit();
+        } catch (Throwable $e) {
+            if ($ownsTransaction && $pdo->inTransaction()) $pdo->rollBack();
+            throw $e;
+        }
+        return count($targets);
+    }
+
+    function sceneiqSoftDeleteDynamicData(PDO $pdo, $userId, $scope) {
+        $userId = (int)$userId;
+        $pdo->beginTransaction();
+        try {
+            if (in_array($scope,['dynamic_content','dynamic_both'],true)) {
+                $pdo->prepare('UPDATE `sceneiq_dynamic_fields` SET `deleted_at`=NOW() WHERE `user_id`=:user_id AND `deleted_at` IS NULL')->execute([':user_id'=>$userId]);
+            }
+            if (in_array($scope,['dynamic_tabs','dynamic_both'],true)) {
+                $pdo->prepare('UPDATE `sceneiq_dynamic_tabs` SET `deleted_at`=NOW() WHERE `user_id`=:user_id AND `deleted_at` IS NULL')->execute([':user_id'=>$userId]);
+            }
+            $pdo->commit();
+        } catch (Throwable $e) { if ($pdo->inTransaction()) $pdo->rollBack(); throw $e; }
+    }
+
+    function sceneiqDeleteUserTableData(PDO $pdo, $userId) {
+        $userId = (int)$userId;
+        foreach (['sceneiq_project_entries','sceneiq_dynamic_fields','sceneiq_dynamic_tabs'] as $table) {
+            $stmt = $pdo->prepare('UPDATE `' . $table . '` SET `deleted_at`=NOW() WHERE `user_id`=:user_id AND `deleted_at` IS NULL');
+            $stmt->execute([':user_id'=>$userId]);
+        }
+    }
+
 
     // Convert submitted dynamic-field values according to their configured type.
     // JSON values remain arrays/objects/numbers/booleans/null; integers remain numeric.
@@ -309,7 +782,7 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
 
         // JSON-looking content is data, not a string. Detect it even when an old
         // or incorrectly configured field says "string", so pasted objects and
-        // arrays are saved as native JSON structures in settings.
+        // arrays are retained as native JSON structures in project entry payloads.
         if (is_string($value)) {
             $jsonText = trim($value);
             $looksLikeJsonContainer = ($jsonText !== '' && ($jsonText[0] === '{' || $jsonText[0] === '['));
@@ -367,22 +840,398 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
     }
 
     function repairSettings($settings) {
-        if (!is_array($settings)) return [];
+        // The settings column must be represented as a list of entry records.
+        // Older configurations may contain either a list of records, one record
+        // directly, or a keyed collection of records. Never return a flat object
+        // whose scalar field values would be mistaken for separate entries.
+        if (!is_array($settings) || empty($settings)) {
+            return [];
+        }
+
+        // Standard list of entries. Filter malformed scalar members so all
+        // callers can safely access entry fields such as status and _index.
         if (isset($settings[0]) && is_array($settings[0])) {
-            return array_values(array_filter($settings, function($item) {
+            return array_values(array_filter($settings, function ($item) {
                 return is_array($item);
             }));
         }
-        if (isset($settings['status']) || isset($settings['dynamic_values'])) {
+
+        // A single entry may contain built-in metadata or only dynamic fields.
+        if (
+            array_key_exists('status', $settings) ||
+            array_key_exists('dynamic_values', $settings) ||
+            array_key_exists('operation_status', $settings)
+        ) {
             return [$settings];
         }
+
+        // Legacy keyed collection: recognize nested records carrying entry
+        // metadata and retain those records in their existing iteration order.
         $result = [];
-        foreach ($settings as $key => $value) {
-            if (is_array($value) && (isset($value['status']) || isset($value['dynamic_values']))) {
+        foreach ($settings as $value) {
+            if (
+                is_array($value) &&
+                (array_key_exists('status', $value) ||
+                 array_key_exists('dynamic_values', $value) ||
+                 array_key_exists('operation_status', $value))
+            ) {
                 $result[] = $value;
             }
         }
-        return empty($result) ? $settings : $result;
+
+        if (!empty($result)) {
+            return array_values($result);
+        }
+
+        // A flat associative object with only user-defined fields is one entry,
+        // not a collection of scalar entries. Wrapping it preserves every value.
+        return [$settings];
+    }
+
+    /**
+     * Normalize the stored dynamic_tabs JSON into a safe, sequential list of tab
+     * records. Older/corrupt configurations can contain scalar strings among the
+     * tab records, or a single tab object instead of a list. Rendering and the
+     * browser-side editor expect every root and child tab to be an array/object.
+     * Invalid scalar records are skipped; valid tab properties are preserved.
+     */
+    function sceneiqValueToText($value, $fallback = '') {
+        if ($value === null) return (string)$fallback;
+        if (is_string($value) || is_int($value) || is_float($value) || is_bool($value)) {
+            return is_bool($value) ? ($value ? '1' : '0') : (string)$value;
+        }
+        if (is_array($value) || is_object($value)) {
+            $encoded = json_encode($value, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+            return ($encoded !== false) ? $encoded : (string)$fallback;
+        }
+        return (string)$fallback;
+    }
+
+    function sceneiqNormalizeValueList($values) {
+        if (is_string($values)) {
+            $decoded = json_decode($values, true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $values = $decoded;
+            } else {
+                $values = ($values === '') ? [] : [$values];
+            }
+        }
+        if (!is_array($values)) return [];
+
+        $normalized = [];
+        foreach ($values as $value) {
+            if (is_scalar($value) || $value === null) {
+                $normalized[] = $value === null ? '' : $value;
+            }
+        }
+        return array_values($normalized);
+    }
+
+    /**
+     * Inspect and, when necessary, decode SceneIQ's compressed Dynamic Content envelope.
+     *
+     * The format marker is gzip-json-v1. The historical payload in the supplied
+     * database uses Base64 + zlib/DEFLATE (PHP gzcompress/gzuncompress), despite
+     * the legacy marker name. We verify both the original byte count and SHA-256
+     * before accepting the recovered JSON. This function is account-agnostic.
+     */
+    /**
+     * Inspect a SceneIQ gzip-json-v1 storage envelope in any configuration column.
+     * The known format is Base64 + zlib/DEFLATE (gzcompress/gzuncompress).
+     * It is accepted only after byte-count, SHA-256 and JSON validation succeed.
+     */
+    function sceneiqInspectStorageEnvelope($storedValue) {
+        $rawJson = is_string($storedValue) ? $storedValue : null;
+        if (is_string($storedValue)) {
+            $decodedEnvelope = json_decode($storedValue, true);
+            if (json_last_error() !== JSON_ERROR_NONE) {
+                if (strpos($storedValue, '__sceneiq_storage') !== false) {
+                    throw new RuntimeException('A SceneIQ storage marker was found, but its JSON envelope is malformed. The original data was left untouched.');
+                }
+                return ['is_envelope' => false, 'value' => [], 'raw_json' => $rawJson];
+            }
+            $value = $decodedEnvelope;
+        } else {
+            $value = is_array($storedValue) ? $storedValue : [];
+        }
+
+        if (!is_array($value) || !array_key_exists('__sceneiq_storage', $value)) {
+            return [
+                'is_envelope' => false,
+                'value' => is_array($value) ? $value : [],
+                'raw_json' => $rawJson
+            ];
+        }
+
+        if (!is_string($value['__sceneiq_storage'])) {
+            throw new RuntimeException('The SceneIQ storage marker is malformed. No data was changed.');
+        }
+        $storageMarker = $value['__sceneiq_storage'];
+        if ($storageMarker !== 'gzip-json-v1') {
+            throw new RuntimeException('Unsupported SceneIQ storage format: ' . $storageMarker);
+        }
+
+        $expectedBytes = filter_var($value['original_bytes'] ?? null, FILTER_VALIDATE_INT);
+        $expectedHash = strtolower((string)($value['sha256'] ?? ''));
+        $payload = $value['payload'] ?? null;
+
+        if ($expectedBytes === false || $expectedBytes <= 0 || $expectedBytes > (64 * 1024 * 1024)) {
+            throw new RuntimeException('The compressed configuration has invalid or excessive original_bytes metadata. No data was changed.');
+        }
+        if (!preg_match('/^[a-f0-9]{64}$/', $expectedHash)) {
+            throw new RuntimeException('The compressed configuration has an invalid SHA-256 checksum. No data was changed.');
+        }
+        if (!is_string($payload) || $payload === '' || strlen($payload) > (96 * 1024 * 1024)) {
+            throw new RuntimeException('The compressed configuration payload is missing or exceeds the safe size limit. No data was changed.');
+        }
+
+        $binary = base64_decode($payload, true);
+        if ($binary === false) {
+            throw new RuntimeException('The compressed configuration payload is not valid Base64. No data was changed.');
+        }
+
+        $plain = false;
+        $method = '';
+        $maxOutputBytes = (int)$expectedBytes + 1;
+
+        // Primary format found in the supplied account data: zlib header 78 9C.
+        if (function_exists('gzuncompress')) {
+            $candidate = @gzuncompress($binary, $maxOutputBytes);
+            if ($candidate !== false) {
+                $plain = $candidate;
+                $method = 'zlib/gzuncompress';
+            }
+        }
+        // Compatibility with GZIP, raw DEFLATE, and zlib-body variants.
+        if ($plain === false && function_exists('gzdecode') && substr($binary, 0, 2) === "\x1f\x8b") {
+            $candidate = @gzdecode($binary, $maxOutputBytes);
+            if ($candidate !== false) { $plain = $candidate; $method = 'gzip/gzdecode'; }
+        }
+        if ($plain === false && function_exists('gzinflate')) {
+            $candidate = @gzinflate($binary, $maxOutputBytes);
+            if ($candidate !== false) { $plain = $candidate; $method = 'raw-deflate/gzinflate'; }
+        }
+        if ($plain === false && function_exists('gzinflate') && strlen($binary) > 6) {
+            $candidate = @gzinflate(substr($binary, 2, -4), $maxOutputBytes);
+            if ($candidate !== false) { $plain = $candidate; $method = 'zlib-body/gzinflate'; }
+        }
+        if ($plain === false) {
+            throw new RuntimeException('SceneIQ could not decompress this configuration payload. The original data has been left untouched.');
+        }
+
+        $actualBytes = strlen($plain);
+        if ($actualBytes !== (int)$expectedBytes) {
+            throw new RuntimeException('Recovered configuration size (' . $actualBytes . ' bytes) does not match recorded size (' . (int)$expectedBytes . ' bytes). No data was changed.');
+        }
+        $actualHash = hash('sha256', $plain);
+        if (!hash_equals($expectedHash, $actualHash)) {
+            throw new RuntimeException('The compressed configuration SHA-256 checksum does not match. No data was changed.');
+        }
+        try {
+            $decodedPlain = json_decode($plain, true, 512, JSON_THROW_ON_ERROR);
+        } catch (JsonException $e) {
+            throw new RuntimeException('The verified compressed bytes do not contain valid JSON: ' . $e->getMessage(), 0, $e);
+        }
+        if (!is_array($decodedPlain) || array_key_exists('__sceneiq_storage', $decodedPlain)) {
+            throw new RuntimeException('The verified payload is not a valid SceneIQ configuration array. No data was changed.');
+        }
+
+        return [
+            'is_envelope' => true,
+            'value' => $decodedPlain,
+            'raw_json' => $rawJson,
+            'plain_json' => $plain,
+            'method' => $method,
+            'original_bytes' => $actualBytes,
+            'sha256' => $actualHash,
+            'compressed_bytes' => strlen($binary)
+        ];
+    }
+
+    /** Decode a regular JSON config column or a verified compressed envelope. */
+    function sceneiqDecodeConfigColumn($storedValue, $columnName, $fallback = []) {
+        $inspection = sceneiqInspectStorageEnvelope($storedValue);
+        $value = $inspection['value'] ?? $fallback;
+        if (!is_array($value)) {
+            throw new RuntimeException('The recovered ' . $columnName . ' configuration is not an array.');
+        }
+        return $value;
+    }
+
+    function normalizeDynamicFieldDefinitions($fields) {
+        // This is deliberately account-agnostic: every user's compressed
+        // gzip-json-v1 envelope is decoded and verified before field rendering.
+        $storageResult = sceneiqInspectStorageEnvelope($fields);
+        $fields = $storageResult['value'] ?? [];
+        if (!is_array($fields) || empty($fields)) return [];
+
+        // A single field definition may have been stored without its outer map key.
+        if (array_key_exists('field_type', $fields) || array_key_exists('field-title', $fields) || array_key_exists('field-name', $fields)) {
+            $singleKey = sceneiqValueToText($fields['field-name'] ?? 'field_1', 'field_1');
+            $fields = [$singleKey => $fields];
+        }
+
+        $normalized = [];
+        foreach ($fields as $fieldKey => $field) {
+            $fieldKey = sceneiqValueToText($fieldKey, 'field');
+
+            if (is_string($field)) {
+                $decodedField = json_decode($field, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decodedField)) {
+                    $field = $decodedField;
+                }
+            }
+
+            if (!is_array($field)) {
+                $field = [
+                    'field-title' => $fieldKey,
+                    'field_type' => 'individual',
+                    'element_type' => 'input',
+                    'data_type' => 'string',
+                    'default_value' => sceneiqValueToText($field)
+                ];
+            }
+
+            $field['field-title'] = sceneiqValueToText($field['field-title'] ?? $fieldKey, $fieldKey);
+            $fieldType = strtolower(sceneiqValueToText($field['field_type'] ?? 'individual', 'individual'));
+            $field['field_type'] = in_array($fieldType, ['objects', 'object'], true) ? 'objects' : 'individual';
+            $field['element_type'] = sceneiqValueToText($field['element_type'] ?? 'input', 'input');
+            $field['default_value'] = sceneiqValueToText($field['default_value'] ?? '');
+            $field['default_values'] = sceneiqNormalizeValueList($field['default_values'] ?? []);
+            $field['button_url'] = sceneiqValueToText($field['button_url'] ?? '');
+            $field['separate_paragraphs'] = sceneiqValueToText($field['separate_paragraphs'] ?? 'no', 'no');
+            $field['copy_button_for_each_of'] = sceneiqNormalizeValueList($field['copy_button_for_each_of'] ?? []);
+
+            $dataType = strtolower(sceneiqValueToText($field['data_type'] ?? 'string', 'string'));
+            $field['data_type'] = in_array($dataType, ['string', 'int', 'integer', 'json'], true) ? $dataType : 'string';
+
+            if ($field['field_type'] === 'objects') {
+                $subFields = $field['fieldkeyvalue'] ?? [];
+                if (is_string($subFields)) {
+                    $decodedSubFields = json_decode($subFields, true);
+                    $subFields = (json_last_error() === JSON_ERROR_NONE && is_array($decodedSubFields)) ? $decodedSubFields : [];
+                }
+                if (!is_array($subFields)) $subFields = [];
+
+                $normalizedSubFields = [];
+                foreach ($subFields as $subKey => $subField) {
+                    $subKey = sceneiqValueToText($subKey, 'field');
+                    if (is_string($subField)) {
+                        $decodedSubField = json_decode($subField, true);
+                        if (json_last_error() === JSON_ERROR_NONE && is_array($decodedSubField)) {
+                            $subField = $decodedSubField;
+                        }
+                    }
+                    if (!is_array($subField)) {
+                        $subField = [
+                            'field-title' => $subKey,
+                            'element_type' => 'input',
+                            'data_type' => 'string',
+                            'default_value' => sceneiqValueToText($subField)
+                        ];
+                    }
+                    $subField['field-title'] = sceneiqValueToText($subField['field-title'] ?? $subKey, $subKey);
+                    $subField['element_type'] = sceneiqValueToText($subField['element_type'] ?? 'input', 'input');
+                    $subField['data_type'] = in_array(strtolower(sceneiqValueToText($subField['data_type'] ?? 'string', 'string')), ['string', 'int', 'integer', 'json'], true)
+                        ? strtolower(sceneiqValueToText($subField['data_type'] ?? 'string', 'string'))
+                        : 'string';
+                    $subField['default_value'] = sceneiqValueToText($subField['default_value'] ?? '');
+                    $subField['default_values'] = sceneiqNormalizeValueList($subField['default_values'] ?? []);
+                    $subField['button_url'] = sceneiqValueToText($subField['button_url'] ?? '');
+                    $subField['separate_paragraphs'] = sceneiqValueToText($subField['separate_paragraphs'] ?? 'no', 'no');
+                    $subField['copy_button_for_each_of'] = sceneiqNormalizeValueList($subField['copy_button_for_each_of'] ?? []);
+                    $normalizedSubFields[$subKey] = $subField;
+                }
+                $field['fieldkeyvalue'] = $normalizedSubFields;
+            }
+
+            $normalized[$fieldKey] = $field;
+        }
+        return $normalized;
+    }
+
+    /**
+     * Normalize root and nested tab records. Scalar legacy entries are retained as
+     * simple tab names; invalid nested values cannot break PHP rendering.
+     */
+    function normalizeDynamicTabs($tabs) {
+        $storageResult = sceneiqInspectStorageEnvelope($tabs);
+        $tabs = $storageResult['value'] ?? [];
+        if (is_string($tabs)) {
+            $decoded = json_decode($tabs, true);
+            if (json_last_error() === JSON_ERROR_NONE) {
+                $tabs = $decoded;
+            } else {
+                $tabs = ($tabs === '') ? [] : [['tab_name' => $tabs]];
+            }
+        }
+
+        if (!is_array($tabs) || empty($tabs)) return [];
+
+        // Accept a legacy single-tab object as well as the normal list of tabs.
+        if (array_key_exists('tab_name', $tabs) || array_key_exists('dynamic_fields_display', $tabs)) {
+            $tabs = [$tabs];
+        }
+
+        $normalizeOneTab = function ($tab, $fallbackName) use (&$normalizeOneTab) {
+            if (is_string($tab)) {
+                $decodedTab = json_decode($tab, true);
+                if (json_last_error() === JSON_ERROR_NONE && is_array($decodedTab)) {
+                    $tab = $decodedTab;
+                } else {
+                    $tab = ['tab_name' => $tab];
+                }
+            } elseif (!is_array($tab)) {
+                $tab = ['tab_name' => sceneiqValueToText($tab, $fallbackName)];
+            }
+
+            $tab['tab_name'] = sceneiqValueToText($tab['tab_name'] ?? $fallbackName, $fallbackName);
+            $tab['dynamic_fields_display'] = sceneiqNormalizeValueList($tab['dynamic_fields_display'] ?? []);
+
+            $children = [];
+            $rawChildren = $tab['sub_tabs'] ?? [];
+            if (is_string($rawChildren)) {
+                $decodedChildren = json_decode($rawChildren, true);
+                $rawChildren = (json_last_error() === JSON_ERROR_NONE && is_array($decodedChildren)) ? $decodedChildren : [];
+            }
+            if (is_array($rawChildren)) {
+                // Array keys may be names such as "intro" or "details". Never
+                // perform arithmetic on a foreach key; use a numeric position.
+                $childPosition = 0;
+                foreach ($rawChildren as $child) {
+                    $childPosition++;
+                    $fallbackChildName = 'Sub Tab ' . $childPosition;
+
+                    if (is_string($child)) {
+                        $decodedChild = json_decode($child, true);
+                        if (json_last_error() === JSON_ERROR_NONE && is_array($decodedChild)) {
+                            $child = $decodedChild;
+                        } else {
+                            $child = ['tab_name' => $child];
+                        }
+                    } elseif (!is_array($child)) {
+                        $child = ['tab_name' => sceneiqValueToText($child, $fallbackChildName)];
+                    }
+                    $child['tab_name'] = sceneiqValueToText($child['tab_name'] ?? $fallbackChildName, $fallbackChildName);
+                    $child['dynamic_fields_display'] = sceneiqNormalizeValueList($child['dynamic_fields_display'] ?? []);
+                    $children[] = $child;
+                }
+            }
+            $tab['sub_tabs'] = $children;
+            $tab['sub_tabs_mode'] = sceneiqValueToText($tab['sub_tabs_mode'] ?? (!empty($children) ? 'add' : 'none'));
+            return $tab;
+        };
+
+        $normalized = [];
+        // Stored tabs can be associative (for example, keyed by a tab slug),
+        // so their foreach keys are not guaranteed to be integers. Generate
+        // display fallback names from a separate numeric counter instead.
+        $tabPosition = 0;
+        foreach ($tabs as $tab) {
+            $tabPosition++;
+            $normalized[] = $normalizeOneTab($tab, 'Tab ' . $tabPosition);
+        }
+        return $normalized;
     }
 
     // Build and save one New Project entry. Both the regular POST fallback and the
@@ -392,37 +1241,30 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($userId <= 0 || !is_array($entryData) || empty($entryData)) {
             throw new InvalidArgumentException('No valid entry data was received.');
         }
-
         $config = getUserConfig($pdo, $userId);
-        $globalDynamicFields = $config ? json_decode($config['dynamic_fields'] ?? '[]', true) : [];
-        if (!is_array($globalDynamicFields)) $globalDynamicFields = [];
-
-        $dynamicTabs = $config ? json_decode($config['dynamic_tabs'] ?? '[]', true) : [];
-        if (!is_array($dynamicTabs)) $dynamicTabs = [];
-
+        $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
+        $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
         $submittedFieldKeys = [];
+        $collectSubmitFields = function($tab) use (&$collectSubmitFields,&$submittedFieldKeys) {
+            if (!is_array($tab)) return;
+            foreach (($tab['dynamic_fields_display'] ?? []) as $fieldKey) $submittedFieldKeys[(string)$fieldKey] = true;
+            $children = is_array($tab['sub_tabs'] ?? null) ? $tab['sub_tabs'] : [];
+            foreach ($children as $child) $collectSubmitFields($child);
+        };
         foreach ($dynamicTabs as $tab) {
             if (!is_array($tab)) continue;
-            $submitTab = isset($tab['submit_tab']) ? (bool)$tab['submit_tab'] : true;
-            if (!$submitTab) continue;
-
-            $displayFields = $tab['dynamic_fields_display'] ?? [];
-            if (!is_array($displayFields)) continue;
-            foreach ($displayFields as $fieldKey) {
-                $submittedFieldKeys[(string)$fieldKey] = true;
-            }
+            // The Submit Tabs toggle on a root tab controls the root and its nested tabs.
+            if (isset($tab['submit_tab']) && !(bool)$tab['submit_tab']) continue;
+            $collectSubmitFields($tab);
         }
-
         $flatEntry = [];
         foreach ($entryData as $key => $value) {
             $key = (string)$key;
             if (!isset($submittedFieldKeys[$key])) continue;
-
             if (is_array($value) && isset($value['_object'])) {
                 $objectData = [];
-                $subFieldDefinitions = $globalDynamicFields[$key]['fieldkeyvalue'] ?? [];
+                $subFieldDefinitions = $dynamicFields[$key]['fieldkeyvalue'] ?? [];
                 if (!is_array($subFieldDefinitions)) $subFieldDefinitions = [];
-
                 foreach ($value as $subKey => $subValue) {
                     if ($subKey === '_object') continue;
                     $subType = $subFieldDefinitions[$subKey]['data_type'] ?? 'string';
@@ -430,28 +1272,18 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
                 }
                 $flatEntry[$key] = $objectData;
             } else {
-                $fieldType = $globalDynamicFields[$key]['data_type'] ?? 'string';
-                $flatEntry[$key] = castDynamicValueByType($value, $fieldType);
+                $flatEntry[$key] = castDynamicValueByType($value, $dynamicFields[$key]['data_type'] ?? 'string');
             }
         }
-
-        $settings = $config ? json_decode($config['settings'] ?? '[]', true) : [];
-        if (!is_array($settings)) $settings = [];
-        $settings = repairSettings($settings);
-
-        $newEntry = $flatEntry;
-        $newEntry['status'] = 'pending';
-        $newEntry['operation_status'] = 'entry_created: New Project added by admin';
-        $settings[] = $newEntry;
-
-        $dynamicFields = $config ? json_decode($config['dynamic_fields'] ?? '[]', true) : [];
-        if (!is_array($dynamicFields)) $dynamicFields = [];
-
-        if (!saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs)) {
-            throw new RuntimeException('The database did not confirm that the entry was saved.');
-        }
-
-        return count($flatEntry);
+        if (!$flatEntry) throw new InvalidArgumentException('No fields from enabled Submit Tabs were received.');
+        $flatEntry['status'] = 'pending';
+        $flatEntry['operation_status'] = 'entry_created: New Project added by admin';
+        $maxStmt = $pdo->prepare('SELECT COALESCE(MAX(`display_order`),-1)+1 FROM `sceneiq_project_entries` WHERE `user_id`=:user_id AND `deleted_at` IS NULL');
+        $maxStmt->execute([':user_id'=>$userId]);
+        $nextPosition = (int)$maxStmt->fetchColumn();
+        $stmt = $pdo->prepare('INSERT INTO `sceneiq_project_entries` (`user_id`,`status`,`entry_data_json`,`operation_status`,`display_order`) VALUES (:user_id,:status,:data,:operation_status,:position)');
+        $stmt->execute([':user_id'=>$userId,':status'=>'pending',':data'=>sceneiqEncodeTableJson($flatEntry),':operation_status'=>$flatEntry['operation_status'],':position'=>$nextPosition]);
+        return count($flatEntry) - 2;
     }
 
     function sendEntryUploadJson($success, $message, $extra = [], $httpCode = 200) {
@@ -657,6 +1489,9 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         }
     }
 
+    // Create/verify the relational storage tables before any reads or writes.
+    sceneiqEnsureTableStorageSchema($pdo);
+
     // Process chunked upload requests before normal page POST handlers.
     handleEntryUploadRequests($pdo);
 
@@ -716,109 +1551,138 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         $redirect = true;
     }
 
-    // Clear selected user (go to dashboard)
+    // Clear selected user (go to dashboard). All Accounts is the default landing view.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['clear_user'])) {
         unset($_SESSION['selected_user_id']);
-        $_SESSION['dashboard_view'] = 'initialize';
+        $_SESSION['dashboard_view'] = 'accounts';
         $redirect = true;
     }
 
-    // Set dashboard view
+    // Set dashboard view. Fall back to All Accounts if an unexpected value arrives.
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['set_dashboard_view'])) {
-        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'initialize'), ['initialize', 'accounts', 'copy_data'], true) ? $_POST['view'] : 'initialize';
+        $_SESSION['dashboard_view'] = in_array(($_POST['view'] ?? 'accounts'), ['initialize', 'accounts', 'copy_data'], true) ? $_POST['view'] : 'accounts';
         $redirect = true;
     }
 
-    // Copy complete Dynamic Tabs and/or Dynamic Content configuration between accounts.
-    // The selected database column values are copied as raw strings. They are NOT decoded,
-    // filtered, re-indexed, normalized, or re-encoded, so every stored JSON character/value
-    // in the selected configuration category is retained exactly as it exists in the source.
-    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_account_data'])) {
-        $sourceUserId = intval($_POST['copy_from_account'] ?? 0);
-        $targetUserId = intval($_POST['copy_to_account'] ?? 0);
-        $copyScope = (string)($_POST['copy_data_scope'] ?? '');
+    // Load source-account choices for the custom multi-selection copy modal.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['load_account_copy_options'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        $postedToken = (string)($_POST['sceneiq_copy_csrf_token'] ?? '');
+        $sourceUserId = (int)($_POST['source_user_id'] ?? 0);
+        if (empty($_SESSION['sceneiq_copy_csrf_token']) || !hash_equals($_SESSION['sceneiq_copy_csrf_token'], $postedToken)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Security check failed. Refresh the page and try again.']);
+            exit;
+        }
+        try {
+            if ($sourceUserId <= 0 || !getUserById($pdo, $sourceUserId)) throw new InvalidArgumentException('Choose a valid source account.');
+            $sourceConfig = getUserConfig($pdo, $sourceUserId);
+            if (!$sourceConfig) throw new RuntimeException('The source account data could not be loaded.');
+            $fields = normalizeDynamicFieldDefinitions($sourceConfig['dynamic_fields'] ?? '[]');
+            $fieldOptions = [];
+            foreach ($fields as $fieldKey => $definition) {
+                $fieldOptions[] = [
+                    'key' => (string)$fieldKey,
+                    'title' => (string)($definition['field-title'] ?? $fieldKey),
+                    'type' => (($definition['field_type'] ?? 'individual') === 'objects') ? 'Object field' : 'Individual field'
+                ];
+            }
+            $tabs = normalizeDynamicTabs($sourceConfig['dynamic_tabs'] ?? '[]');
+            echo json_encode([
+                'success' => true,
+                'dynamicTabs' => sceneiqFlattenCopyTabs($tabs),
+                'dynamicFields' => $fieldOptions
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        exit;
+    }
 
-        $scopeColumns = [
-            'dynamic_tabs_and_fields' => ['dynamic_tabs', 'dynamic_fields'],
-            'dynamic_tabs' => ['dynamic_tabs'],
-            'dynamic_fields' => ['dynamic_fields']
+    // Merge checked Dynamic Tabs and/or Dynamic Content into multiple accounts.
+    // Destination-only data remains untouched; matching keys are replaced in full.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_account_data'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        $postedToken = (string)($_POST['sceneiq_copy_csrf_token'] ?? '');
+        $sourceUserId = (int)($_POST['copy_from_account'] ?? 0);
+        $targetUserIds = $_POST['destination_user_ids'] ?? [];
+        $copyScope = (string)($_POST['copy_data_scope'] ?? '');
+        $selectedTabKeys = $_POST['selected_dynamic_tab_keys'] ?? [];
+        $selectedFieldKeys = $_POST['selected_dynamic_field_keys'] ?? [];
+        $scopeMap = [
+            'dynamic_tabs' => [true, false],
+            'dynamic_fields' => [false, true],
+            'dynamic_tabs_and_fields' => [true, true]
         ];
 
-        if ($sourceUserId <= 0 || $targetUserId <= 0) {
-            $_SESSION['flash_error'] = 'Select both the source account and destination account.';
-        } elseif ($sourceUserId === $targetUserId) {
-            $_SESSION['flash_error'] = 'The source and destination accounts must be different.';
-        } elseif (!isset($scopeColumns[$copyScope])) {
-            $_SESSION['flash_error'] = 'Select valid data to copy.';
-        } else {
-            $sourceUser = getUserById($pdo, $sourceUserId);
-            $targetUser = getUserById($pdo, $targetUserId);
-            $sourceConfig = getUserConfig($pdo, $sourceUserId);
-
-            if (!$sourceUser || !$targetUser) {
-                $_SESSION['flash_error'] = 'The selected source or destination account could not be found.';
-            } elseif (!$sourceConfig) {
-                $_SESSION['flash_error'] = 'The source account does not have any saved configuration to copy.';
-            } else {
-                try {
-                    $columnsToCopy = $scopeColumns[$copyScope];
-                    $pdo->beginTransaction();
-                    $targetConfig = getUserConfig($pdo, $targetUserId);
-
-                    if ($targetConfig) {
-                        $setParts = [];
-                        $parameters = [':id' => (int)$targetConfig['id']];
-                        foreach ($columnsToCopy as $columnName) {
-                            // Column names are selected only from the fixed whitelist above.
-                            $setParts[] = '`' . $columnName . '` = :' . $columnName;
-                            $parameters[':' . $columnName] = array_key_exists($columnName, $sourceConfig)
-                                ? $sourceConfig[$columnName]
-                                : null;
-                        }
-
-                        $copyStmt = $pdo->prepare(
-                            'UPDATE sceneiq_config SET ' . implode(', ', $setParts) . ' WHERE id = :id'
-                        );
-                        $copyStmt->execute($parameters);
-                    } else {
-                        // A new destination config needs default values for columns outside
-                        // the chosen scope. Selected columns still use the source's raw values.
-                        $dynamicFieldsRaw = in_array('dynamic_fields', $columnsToCopy, true)
-                            ? $sourceConfig['dynamic_fields']
-                            : '[]';
-                        $dynamicTabsRaw = in_array('dynamic_tabs', $columnsToCopy, true)
-                            ? $sourceConfig['dynamic_tabs']
-                            : '[]';
-
-                        $copyStmt = $pdo->prepare(
-                            'INSERT INTO sceneiq_config (user_id, settings, dynamic_fields, dynamic_tabs)
-' .
-                            'VALUES (:user_id, :settings, :dynamic_fields, :dynamic_tabs)'
-                        );
-                        $copyStmt->execute([
-                            ':user_id' => $targetUserId,
-                            ':settings' => '[]',
-                            ':dynamic_fields' => $dynamicFieldsRaw,
-                            ':dynamic_tabs' => $dynamicTabsRaw
-                        ]);
-                    }
-
-                    $pdo->commit();
-                    $scopeLabel = $copyScope === 'dynamic_tabs_and_fields'
-                        ? 'Dynamic tab and Dynamic content'
-                        : ($copyScope === 'dynamic_tabs' ? 'Dynamic tab' : 'Dynamic content');
-                    $_SESSION['flash_success'] = $scopeLabel . ' copied completely from "' .
-                        $sourceUser['username'] . '" to "' . $targetUser['username'] . '".';
-                } catch (Throwable $e) {
-                    if ($pdo->inTransaction()) {
-                        $pdo->rollBack();
-                    }
-                    error_log('Account data copy failed: ' . $e->getMessage());
-                    $_SESSION['flash_error'] = 'Unable to copy account data. No partial copy was saved.';
-                }
-            }
+        if (empty($_SESSION['sceneiq_copy_csrf_token']) || !hash_equals($_SESSION['sceneiq_copy_csrf_token'], $postedToken)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Security check failed. Refresh the page and try again.']);
+            exit;
         }
-        $redirect = true;
+        try {
+            if (!isset($scopeMap[$copyScope])) throw new InvalidArgumentException('Choose Dynamic tabs, Dynamic field, or Both before copying.');
+            if (!is_array($targetUserIds)) $targetUserIds = [];
+            if (!is_array($selectedTabKeys)) $selectedTabKeys = [];
+            if (!is_array($selectedFieldKeys)) $selectedFieldKeys = [];
+            $copyTabs = $scopeMap[$copyScope][0];
+            $copyFields = $scopeMap[$copyScope][1];
+            if ($copyTabs && !$selectedTabKeys && !$copyFields) throw new InvalidArgumentException('Select at least one Dynamic tab to copy.');
+            if ($copyFields && !$selectedFieldKeys && !$copyTabs) throw new InvalidArgumentException('Select at least one Dynamic field to copy.');
+            if ($copyTabs && $copyFields && !$selectedTabKeys && !$selectedFieldKeys) throw new InvalidArgumentException('Select at least one Dynamic tab or Dynamic field to copy.');
+
+            $sourceUser = getUserById($pdo, $sourceUserId);
+            if (!$sourceUser) throw new InvalidArgumentException('The source account could not be found.');
+            $copiedCount = sceneiqCopySelectedDataToAccounts(
+                $pdo, $sourceUserId, $targetUserIds, $selectedTabKeys, $selectedFieldKeys, $copyTabs, $copyFields
+            );
+            $message = 'Selected data copied to ' . $copiedCount . ' account' . ($copiedCount === 1 ? '' : 's') . '. Destination-only data was preserved.';
+            $selectedAccountId = (int)($_SESSION['selected_user_id'] ?? 0);
+            $state = $selectedAccountId > 0 ? sceneiqBuildLiveState($pdo, $selectedAccountId) : null;
+            echo json_encode(['success' => true, 'message' => $message, 'state' => $state], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            error_log('Account selected-data copy failed: ' . $e->getMessage());
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => 'Unable to copy account data. ' . $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        exit;
+    }
+
+    // Copy one complete Dynamic Content field (individual or object) to many accounts.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['copy_dynamic_field_to_accounts'])) {
+        header('Content-Type: application/json; charset=utf-8');
+        $postedToken = (string)($_POST['sceneiq_copy_csrf_token'] ?? '');
+        $sourceUserId = (int)($_POST['source_user_id'] ?? 0);
+        $fieldKey = trim((string)($_POST['field_key'] ?? ''));
+        $targetJson = (string)($_POST['destination_user_ids_json'] ?? '[]');
+        $targetUserIds = json_decode($targetJson, true);
+        if (empty($_SESSION['sceneiq_copy_csrf_token']) || !hash_equals($_SESSION['sceneiq_copy_csrf_token'], $postedToken)) {
+            http_response_code(403);
+            echo json_encode(['success' => false, 'message' => 'Security check failed. Refresh the page and try again.']);
+            exit;
+        }
+        try {
+            if ($sourceUserId <= 0 || $sourceUserId !== (int)($_SESSION['selected_user_id'] ?? 0)) {
+                throw new InvalidArgumentException('The source account could not be verified. Reopen the selected account and try again.');
+            }
+            if ($fieldKey === '' || !is_array($targetUserIds)) throw new InvalidArgumentException('The field or destination selection is invalid.');
+            $sourceConfig = getUserConfig($pdo, $sourceUserId);
+            if (!$sourceConfig) throw new RuntimeException('The source account data could not be loaded.');
+            $sourceFields = normalizeDynamicFieldDefinitions($sourceConfig['dynamic_fields'] ?? '[]');
+            if (!array_key_exists($fieldKey, $sourceFields)) throw new InvalidArgumentException('The selected Dynamic Content field no longer exists.');
+            $copiedCount = sceneiqCopySelectedDataToAccounts(
+                $pdo, $sourceUserId, $targetUserIds, [], [$fieldKey], false, true, $sourceConfig
+            );
+            $message = 'Field "' . $fieldKey . '" copied to ' . $copiedCount . ' account' . ($copiedCount === 1 ? '' : 's') . '. Matching field keys were replaced in full.';
+            $state = sceneiqBuildLiveState($pdo, $sourceUserId);
+            echo json_encode(['success' => true, 'message' => $message, 'state' => $state], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            error_log('Single Dynamic Content field copy failed: ' . $e->getMessage());
+            http_response_code(400);
+            echo json_encode(['success' => false, 'message' => $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        exit;
     }
 
     // Permanently delete the selected account's Dynamic Content and/or Dynamic Tabs.
@@ -852,36 +1716,8 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
             $_SESSION['flash_error'] = 'Invalid delete option. No data was deleted.';
         } else {
             try {
-                $config = getUserConfig($pdo, $userId);
-
-                if (!$config) {
-                    $_SESSION['flash_error'] = 'No saved configuration was found for this account.';
-                } else {
-                    $setParts = [];
-                    foreach ($deleteScopes[$deleteScope]['columns'] as $columnName) {
-                        // Column names are selected only from the fixed whitelist above.
-                        $setParts[] = '`' . $columnName . '` = :clear_' . $columnName;
-                    }
-
-                    $sql = 'UPDATE sceneiq_config SET ' . implode(', ', $setParts) .
-                           ' WHERE id = :config_id AND user_id = :user_id';
-                    $stmt = $pdo->prepare($sql);
-
-                    $parameters = [
-                        ':config_id' => (int)$config['id'],
-                        ':user_id' => $userId
-                    ];
-                    foreach ($deleteScopes[$deleteScope]['columns'] as $columnName) {
-                        $parameters[':clear_' . $columnName] = '[]';
-                    }
-
-                    if ($stmt->execute($parameters)) {
-                        $_SESSION['flash_success'] = $deleteScopes[$deleteScope]['label'] .
-                            ' deleted successfully for the selected account.';
-                    } else {
-                        $_SESSION['flash_error'] = 'Unable to delete the selected data. No other data was changed.';
-                    }
-                }
+                sceneiqSoftDeleteDynamicData($pdo, $userId, $deleteScope);
+                $_SESSION['flash_success'] = $deleteScopes[$deleteScope]['label'] . ' moved to the recoverable deleted state for this account.';
             } catch (Throwable $e) {
                 error_log('Dynamic data deletion failed for user ' . $userId . ': ' . $e->getMessage());
                 $_SESSION['flash_error'] = 'An error occurred while deleting the selected data. Please try again.';
@@ -916,10 +1752,15 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
                 $debugMessages[] = "ERROR: Failed to decode dynamic_fields_data";
             }
         }
+        if ($rawData === '' || !is_array($decoded ?? null) || empty($decoded)) {
+            $_SESSION['flash_error'] = 'Dynamic Content was not saved because the submitted field definitions were empty or invalid. Existing fields were preserved.';
+            $_SESSION['debug_messages'] = $debugMessages;
+            $redirect = true;
+        } else {
         
         $config = getUserConfig($pdo, $userId);
-                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
-        $settings = $config ? json_decode($config['settings'], true) : [];
+                $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
+        $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
         if (!is_array($settings)) $settings = [];
         $settings = repairSettings($settings);
         
@@ -934,6 +1775,7 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         
         $_SESSION['debug_messages'] = $debugMessages;
         $redirect = true;
+        }
     }
 
     // Update Global Dynamic Field
@@ -952,13 +1794,12 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($oldKey && $newKey && !empty($fieldData)) {
             try {
                 $config = getUserConfig($pdo, $userId);
-                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
-                $settings = $config ? json_decode($config['settings'], true) : [];
+                $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
+                $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
                 
-                $dynamicFields = $config ? json_decode($config['dynamic_fields'], true) : [];
-                if (!is_array($dynamicFields)) $dynamicFields = [];
+                $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
                 
                 // Remove old key if it exists
                 if (isset($dynamicFields[$oldKey])) {
@@ -1010,13 +1851,12 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if (!empty($fieldData)) {
             try {
                 $config = getUserConfig($pdo, $userId);
-                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
-                $settings = $config ? json_decode($config['settings'], true) : [];
+                $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
+                $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
                 
-                $dynamicFields = $config ? json_decode($config['dynamic_fields'], true) : [];
-                if (!is_array($dynamicFields)) $dynamicFields = [];
+                $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
                 
                 if (isset($fieldData['field_type']) && $fieldData['field_type'] === 'objects') {
                     $fieldKey = $fieldData['field-name'] ?? '';
@@ -1090,14 +1930,13 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         
         if ($fieldKey) {
             $config = getUserConfig($pdo, $userId);
-                $dynamicTabs = $config ? (json_decode($config['dynamic_tabs'], true) ?: []) : [];
+                $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
             if ($config) {
-                $settings = json_decode($config['settings'], true) ?: [];
+                $settings = sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []);
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
                 
-                $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
-                if (!is_array($dynamicFields)) $dynamicFields = [];
+                $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
                 
                 if (isset($dynamicFields[$fieldKey])) {
                     unset($dynamicFields[$fieldKey]);
@@ -1119,9 +1958,8 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($userId > 0 && is_array($settings)) {
             $settings = repairSettings($settings);
             $config = getUserConfig($pdo, $userId);
-            $dynamicFields = $config ? json_decode($config['dynamic_fields'], true) : [];
-            if (!is_array($dynamicFields)) $dynamicFields = [];
-            $dynamicTabs = $config ? json_decode($config['dynamic_tabs'], true) : [];
+            $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
+            $dynamicTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
             if (!is_array($dynamicTabs)) $dynamicTabs = [];
             
             if (saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs)) {
@@ -1141,14 +1979,15 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($userId > 0 && $index >= 0) {
             $config = getUserConfig($pdo, $userId);
             if ($config) {
-                $settings = json_decode($config['settings'], true) ?: [];
+                $settings = sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []);
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
                 
-                if ($index < count($settings)) {
-                    array_splice($settings, $index, 1);
-                    $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
-                    $dynamicTabs = json_decode($config['dynamic_tabs'], true) ?: [];
+                $entryPosition = sceneiqFindProjectEntryIndex($settings, $index);
+                if ($entryPosition >= 0) {
+                    array_splice($settings, $entryPosition, 1);
+                    $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
+                    $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
                     $result = saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                     
                     if ($result) {
@@ -1200,14 +2039,15 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($userId > 0 && $index >= 0 && in_array($newStatus, ['pending', 'completed', 'aborted'])) {
             $config = getUserConfig($pdo, $userId);
             if ($config) {
-                $settings = json_decode($config['settings'], true) ?: [];
+                $settings = sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []);
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
                 
-                if ($index < count($settings)) {
-                    $settings[$index]['status'] = $newStatus;
-                    $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
-                    $dynamicTabs = json_decode($config['dynamic_tabs'], true) ?: [];
+                $entryPosition = sceneiqFindProjectEntryIndex($settings, $index);
+                if ($entryPosition >= 0) {
+                    $settings[$entryPosition]['status'] = $newStatus;
+                    $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
+                    $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
                     saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                     $_SESSION['flash_success'] = 'Status updated successfully!';
                 }
@@ -1226,14 +2066,15 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($userId > 0 && $index >= 0 && $fieldKey) {
             $config = getUserConfig($pdo, $userId);
             if ($config) {
-                $settings = json_decode($config['settings'], true) ?: [];
+                $settings = sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []);
                 if (!is_array($settings)) $settings = [];
                 $settings = repairSettings($settings);
                 
-                if ($index < count($settings)) {
-                    $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
-                    $settings[$index][$fieldKey] = $fieldValue;
-                    $dynamicTabs = json_decode($config['dynamic_tabs'], true) ?: [];
+                $entryPosition = sceneiqFindProjectEntryIndex($settings, $index);
+                if ($entryPosition >= 0) {
+                    $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
+                    $settings[$entryPosition][$fieldKey] = $fieldValue;
+                    $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
                     saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                     $_SESSION['flash_success'] = 'Field updated successfully!';
                 }
@@ -1247,19 +2088,17 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
     // Save Dynamic Tabs for a user (UPDATED with additional_features)
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_dynamic_tabs'])) {
         $userId = intval($_POST['user_id'] ?? 0);
-        $tabsData = isset($_POST['tabs_data']) ? json_decode($_POST['tabs_data'], true) : [];
+        $tabsData = normalizeDynamicTabs($_POST['tabs_data'] ?? '[]');
         
         if ($userId > 0 && is_array($tabsData)) {
             $config = getUserConfig($pdo, $userId);
-            $settings = $config ? json_decode($config['settings'], true) : [];
+            $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
             if (!is_array($settings)) $settings = [];
             $settings = repairSettings($settings);
-            $dynamicFields = $config ? json_decode($config['dynamic_fields'], true) : [];
-            if (!is_array($dynamicFields)) $dynamicFields = [];
+            $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
             
             // Preserve existing submit_tab values from stored tabs
-            $existingTabs = $config ? json_decode($config['dynamic_tabs'], true) : [];
-            if (!is_array($existingTabs)) $existingTabs = [];
+            $existingTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
             
             // Create a lookup of existing submit_tab values by tab_name
             $submitTabLookup = [];
@@ -1271,6 +2110,7 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
             
             // Merge submitted tabs with existing submit_tab values and ensure additional_features
             foreach ($tabsData as &$tab) {
+                if (!is_array($tab)) continue;
                 if (isset($tab['tab_name']) && isset($submitTabLookup[$tab['tab_name']])) {
                     $tab['submit_tab'] = $submitTabLookup[$tab['tab_name']];
                 } elseif (!isset($tab['submit_tab'])) {
@@ -1316,27 +2156,27 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
     // Save Submit Tabs Configuration
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['save_submit_tabs'])) {
         $userId = intval($_POST['user_id'] ?? 0);
-        $submitTabsData = isset($_POST['submit_tabs_data']) ? json_decode($_POST['submit_tabs_data'], true) : [];
+        $submitTabsData = normalizeDynamicTabs($_POST['submit_tabs_data'] ?? '[]');
         
         if ($userId > 0 && is_array($submitTabsData)) {
             $config = getUserConfig($pdo, $userId);
-            $settings = $config ? json_decode($config['settings'], true) : [];
+            $settings = $config ? sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []) : [];
             if (!is_array($settings)) $settings = [];
             $settings = repairSettings($settings);
-            $dynamicFields = $config ? json_decode($config['dynamic_fields'], true) : [];
-            if (!is_array($dynamicFields)) $dynamicFields = [];
+            $dynamicFields = $config ? normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]') : [];
             
             // Get existing tabs
-            $existingTabs = $config ? json_decode($config['dynamic_tabs'], true) : [];
-            if (!is_array($existingTabs)) $existingTabs = [];
+            $existingTabs = $config ? normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]') : [];
             
             // Update ONLY submit_tab values on existing tabs - NO NEW TABS CREATED
             foreach ($submitTabsData as $updatedTab) {
+                if (!is_array($updatedTab)) continue;
                 $tabName = $updatedTab['tab_name'] ?? '';
                 if (!$tabName) continue;
                 
                 // Find and update the existing tab
                 foreach ($existingTabs as &$existingTab) {
+                    if (!is_array($existingTab)) continue;
                     if (($existingTab['tab_name'] ?? '') === $tabName) {
                         $existingTab['submit_tab'] = $updatedTab['submit_tab'] ?? true;
                         break;
@@ -1366,16 +2206,14 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($userId > 0 && $tabIndex >= 0) {
             $config = getUserConfig($pdo, $userId);
             if ($config) {
-                $dynamicTabs = json_decode($config['dynamic_tabs'], true) ?: [];
-                if (!is_array($dynamicTabs)) $dynamicTabs = [];
+                $dynamicTabs = normalizeDynamicTabs($config['dynamic_tabs'] ?? '[]');
                 
                 if (isset($dynamicTabs[$tabIndex])) {
                     array_splice($dynamicTabs, $tabIndex, 1);
-                    $settings = json_decode($config['settings'], true) ?: [];
+                    $settings = sceneiqDecodeConfigColumn($config['settings'] ?? '[]', 'settings', []);
                     if (!is_array($settings)) $settings = [];
                     $settings = repairSettings($settings);
-                    $dynamicFields = json_decode($config['dynamic_fields'], true) ?: [];
-                    if (!is_array($dynamicFields)) $dynamicFields = [];
+                    $dynamicFields = normalizeDynamicFieldDefinitions($config['dynamic_fields'] ?? '[]');
                     
                     saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs);
                     $_SESSION['flash_success'] = 'Tab deleted successfully!';
@@ -1576,8 +2414,61 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         $redirect = true;
     }
 
-    // If any POST request that should redirect, do it here
+    // Legacy JSON recovery is intentionally no longer used by the table-based interface.
+    // The original sceneiq_config table remains untouched as the migration source/archive.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && (isset($_POST['restore_all_config_storage']) || isset($_POST['restore_all_dynamic_field_storage']))) {
+        $_SESSION['flash_error'] = 'This version uses relational tables. Run the supplied SceneIQ migration utility to import any remaining legacy sceneiq_config records; the originals are preserved.';
+        $redirect = true;
+    }
+
+    // Lightweight state endpoint used by editor actions that already return JSON.
+    // It returns the latest table-backed records without changing navigation.
+    if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['sceneiq_live_state'])) {
+        try {
+            $liveUserId = (int)($_SESSION['selected_user_id'] ?? 0);
+            $liveState = sceneiqBuildLiveState($pdo, $liveUserId);
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            echo json_encode(['success' => true, 'state' => $liveState], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+        } catch (Throwable $e) {
+            error_log('SceneIQ live state refresh failed: ' . $e->getMessage());
+            http_response_code(500);
+            header('Content-Type: application/json; charset=utf-8');
+            echo json_encode(['success' => false, 'message' => 'The latest account data could not be refreshed. ' . $e->getMessage()], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES);
+        }
+        exit;
+    }
+
+    // Save requests marked as XMLHttpRequest return JSON + the latest account state.
+    // Navigation requests (select account / dashboard / back to account list) still
+    // use the original normal redirect behavior.
+    $sceneiqAjaxRequest = strtolower((string)($_SERVER['HTTP_X_REQUESTED_WITH'] ?? '')) === 'xmlhttprequest'
+        || (string)($_SERVER['HTTP_X_SCENEIQ_REQUEST'] ?? '') === 'save';
+
+    // If any POST request should redirect, return JSON for background saves instead.
     if ($redirect) {
+        if ($sceneiqAjaxRequest) {
+            $flashSuccessAjax = (string)($_SESSION['flash_success'] ?? '');
+            $flashErrorAjax = (string)($_SESSION['flash_error'] ?? '');
+            $debugMessagesAjax = $_SESSION['debug_messages'] ?? [];
+            unset($_SESSION['flash_success'], $_SESSION['flash_error'], $_SESSION['debug_messages']);
+            $liveStateAjax = null;
+            try {
+                $liveUserIdAjax = (int)($_SESSION['selected_user_id'] ?? 0);
+                $liveStateAjax = sceneiqBuildLiveState($pdo, $liveUserIdAjax);
+            } catch (Throwable $stateError) {
+                error_log('SceneIQ post-save state build failed: ' . $stateError->getMessage());
+            }
+            header('Content-Type: application/json; charset=utf-8');
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
+            echo json_encode([
+                'success' => $flashErrorAjax === '',
+                'message' => $flashErrorAjax !== '' ? $flashErrorAjax : ($flashSuccessAjax !== '' ? $flashSuccessAjax : 'Saved successfully.'),
+                'state' => $liveStateAjax,
+                'debug' => $debugMessagesAjax
+            ], JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_INVALID_UTF8_SUBSTITUTE);
+            exit;
+        }
         header('Location: ' . $_SERVER['PHP_SELF']);
         exit;
     }
@@ -1591,8 +2482,17 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
     // ===== GET DATA =====
     $users = getAllUsers($pdo);
     $selectedUserId = isset($_SESSION['selected_user_id']) ? intval($_SESSION['selected_user_id']) : 0;
-    $dashboardView = isset($_SESSION['dashboard_view']) ? $_SESSION['dashboard_view'] : 'initialize';
-    if (!in_array($dashboardView, ['initialize', 'accounts', 'copy_data'], true)) { $dashboardView = 'initialize'; }
+
+    // One-time session migration: users who had the previous default saved as
+    // "initialize" are moved to All Accounts once after this update. Later tab
+    // selections are respected normally.
+    if (empty($_SESSION['sceneiq_accounts_default_view_v1'])) {
+        $_SESSION['dashboard_view'] = 'accounts';
+        $_SESSION['sceneiq_accounts_default_view_v1'] = '1';
+    }
+
+    $dashboardView = isset($_SESSION['dashboard_view']) ? $_SESSION['dashboard_view'] : 'accounts';
+    if (!in_array($dashboardView, ['initialize', 'accounts', 'copy_data'], true)) { $dashboardView = 'accounts'; }
 
     $selectedUser = null;
     $userConfig = null;
@@ -1612,22 +2512,54 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
         if ($selectedUser) {
             $userConfig = getUserConfig($pdo, $selectedUserId);
             if ($userConfig) {
-                $userSettings = json_decode($userConfig['settings'], true) ?: [];
-                if (!is_array($userSettings)) $userSettings = [];
-                $userSettings = repairSettings($userSettings);
-                
-                $userDynamicFields = json_decode($userConfig['dynamic_fields'], true) ?: [];
-                if (!is_array($userDynamicFields)) $userDynamicFields = [];
-                
-                $userDynamicTabs = json_decode($userConfig['dynamic_tabs'], true) ?: [];
-                if (!is_array($userDynamicTabs)) $userDynamicTabs = [];
+                try {
+                    // Project entries and statuses are loaded from relational project rows.
+                    $userSettings = sceneiqDecodeConfigColumn($userConfig['settings'] ?? '[]', 'settings', []);
+                    $userSettings = repairSettings($userSettings);
+                } catch (Throwable $storageError) {
+                    error_log('SceneIQ project/settings decode failed for user ' . $selectedUserId . ': ' . $storageError->getMessage());
+                    $userSettings = [];
+                    $storageWarning = 'Project entries for this account could not be verified and were not modified. Use the all-account SceneIQ data recovery action from All Accounts; unverifiable data remains preserved in the database.';
+                    $flashError = $flashError ? ($flashError . ' ' . $storageWarning) : $storageWarning;
+                }
+
+                try {
+                    $userDynamicFields = normalizeDynamicFieldDefinitions($userConfig['dynamic_fields'] ?? '[]');
+                } catch (Throwable $storageError) {
+                    error_log('SceneIQ Dynamic Content decode failed for user ' . $selectedUserId . ': ' . $storageError->getMessage());
+                    $userDynamicFields = [];
+                    $storageWarning = 'Dynamic Content for this account could not be verified and was not modified. Use the all-account SceneIQ data recovery action from All Accounts; unverifiable data remains preserved in the database.';
+                    $flashError = $flashError ? ($flashError . ' ' . $storageWarning) : $storageWarning;
+                }
+
+                try {
+                    $userDynamicTabs = normalizeDynamicTabs($userConfig['dynamic_tabs'] ?? '[]');
+                } catch (Throwable $storageError) {
+                    error_log('SceneIQ Dynamic Tabs decode failed for user ' . $selectedUserId . ': ' . $storageError->getMessage());
+                    $userDynamicTabs = [];
+                    $storageWarning = 'Dynamic Tabs for this account could not be verified and were not modified. Use the all-account SceneIQ data recovery action from All Accounts; unverifiable data remains preserved in the database.';
+                    $flashError = $flashError ? ($flashError . ' ' . $storageWarning) : $storageWarning;
+                }
                 
                 foreach ($userSettings as $index => $entry) {
-                    $status = isset($entry['status']) ? strtolower($entry['status']) : 'pending';
+                    // Defensive guard: legacy or malformed JSON must never cause
+                    // an attempt to write an array offset into a scalar value.
+                    if (!is_array($entry)) {
+                        continue;
+                    }
+
+                    $statusValue = $entry['status'] ?? 'pending';
+                    $status = is_scalar($statusValue)
+                        ? strtolower(trim((string)$statusValue))
+                        : 'pending';
+                    if ($status === '') {
+                        $status = 'pending';
+                    }
+
                     if (!isset($groupedEntries[$status])) {
                         $groupedEntries[$status] = [];
                     }
-                    $entry['_index'] = $index;
+                    $entry['_index'] = (int)($entry['_db_id'] ?? $index);
                     $groupedEntries[$status][] = $entry;
                 }
             } else {
@@ -1647,7 +2579,7 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>SceneIQ Server - Admin</title>
 <style>
-        /* Folder/file navigation is the only visible layout for a selected account. */
+        /* Prevent the legacy tab layout from flashing before the final folder UI initializes. */
         body.sceneiq-folder-pending .custom-body { visibility: hidden !important; }
         body.sceneiq-folder-ready .custom-body { visibility: visible !important; }
         .copy-button-copied { background:#dcfce7 !important; border-color:#16a34a !important; color:#166534 !important; }
@@ -3782,6 +4714,46 @@ function saveUserConfig($pdo, $userId, $settings, $dynamicFields, $dynamicTabs =
 .account-object-move-controls .btn:disabled { opacity:.35; cursor:not-allowed; }
 .account-dynamic-field-card.is-saving-order { opacity:.65; pointer-events:none; }
 
+/* SceneIQ admin now uses a regular, familiar page font. */
+html, body, .custom-body, .custom-body * {
+    font-family: Arial, Helvetica, sans-serif !important;
+}
+/* Keep very large field values inside their own scrollable preview area. */
+.account-dynamic-field-details {
+    max-height: 440px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+}
+.account-dynamic-field-info {
+    display: grid;
+    align-content: start;
+    max-height: 280px;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    padding: 2px 6px 2px 0;
+}
+.account-dynamic-field-value {
+    grid-column: 1 / -1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+.account-dynamic-field-value pre {
+    display: block;
+    max-height: 150px;
+    margin-top: 5px;
+    padding: 9px 10px;
+    overflow: auto;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    border: 1px solid #e2e8f0;
+    border-radius: 7px;
+    background: #fff;
+    color: #334155;
+    font: 13px/1.45 Arial, Helvetica, sans-serif;
+}
+.account-dynamic-field-heading-side { flex-wrap: wrap; justify-content: flex-end; }
+.account-field-copy { flex: 0 0 auto; white-space: nowrap; }
+
 @media (max-width: 640px) {
     #user_tab_submit_tabs .submit-tabs-save-bar .btn,
     #user_tab_dynamic_fields .account-dynamic-fields-add-bar .btn { width: 100%; }
@@ -4460,19 +5432,247 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
 .user-search-modal .dialog-body { overflow-y:auto !important; }
 @media (max-width:560px) { .multiple-selections-dialog { padding:14px; } .multiple-selections-dialog-header h4 { font-size:15px; } }
 </style>
+
+<style id="sceneiq-folder-navigation-style">
+/* SceneIQ folder/file navigation */
+.main-header.folder-mode{justify-content:center;position:relative;min-height:64px;padding:12px 72px}
+.main-header.folder-mode .folder-header-left{position:absolute;left:16px;top:50%;transform:translateY(-50%)}
+.main-header.folder-mode .folder-header-title{font-size:17px;font-weight:750;text-align:center;max-width:100%;overflow-wrap:anywhere}
+.main-header.folder-mode .folder-header-right{position:absolute;right:16px;top:50%;transform:translateY(-50%)}
+.folder-back-btn{width:40px;height:40px;border:1px solid rgba(255,255,255,.35);border-radius:12px;background:rgba(255,255,255,.15);color:#fff;font-size:24px;line-height:1;cursor:pointer;display:grid;place-items:center}
+.folder-back-btn:hover{background:rgba(255,255,255,.27)}
+.folder-nav-root{width:100%;max-width:1100px;margin:0 auto;padding:clamp(14px,3vw,30px) 0 35px}
+.folder-nav-heading{margin:0 0 7px;color:#102a43;font-size:clamp(21px,3vw,28px);font-weight:800;letter-spacing:-.035em}
+.folder-nav-description{color:#718096;font-size:13px;margin:0 0 22px;line-height:1.6}
+.folder-card-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
+.folder-card{appearance:none;position:relative;min-width:0;min-height:142px;text-align:left;padding:20px 18px;border:1px solid #e2e8f0;border-radius:18px;background:linear-gradient(145deg,#fff 0%,#f8fbfc 100%);box-shadow:0 5px 18px rgba(15,35,55,.055);cursor:pointer;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:17px;color:#142b3c;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;overflow:hidden}
+.folder-card:before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--folder-accent,#0f8b80);opacity:.85}
+.folder-card:hover{transform:translateY(-3px);border-color:#9bd7ce;box-shadow:0 12px 28px rgba(15,75,80,.11)}
+.folder-card:focus-visible{outline:3px solid #79d3c6;outline-offset:3px}
+.folder-card-top{display:flex;width:100%;align-items:flex-start;justify-content:space-between;gap:12px}
+.folder-card-icon{width:43px;height:43px;flex:0 0 43px;border-radius:13px;background:var(--folder-tint,#e6f7f4);display:grid;place-items:center;font-size:22px}
+.folder-card-arrow{color:#91a2b2;font-size:20px}
+.folder-card-title{font-size:15px;font-weight:780;line-height:1.35;overflow-wrap:anywhere}
+.folder-card-subtitle{margin-top:5px;font-size:12px;line-height:1.45;color:#81909e;overflow-wrap:anywhere}
+.folder-card.wide{grid-column:1/-1;min-height:112px}
+.folder-card.wide .folder-card-top{align-items:center}
+.folder-card.wide .folder-card-copy{flex:1;min-width:0}
+.folder-card-count{font-size:11px;font-weight:750;color:#087f75;background:#e6f7f4;border-radius:99px;padding:5px 9px;white-space:nowrap}
+.folder-page-content{min-width:0;width:100%;animation:folderPageIn .18s ease both}
+.folder-page-content .user-config-content{display:block!important;padding-top:0}
+.folder-page-content .user-config-content.folder-active-content{display:block!important}
+.folder-page-content .dynamic-sub-tabs,.folder-page-content .nested-project-tabs>.dynamic-sub-tabs{display:none!important}
+.folder-page-content .dynamic-sub-tab-content{display:none!important}
+.folder-page-content .dynamic-sub-tab-content.folder-active-content{display:block!important}
+.folder-page-content .nested-child-content{display:none!important}
+.folder-page-content .nested-child-content.folder-active-content{display:block!important}
+.folder-breadcrumb{font-size:12px;color:#8a9aa9;margin-bottom:15px;overflow-wrap:anywhere}
+.folder-breadcrumb span{color:#087f75;font-weight:700}
+@keyframes folderPageIn{from{opacity:.4;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
+@media(max-width:560px){.folder-card-grid{gap:10px}.folder-card{min-height:128px;padding:15px 13px;border-radius:15px}.folder-card-icon{width:37px;height:37px;flex-basis:37px;font-size:19px}.folder-card-title{font-size:13px}.folder-card-subtitle{font-size:11px}.main-header.folder-mode{padding-left:62px;padding-right:62px}.main-header.folder-mode .folder-header-left{left:10px}.main-header.folder-mode .folder-header-right{right:10px}.folder-back-btn{width:38px;height:38px}}
+@media(prefers-reduced-motion:reduce){.folder-card,.folder-page-content{animation:none!important;transition:none!important}}
+
+/* Selected-account header: menu icon at the far left and identity centered. */
+.main-header.account-selected-header{
+    position:relative;
+    justify-content:center!important;
+    min-height:64px;
+    padding:10px 72px;
+}
+.main-header.account-selected-header .account-header-menu{
+    position:absolute;
+    left:16px;
+    top:50%;
+    transform:translateY(-50%);
+    display:flex;
+    align-items:center;
+}
+.account-menu-button{
+    width:42px;
+    height:42px;
+    display:grid;
+    place-items:center;
+    border:1px solid rgba(255,255,255,.35);
+    border-radius:12px;
+    background:rgba(255,255,255,.15);
+    color:#fff;
+    font-size:23px;
+    line-height:1;
+    cursor:pointer;
+}
+.account-menu-button:hover{background:rgba(255,255,255,.27)}
+.account-header-identity,
+.account-folder-identity{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:2px;
+    width:100%;
+    min-width:0;
+    max-width:min(60vw,720px);
+    margin:0 auto;
+    text-align:center;
+}
+.account-header-username{color:#fff;font-size:17px;font-weight:750;line-height:1.25;overflow-wrap:anywhere}
+.account-header-email{color:rgba(255,255,255,.88);font-size:12px;font-weight:500;line-height:1.3;overflow-wrap:anywhere}
+.main-header.folder-mode.account-selected-header .folder-header-title.account-folder-identity{
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    justify-content:center;
+    gap:2px;
+    max-width:min(60vw,720px);
+    width:100%;
+    text-align:center;
+    font-size:inherit;
+    font-weight:inherit;
+}
+.main-header.folder-mode.account-selected-header .folder-header-left{left:16px}
+.main-header.folder-mode.account-selected-header .folder-header-right{right:16px}
+.main-header.folder-mode.account-selected-header .account-header-username{font-size:17px;font-weight:750}
+.main-header.folder-mode.account-selected-header .account-header-email{font-size:12px;font-weight:500}
+.main-header.folder-mode.account-selected-header .folder-menu-button{display:grid}
+@media(max-width:560px){
+    .main-header.account-selected-header{min-height:62px;padding:9px 58px}
+    .account-header-identity,.main-header.folder-mode.account-selected-header .folder-header-title.account-folder-identity{max-width:calc(100% - 150px);width:calc(100% - 150px)}
+    .main-header.account-selected-header .account-header-menu{left:10px}
+    .account-menu-button{width:38px;height:38px;font-size:21px}
+    .account-header-username{font-size:15px}
+    .account-header-email{font-size:11px}
+    .main-header.folder-mode.account-selected-header .folder-header-left{left:10px}
+    .main-header.folder-mode.account-selected-header .folder-header-right{right:10px}
+    .main-header.folder-mode.account-selected-header .account-header-username{font-size:15px}
+    .main-header.folder-mode.account-selected-header .account-header-email{font-size:11px}
+}
+
+/* Right-edge account switcher dropdown */
+.main-header.account-selected-header { overflow:visible; }
+.account-switcher-host { position:absolute; right:16px; top:50%; transform:translateY(-50%); z-index:12000; }
+.account-switcher { position:relative; }
+.account-switcher-toggle {
+    display:flex; align-items:center; gap:8px; max-width:230px; min-height:40px;
+    padding:8px 12px; border:1px solid rgba(255,255,255,.38); border-radius:11px;
+    background:rgba(255,255,255,.16); color:#fff; cursor:pointer; font:600 13px/1.2 'Segoe UI',Arial,sans-serif;
+}
+.account-switcher-toggle:hover,.account-switcher-toggle[aria-expanded="true"] { background:rgba(255,255,255,.28); }
+.account-switcher-toggle-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.account-switcher-chevron { opacity:.9; font-size:11px; flex:0 0 auto; }
+.account-switcher-dropdown {
+    position:absolute; top:calc(100% + 9px); right:0; width:min(330px,calc(100vw - 20px));
+    max-height:min(68vh,520px); overflow:hidden; display:flex; flex-direction:column;
+    border:1px solid #dce5ec; border-radius:14px; background:#fff; color:#243244;
+    box-shadow:0 18px 50px rgba(15,23,42,.25); z-index:12001;
+}
+.account-switcher-dropdown[hidden] { display:none !important; }
+.account-switcher-search { width:calc(100% - 20px); margin:10px; padding:10px 12px; border:1px solid #dce5ec; border-radius:9px; outline:none; }
+.account-switcher-list { overflow-y:auto; padding:0 8px 8px; }
+.account-switcher-user-form { margin:0; }
+.account-switcher-user { display:flex; width:100%; flex-direction:column; gap:3px; padding:10px 11px; border:0; border-radius:9px; background:#fff; text-align:left; cursor:pointer; color:#253449; }
+.account-switcher-user:hover { background:#f1f7f8; }
+.account-switcher-user.is-current { background:#e8f5f2; color:#075e57; }
+.account-switcher-user-name { font-weight:700; font-size:13px; overflow-wrap:anywhere; }
+.account-switcher-user-email { color:#718096; font-size:11px; overflow-wrap:anywhere; }
+.account-switcher-empty { padding:16px 12px; color:#64748b; font-size:12px; text-align:center; }
+.main-header.folder-mode.account-selected-header .account-switcher-host { right:16px; }
+@media(max-width:560px) {
+  .account-switcher-host { right:9px; }
+  .account-switcher-toggle { max-width:112px; min-height:37px; padding:7px 8px; font-size:11px; gap:5px; }
+  .account-switcher-dropdown { right:0; width:min(300px,calc(100vw - 16px)); }
+  .main-header.folder-mode.account-selected-header .account-switcher-host { right:9px; }
+}
+
+/* FINAL FOLDER-ONLY NAVIGATION OVERRIDES: no tab strips or tab-shaped navigation */
+body:has(#sceneiqFolderRoot) .dashboard-tabs,
+body:has(#sceneiqFolderRoot) .user-config-tabs,
+body:has(#sceneiqFolderRoot) #newProjectSubTabs,
+body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tabs,
+body:has(#sceneiqFolderRoot) .folder-page-content .nested-project-tabs > .dynamic-sub-tabs {
+    display:none !important;
+    visibility:hidden !important;
+    height:0 !important;
+    min-height:0 !important;
+    max-height:0 !important;
+    margin:0 !important;
+    padding:0 !important;
+    border:0 !important;
+    overflow:hidden !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .user-config-content {
+    display:block !important;
+    width:100%;
+    padding:0 !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tab-content {
+    display:none !important;
+    width:100%;
+    padding:0 !important;
+    border:0 !important;
+    background:transparent !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tab-content.folder-active-content {
+    display:block !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .nested-child-content {
+    display:none !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .nested-child-content.folder-active-content {
+    display:block !important;
+}
+body:has(#sceneiqFolderRoot) .folder-page-content .folder-page-content {
+    width:100%;
+    max-width:100%;
+    padding:0;
+    margin:0;
+}
+body:has(#sceneiqFolderRoot) .folder-nav-root {
+    padding-top:20px;
+}
+@media(max-width:560px) {
+    body:has(#sceneiqFolderRoot) .folder-nav-root { padding-top:14px; }
+}
+</style>
 </head>
+<script>
+window.sceneIQAccountSwitcherUsers = <?php
+    $switcherUsers = array_map(function ($account) {
+        return [
+            'id' => (int)($account['id'] ?? 0),
+            'username' => (string)($account['username'] ?? ''),
+            'email' => (string)($account['email'] ?? '')
+        ];
+    }, $users);
+    echo json_encode($switcherUsers, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT);
+?>;
+window.sceneIQSelectedAccountId = <?php echo (int)$selectedUserId; ?>;
+</script>
 <body class="<?php echo $selectedUserId > 0 ? 'sceneiq-folder-pending' : ''; ?>">
     <div class="custom-body">
-        <div class="main-header" style="display:flex;">
-            <div><h1>SceneIQ <span>Server</span></h1></div>
-            <div>
-                <?php if ($selectedUserId > 0 && $selectedUser): ?>
-                    <button type="button" class="debug-btn" id="menuButton" onclick="openMenuDrawer()" aria-haspopup="dialog" aria-controls="menuDrawer">Menu</button>
-                <?php else: ?>
-                    <button type="button" class="debug-btn" id="taskButton" onclick="window.location.href='index.php'">Task</button>
-                <?php endif; ?>
+        <?php if ($selectedUserId > 0 && $selectedUser): ?>
+            <div class="main-header account-selected-header"
+                 data-account-username="<?php echo htmlspecialchars($selectedUser['username'] ?? '', ENT_QUOTES, 'UTF-8'); ?>"
+                 data-account-email="<?php echo htmlspecialchars($selectedUser['email'] ?? '', ENT_QUOTES, 'UTF-8'); ?>"
+                 data-account-id="<?php echo (int)($selectedUser['id'] ?? 0); ?>">
+                <div class="account-header-menu">
+                    <button type="button" class="account-menu-button" id="menuButton" onclick="openMenuDrawer()"
+                            aria-label="Open menu" title="Menu" aria-haspopup="dialog" aria-controls="menuDrawer">
+                        <span aria-hidden="true">☰</span>
+                    </button>
+                </div>
+                <div class="account-header-identity" aria-label="Selected account">
+                    <div class="account-header-username"><?php echo htmlspecialchars($selectedUser['username'] ?? '', ENT_QUOTES, 'UTF-8'); ?></div>
+                    <div class="account-header-email"><?php echo htmlspecialchars($selectedUser['email'] ?? '', ENT_QUOTES, 'UTF-8'); ?></div>
+                </div>
+                <div class="account-switcher-host" aria-live="polite"></div>
             </div>
-        </div>
+        <?php else: ?>
+            <div class="main-header" style="display:flex;">
+                <div><h1>SceneIQ <span>Server</span></h1></div>
+                <div>
+                    <button type="button" class="debug-btn" id="taskButton" onclick="window.location.href='index.php'">Task</button>
+                </div>
+            </div>
+        <?php endif; ?>
         
         <div class="scroll-body">
             <div class="server-container">
@@ -4552,12 +5752,14 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                                         <?php 
                                         $firstTabIndex = -1;
                                     foreach ($userDynamicTabs as $candidateIndex => $candidateTab) {
+                                        if (!is_array($candidateTab)) continue;
                                         if (!array_key_exists('display_tab', $candidateTab) || !empty($candidateTab['display_tab'])) {
                                             $firstTabIndex = $candidateIndex;
                                             break;
                                         }
                                     }
                                         foreach ($userDynamicTabs as $tabIndex => $tab): 
+                                            if (!is_array($tab)) continue;
                                             if (array_key_exists('display_tab', $tab) && empty($tab['display_tab'])) continue;
                                             $isActive = ($tabIndex === $firstTabIndex) ? 'active' : '';
                                         ?>
@@ -4574,18 +5776,20 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                                     <?php 
                                     $firstTabIndex = -1;
                                     foreach ($userDynamicTabs as $candidateIndex => $candidateTab) {
+                                        if (!is_array($candidateTab)) continue;
                                         if (!array_key_exists('display_tab', $candidateTab) || !empty($candidateTab['display_tab'])) {
                                             $firstTabIndex = $candidateIndex;
                                             break;
                                         }
                                     }
                                     foreach ($userDynamicTabs as $tabIndex => $tab): 
+                                        if (!is_array($tab)) continue;
                                         if (array_key_exists('display_tab', $tab) && empty($tab['display_tab'])) continue;
                                         $isActive = ($tabIndex === $firstTabIndex) ? 'active' : '';
                                     ?>
                                         <div id="newProjectSubTab_tab_<?php echo $tabIndex; ?>" class="dynamic-sub-tab-content <?php echo $isActive; ?>">
                                             <?php
-                                                $children = (isset($tab['sub_tabs_mode']) && $tab['sub_tabs_mode'] === 'add' && !empty($tab['sub_tabs']) && is_array($tab['sub_tabs'])) ? array_values(array_filter($tab['sub_tabs'], function($child) { return !array_key_exists('display_tab', $child) || !empty($child['display_tab']); })) : [];
+                                                $children = (isset($tab['sub_tabs_mode']) && $tab['sub_tabs_mode'] === 'add' && !empty($tab['sub_tabs']) && is_array($tab['sub_tabs'])) ? array_values(array_filter($tab['sub_tabs'], function($child) { return is_array($child) && (!array_key_exists('display_tab', $child) || !empty($child['display_tab'])); })) : [];
                                                 if (!empty($children)):
                                             ?>
                                                 <?php if (!empty($tab['header']) || !empty($tab['description'])): ?>
@@ -4649,24 +5853,9 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                             
                         <?php else: ?>
                             <div class="dashboard-tabs" role="tablist" aria-label="Account dashboard">
-                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>" onclick="switchDashboardTab('initialize', this)">Initialize Account</button>
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>" onclick="switchDashboardTab('accounts', this)">All Accounts</button>
+                                <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>" onclick="switchDashboardTab('initialize', this)">Initialize Account</button>
                                 <button type="button" class="dashboard-tab-btn <?php echo ($dashboardView === 'copy_data') ? 'active' : ''; ?>" onclick="switchDashboardTab('copy_data', this)">Copy Data</button>
-                            </div>
-                            
-                            <div id="dash_tab_initialize" class="dashboard-content <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>">
-                                <div class="create-user-form">
-                                    <h3> Create New Account</h3>
-                                    <form method="POST" id="createUserForm">
-                                        <div class="form-row">
-                                            <input type="email" name="email" placeholder="Email" required>
-                                            <input type="text" name="username" placeholder="Username" required>
-                                            <input type="password" name="password" placeholder="Password (min 6 chars)" required minlength="6">
-                                            <button type="submit" name="create_user" class="btn-create">Create Account</button>
-                                            <button class="btn-create" onclick="window.location.href='users.php'">Login as a Account</button>
-                                        </div>
-                                    </form>
-                                </div>
                             </div>
                             
                             <div id="dash_tab_accounts" class="dashboard-content <?php echo ($dashboardView === 'accounts') ? 'active' : ''; ?>">
@@ -4688,20 +5877,37 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                                 </div>
                             </div>
                             
+                            <div id="dash_tab_initialize" class="dashboard-content <?php echo ($dashboardView === 'initialize') ? 'active' : ''; ?>">
+                                <div class="create-user-form">
+                                    <h3> Create New Account</h3>
+                                    <form method="POST" id="createUserForm">
+                                        <div class="form-row">
+                                            <input type="email" name="email" placeholder="Email" required>
+                                            <input type="text" name="username" placeholder="Username" required>
+                                            <input type="password" name="password" placeholder="Password (min 6 chars)" required minlength="6">
+                                            <button type="submit" name="create_user" class="btn-create">Create Account</button>
+                                            <button class="btn-create" onclick="window.location.href='users.php'">Login as a Account</button>
+                                        </div>
+                                    </form>
+                                </div>
+                            </div>
+                            
                             <div id="dash_tab_copy_data" class="dashboard-content <?php echo ($dashboardView === 'copy_data') ? 'active' : ''; ?>">
                                 <section class="copy-data-panel">
                                     <h3>Copy Data Between Accounts</h3>
                                     <p class="copy-data-description">
-                                        Copy the complete saved Dynamic tab configuration, Dynamic content definitions, or both.
-                                        The selected destination data will be replaced by the source data exactly as stored.
-                                        Project entries (Pending, Completed, and Aborted) are not changed.
+                                        Choose a source, select Dynamic tabs, Dynamic field, or Both, then choose one or more destination accounts.
+                                        Only the checked items are copied. Destination data with unrelated keys is preserved; matching field or tab keys are replaced.
+                                        Project entries (Pending, Completed, and Aborted) are never changed.
                                     </p>
 
                                     <?php if (count($users) < 2): ?>
                                         <p class="copy-data-empty">At least two accounts are required to copy data between accounts.</p>
                                     <?php else: ?>
-                                        <form method="POST" id="copyAccountDataForm" class="copy-data-form" onsubmit="return confirmCopyDataForm();">
+                                        <form method="POST" id="copyAccountDataForm" class="copy-data-form">
                                             <input type="hidden" name="copy_account_data" value="1">
+                                            <input type="hidden" name="copy_data_scope" id="copyDataScope" value="">
+                                            <input type="hidden" name="sceneiq_copy_csrf_token" value="<?php echo htmlspecialchars($_SESSION['sceneiq_copy_csrf_token'], ENT_QUOTES, 'UTF-8'); ?>">
 
                                             <div class="copy-data-field">
                                                 <label for="copyDataFromAccount">Copy data from Account</label>
@@ -4714,26 +5920,27 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                                             </div>
 
                                             <div class="copy-data-field">
-                                                <label for="copyDataScope">Copy data of</label>
-                                                <select name="copy_data_scope" id="copyDataScope" required>
-                                                    <option value="dynamic_tabs_and_fields">Dynamic tab and Dynamic content</option>
-                                                    <option value="dynamic_tabs">Dynamic tab</option>
-                                                    <option value="dynamic_fields">Dynamic content</option>
-                                                </select>
+                                                <label>What should be copied?</label>
+                                                <div class="copy-mode-grid" id="copyModeGrid">
+                                                    <button type="button" class="copy-mode-button" data-copy-scope="dynamic_tabs">Dynamic tabs</button>
+                                                    <button type="button" class="copy-mode-button" data-copy-scope="dynamic_fields">Dynamic field</button>
+                                                    <button type="button" class="copy-mode-button" data-copy-scope="dynamic_tabs_and_fields">Both</button>
+                                                </div>
+                                                <small class="copy-data-help">Nothing is selected by default. Choose an option to configure exactly which items are copied.</small>
                                             </div>
 
                                             <div class="copy-data-field">
-                                                <label for="copyDataToAccount">Copy These Data to Account</label>
-                                                <select name="copy_to_account" id="copyDataToAccount" required>
-                                                    <option value="">Select destination account</option>
-                                                    <?php foreach ($users as $user): ?>
-                                                        <option value="<?php echo (int)$user['id']; ?>"><?php echo htmlspecialchars($user['username'] . ' — ' . $user['email'], ENT_QUOTES, 'UTF-8'); ?></option>
-                                                    <?php endforeach; ?>
-                                                </select>
+                                                <label>Copy to these accounts</label>
+                                                <button type="button" class="copy-destination-trigger" id="copyDestinationTrigger" disabled>
+                                                    <span id="copyDestinationLabel">Choose destination accounts</span>
+                                                    <span class="copy-destination-count" id="copyDestinationCount">0 selected</span>
+                                                </button>
+                                                <small class="copy-data-help">You can select multiple destination accounts. The source account is excluded automatically.</small>
                                             </div>
 
+                                            <div class="copy-selection-summary" id="copySelectionSummary">No data category selected.</div>
                                             <div class="copy-data-actions">
-                                                <button type="submit" class="btn btn-primary">Copy Data</button>
+                                                <button type="submit" class="btn btn-primary" id="copyDataSubmit" disabled>Copy Data</button>
                                             </div>
                                         </form>
                                     <?php endif; ?>
@@ -4825,6 +6032,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
 
 <?php
     function renderNewProjectForm($dynamicFields, $selectedUserId) {
+        $dynamicFields = normalizeDynamicFieldDefinitions($dynamicFields);
         if (empty($dynamicFields)) {
             echo '<p style="color:#6b7280;">No fields available for this view.</p>';
             return;
@@ -4837,17 +6045,20 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
             <input type="hidden" class="entryUploadCsrf" value="<?php echo htmlspecialchars($_SESSION['entry_upload_csrf_token'] ?? '', ENT_QUOTES, 'UTF-8'); ?>">
             
             <?php foreach ($dynamicFields as $key => $field): ?>
-                <?php if ($field['field_type'] === 'objects'): ?>
+                <?php if (!is_array($field)) continue; ?>
+                <?php if (($field['field_type'] ?? 'individual') === 'objects'): ?>
                     <div class="form-group" style="border:2px solid #00695c; border-radius:10px; padding:15px; margin-bottom:15px;">
                         <h4 style="color:#00695c; margin-bottom:10px;"> <?php echo htmlspecialchars($field['field-title'] ?? $key); ?></h4>
                         <div id="object_<?php echo $key; ?>_container">
                             <?php 
                                 $subFields = $field['fieldkeyvalue'] ?? [];
+                                if (!is_array($subFields)) $subFields = [];
                                 foreach ($subFields as $subKey => $subField):
+                                    if (!is_array($subField)) continue;
                                     $elementType = $subField['element_type'] ?? 'input';
                                     $title = $subField['field-title'] ?? $subKey;
-                                    $defaultValue = $subField['default_value'] ?? '';
-                                    $buttonUrl = $subField['button_url'] ?? '';
+                                    $defaultValue = sceneiqValueToText($subField['default_value'] ?? '');
+                                    $buttonUrl = sceneiqValueToText($subField['button_url'] ?? '');
                             ?>
                                 <div class="sub-field-group">
                                     <label><?php echo htmlspecialchars($title); ?></label>
@@ -4941,9 +6152,9 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                         <label><?php echo htmlspecialchars($field['field-title'] ?? $key); ?></label>
                         <?php 
                             $elementType = $field['element_type'] ?? 'input';
-                            $defaultValue = $field['default_value'] ?? '';
+                            $defaultValue = sceneiqValueToText($field['default_value'] ?? '');
                             $defaultValues = $field['default_values'] ?? [];
-                            $buttonUrl = $field['button_url'] ?? '';
+                            $buttonUrl = sceneiqValueToText($field['button_url'] ?? '');
                         ?>
                         <?php if ($elementType === 'copy_button_for_each_of'): ?>
                             <div id="field_<?php echo htmlspecialchars($key); ?>_container" style="display:flex;flex-direction:column;gap:12px;margin:10px 0;">
@@ -5072,6 +6283,81 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
     }
 ?>
 
+<div class="sceneiq-copy-modal" id="copySelectionModal" aria-hidden="true">
+    <div class="sceneiq-copy-modal-panel" role="dialog" aria-modal="true" aria-labelledby="copySelectionModalTitle">
+        <div class="sceneiq-copy-modal-header">
+            <div><h3 id="copySelectionModalTitle">Choose data to copy</h3><p id="copySelectionModalDescription">All source items are selected initially. Uncheck anything you do not want copied.</p></div>
+            <button type="button" class="sceneiq-copy-modal-close" data-copy-modal-close="selection" aria-label="Close">×</button>
+        </div>
+        <div class="copy-config-tabs" id="copyConfigTabs" hidden>
+            <button type="button" class="active" data-copy-config-tab="dynamic_tabs">Dynamic tabs</button>
+            <button type="button" data-copy-config-tab="dynamic_fields">Dynamic field</button>
+        </div>
+        <div class="copy-config-toolbar">
+            <span id="copyConfigCount">0 selected</span>
+            <div><button type="button" class="btn btn-secondary btn-sm" id="copyConfigSelectAll">Select all</button><button type="button" class="btn btn-secondary btn-sm" id="copyConfigClearAll">Clear all</button></div>
+        </div>
+        <div class="copy-config-list" id="copyConfigList"></div>
+        <div class="sceneiq-copy-modal-actions">
+            <button type="button" class="btn btn-secondary" data-copy-modal-close="selection">Cancel</button>
+            <button type="button" class="btn btn-primary" id="copyConfigApply">Use selected data</button>
+        </div>
+    </div>
+</div>
+
+<div class="sceneiq-copy-modal" id="copyDestinationModal" aria-hidden="true">
+    <div class="sceneiq-copy-modal-panel" role="dialog" aria-modal="true" aria-labelledby="copyDestinationModalTitle">
+        <div class="sceneiq-copy-modal-header">
+            <div><h3 id="copyDestinationModalTitle">Choose destination accounts</h3><p id="copyDestinationModalDescription">Select one or more accounts. The source account is not listed.</p></div>
+            <button type="button" class="sceneiq-copy-modal-close" data-copy-modal-close="destinations" aria-label="Close">×</button>
+        </div>
+        <div class="copy-config-toolbar">
+            <span id="copyDestinationModalCount">0 selected</span>
+            <div><button type="button" class="btn btn-secondary btn-sm" id="copyDestinationSelectAll">Select all</button><button type="button" class="btn btn-secondary btn-sm" id="copyDestinationClearAll">Clear all</button></div>
+        </div>
+        <div class="copy-config-list" id="copyDestinationList"></div>
+        <div class="sceneiq-copy-modal-actions">
+            <button type="button" class="btn btn-secondary" data-copy-modal-close="destinations">Cancel</button>
+            <button type="button" class="btn btn-primary" id="copyDestinationApply">Use selected accounts</button>
+        </div>
+    </div>
+</div>
+
+<style>
+.copy-mode-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:9px; }
+.copy-mode-button { min-height:46px; padding:10px 12px; border:1px solid #cbd5e1; border-radius:9px; background:#fff; color:#334155; font-weight:700; cursor:pointer; }
+.copy-mode-button:hover:not(:disabled), .copy-mode-button.active { border-color:#0f766e; background:#f0fdfa; color:#115e59; }
+.copy-mode-button:disabled { opacity:.45; cursor:not-allowed; }
+.copy-data-help { color:#64748b; font-size:12px; line-height:1.5; }
+.copy-destination-trigger { width:100%; min-height:48px; padding:10px 12px; display:flex; align-items:center; justify-content:space-between; gap:12px; border:1px solid #cbd5e1; border-radius:9px; background:#fff; color:#172033; font-weight:600; text-align:left; cursor:pointer; }
+.copy-destination-trigger:disabled { opacity:.5; cursor:not-allowed; }
+.copy-destination-count { color:#0f766e; font-size:12px; white-space:nowrap; }
+.copy-selection-summary { padding:11px 12px; border:1px solid #e2e8f0; border-radius:9px; background:#f8fafc; color:#475569; font-size:13px; }
+.sceneiq-copy-modal { position:fixed; inset:0; z-index:2147482000; display:none; align-items:center; justify-content:center; padding:18px; background:rgba(15,23,42,.58); }
+.sceneiq-copy-modal.active { display:flex; }
+.sceneiq-copy-modal-panel { width:min(720px,100%); max-height:min(86vh,850px); display:flex; flex-direction:column; overflow:hidden; border:1px solid #dbe3eb; border-radius:16px; background:#fff; box-shadow:0 24px 80px rgba(15,23,42,.28); }
+.sceneiq-copy-modal-header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; padding:18px 20px; border-bottom:1px solid #e5e7eb; }
+.sceneiq-copy-modal-header h3 { margin:0 0 5px; color:#172033; font-size:19px; }
+.sceneiq-copy-modal-header p { margin:0; color:#64748b; font-size:13px; line-height:1.45; }
+.sceneiq-copy-modal-close { width:34px; height:34px; flex:0 0 34px; border:0; border-radius:8px; background:#f1f5f9; color:#334155; font-size:24px; cursor:pointer; }
+.copy-config-tabs { display:flex; gap:8px; padding:12px 18px 0; }
+.copy-config-tabs[hidden] { display:none !important; }
+.copy-config-tabs button { min-height:38px; padding:8px 14px; border:1px solid #dbe3eb; border-radius:8px; background:#f8fafc; color:#475569; font-weight:700; cursor:pointer; }
+.copy-config-tabs button.active { border-color:#0f766e; background:#f0fdfa; color:#115e59; }
+.copy-config-toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:12px 18px; color:#64748b; font-size:12px; }
+.copy-config-toolbar > div { display:flex; gap:7px; }
+.copy-config-list { min-height:120px; max-height:52vh; overflow:auto; padding:0 18px 14px; overscroll-behavior:contain; }
+.copy-config-option { display:flex; align-items:center; justify-content:space-between; gap:14px; padding:11px 12px; margin-bottom:7px; border:1px solid #e2e8f0; border-radius:9px; background:#fff; cursor:pointer; }
+.copy-config-option:hover { background:#f8fafc; }
+.copy-config-option-copy { display:flex; flex-direction:column; gap:4px; min-width:0; }
+.copy-config-option-title { color:#1f2937; font-size:13px; font-weight:700; overflow-wrap:anywhere; }
+.copy-config-option-meta { color:#64748b; font-size:11px; overflow-wrap:anywhere; }
+.copy-config-option input { width:18px; height:18px; flex:0 0 18px; accent-color:#0f766e; }
+.copy-config-empty { padding:24px 12px; color:#64748b; text-align:center; }
+.sceneiq-copy-modal-actions { display:flex; justify-content:flex-end; gap:9px; padding:14px 18px; border-top:1px solid #e5e7eb; background:#fff; }
+@media(max-width:560px) { .copy-mode-grid { grid-template-columns:1fr; } .sceneiq-copy-modal { padding:8px; } .sceneiq-copy-modal-panel { max-height:92vh; } .copy-config-list { max-height:58vh; } .sceneiq-copy-modal-actions { flex-direction:column-reverse; } .sceneiq-copy-modal-actions .btn { width:100%; } }
+</style>
+
 <script>
     function openUrl(url) {
         if (!url) return;
@@ -5082,10 +6368,10 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         window.open(url, '_blank');
     }
     // ===== DATA =====
-    var selectedUserId = <?php echo json_encode($selectedUserId); ?>;
-    var globalDynamicFields = <?php echo json_encode($globalDynamicFields); ?>;
-    var userSettings = <?php echo json_encode($userSettings); ?>;
-    var userDynamicTabs = <?php echo json_encode($userDynamicTabs); ?>;
+    var selectedUserId = <?php echo json_encode($selectedUserId, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
+    var globalDynamicFields = <?php echo json_encode($globalDynamicFields, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
+    var userSettings = <?php echo json_encode($userSettings, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
+    var userDynamicTabs = <?php echo json_encode($userDynamicTabs, JSON_INVALID_UTF8_SUBSTITUTE | JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
     var _pendingSaveData = null;
 
     // ============================================================
@@ -5703,9 +6989,25 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         var toggle = document.getElementById('deleteDataToggle');
         if (!options || !toggle) return;
 
-        var opening = !options.classList.contains('open');
-        options.classList.toggle('open', opening);
-        toggle.setAttribute('aria-expanded', opening ? 'true' : 'false');
+        // Closing an already-open section does not need another confirmation.
+        if (options.classList.contains('open')) {
+            options.classList.remove('open');
+            toggle.setAttribute('aria-expanded', 'false');
+            return;
+        }
+
+        // Opening Delete Data is deliberately gated by the custom confirmation modal.
+        showDialog('Open Delete Data?', 'Are you sure you want to open this?', [
+            { label: 'No', class: 'btn-secondary', callback: null },
+            {
+                label: 'Yes',
+                class: 'btn-confirm',
+                callback: function() {
+                    options.classList.add('open');
+                    toggle.setAttribute('aria-expanded', 'true');
+                }
+            }
+        ]);
     }
 
     function requestDeleteData(scope) {
@@ -5736,7 +7038,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                     return;
                 }
                 scopeInput.value = scope;
-                form.submit();
+                form.requestSubmit ? form.requestSubmit() : form.submit();
             }
         );
     }
@@ -5793,54 +7095,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         });
     }
 
-    // Exclude the selected source account from the destination options.
-    function syncCopyDataTargetAccounts() {
-        var sourceSelect = document.getElementById('copyDataFromAccount');
-        var targetSelect = document.getElementById('copyDataToAccount');
-        if (!sourceSelect || !targetSelect) return;
-
-        var sourceId = sourceSelect.value;
-        Array.prototype.forEach.call(targetSelect.options, function(option) {
-            if (!option.value) return;
-            var isSource = option.value === sourceId;
-            option.disabled = isSource;
-            option.hidden = isSource;
-        });
-
-        if (targetSelect.value && targetSelect.value === sourceId) {
-            targetSelect.value = '';
-        }
-    }
-
-    function confirmCopyDataForm() {
-        var sourceSelect = document.getElementById('copyDataFromAccount');
-        var targetSelect = document.getElementById('copyDataToAccount');
-        var scopeSelect = document.getElementById('copyDataScope');
-        if (!sourceSelect || !targetSelect || !scopeSelect) return false;
-
-        if (!sourceSelect.value || !targetSelect.value) {
-            showDialog('Select Accounts', 'Choose both the source account and destination account.');
-            return false;
-        }
-        if (sourceSelect.value === targetSelect.value) {
-            showDialog('Invalid Selection', 'The source and destination accounts must be different.');
-            return false;
-        }
-
-        var sourceLabel = sourceSelect.options[sourceSelect.selectedIndex].text;
-        var targetLabel = targetSelect.options[targetSelect.selectedIndex].text;
-        var scopeLabel = scopeSelect.options[scopeSelect.selectedIndex].text;
-        return window.confirm(
-            'Copy ' + scopeLabel + ' from ' + sourceLabel + ' to ' + targetLabel + '?\n\n' +
-            'The selected destination data will be replaced completely. This action cannot be undone.'
-        );
-    }
-
-    var copyDataFromSelect = document.getElementById('copyDataFromAccount');
-    if (copyDataFromSelect) {
-        copyDataFromSelect.addEventListener('change', syncCopyDataTargetAccounts);
-        syncCopyDataTargetAccounts();
-    }
+    // The account-copy controls are initialized by the dedicated SceneIQ multi-copy controller below.
 
     // ============================================================
     // ===== USER CONFIG TAB SWITCHING =====
@@ -5959,7 +7214,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         
         userDynamicTabs = updatedTabs;
         document.getElementById('submitTabsDataInput').value = JSON.stringify(updatedTabs);
-        document.getElementById('submitTabsForm').submit();
+        (document.getElementById('submitTabsForm').requestSubmit ? document.getElementById('submitTabsForm').requestSubmit() : document.getElementById('submitTabsForm').submit());
     }
 
     // ===== UPDATE renderUserGlobalDynamicFields FUNCTION =====
@@ -6099,8 +7354,8 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                 var extraInfo = elementType === 'button' ? ' (URL: ' + buttonUrl + ')' : '';
                 fieldInfo = '<div><strong>Type:</strong> Individual field</div>' +
                     '<div><strong>Element:</strong> ' + escapeHtml(String(elementType + extraInfo)) + '</div>' +
-                    (defaultValue ? '<div><strong>Default value:</strong> ' + escapeHtml(String(defaultValue)) + '</div>' : '') +
-                    (defaultValues.length ? '<div><strong>' + (elementType === 'multiple-selections' ? 'Available values:' : 'Select options:') + '</strong> ' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</div>' : '');
+                    (defaultValue !== '' ? '<div class="account-dynamic-field-value"><strong>Default value:</strong><pre>' + escapeHtml(String(defaultValue)) + '</pre></div>' : '') +
+                    (defaultValues.length ? '<div class="account-dynamic-field-value"><strong>' + (elementType === 'multiple-selections' ? 'Available values:' : 'Select options:') + '</strong><pre>' + defaultValues.map(function(v) { return escapeHtml(String(v)); }).join(', ') + '</pre></div>' : '');
             }
 
             card.innerHTML =
@@ -6122,6 +7377,19 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                         '<button type="button" class="btn btn-danger btn-sm account-field-delete">Delete</button>' +
                     '</div>' +
                 '</div>';
+
+            var copyFieldButton = document.createElement('button');
+            copyFieldButton.type = 'button';
+            copyFieldButton.className = 'btn btn-secondary btn-sm account-field-copy';
+            copyFieldButton.textContent = 'Copy field to';
+            copyFieldButton.addEventListener('click', function(event) {
+                event.preventDefault();
+                event.stopPropagation();
+                openCopyFieldToUsers(key);
+            });
+            var headingSide = card.querySelector('.account-dynamic-field-heading-side');
+            var chevron = headingSide ? headingSide.querySelector('.account-dynamic-field-chevron') : null;
+            if (headingSide) headingSide.insertBefore(copyFieldButton, chevron);
 
             var editButton = card.querySelector('.account-field-edit');
             var deleteButton = card.querySelector('.account-field-delete');
@@ -6318,12 +7586,13 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
     // values remain native JSON values in the copied object.
     function copySingleStatusEntry(index, button) {
         var entryIndex = Number(index);
-        if (!Number.isInteger(entryIndex) || entryIndex < 0 || !Array.isArray(userSettings) || !userSettings[entryIndex]) {
+        var sourceEntry = (Array.isArray(userSettings) ? userSettings : []).find(function(item, pos) { return Number(item && (item._db_id || item._index || pos)) === entryIndex; });
+        if (!Number.isInteger(entryIndex) || entryIndex <= 0 || !sourceEntry) {
             showDialog('Copy Error', 'This entry could not be found. Refresh the account and try again.');
             return;
         }
 
-        var record = normalizeRecordTypesForCopy(userSettings[entryIndex]);
+        var record = normalizeRecordTypesForCopy(sourceEntry);
         copyToClipboard(JSON.stringify(record, null, 2), button);
     }
 
@@ -6333,7 +7602,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         var entries = userSettings.filter(function(entry, index) {
             var entryStatus = (entry.status || 'pending').toLowerCase();
             if (entryStatus === status) {
-                entry._index = index;
+                entry._index = Number(entry._db_id || entry._index || index);
                 return true;
             }
             return false;
@@ -6358,7 +7627,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         var entries = userSettings.filter(function(entry, index) {
             var entryStatus = (entry.status || 'pending').toLowerCase();
             if (entryStatus === status) {
-                entry._index = index;
+                entry._index = Number(entry._db_id || entry._index || index);
                 return true;
             }
             return false;
@@ -6624,13 +7893,13 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                 '<input type="hidden" name="delete_entry" value="true">' +
                 '<input type="hidden" name="user_id" value="' + selectedUserId + '">' +
                 '<input type="hidden" name="index" value="' + index + '">' +
-                '<button type="button" class="btn btn-danger btn-sm" onclick="confirmAction(\'Delete Entry\', \'Delete this entry?\', function(){ this.closest(\'form\').submit(); }.bind(this))"> Delete</button>' +
+                '<button type="button" class="btn btn-danger btn-sm" onclick="confirmAction(\'Delete Entry\', \'Delete this entry?\', function(){ (this.closest(\'form\').requestSubmit ? this.closest(\'form\').requestSubmit() : this.closest(\'form\').submit()); }.bind(this))"> Delete</button>' +
                 '</form>' +
                 '<form method="POST" style="display:inline;">' +
                 '<input type="hidden" name="update_entry_status" value="true">' +
                 '<input type="hidden" name="user_id" value="' + selectedUserId + '">' +
                 '<input type="hidden" name="index" value="' + index + '">' +
-                '<select name="new_status" class="status-select" onchange="this.form.submit()">' +
+                '<select name="new_status" class="status-select" onchange="this.form.requestSubmit ? this.form.requestSubmit() : this.form.submit()">' +
                 '<option value="pending" ' + (entryStatus === 'pending' ? 'selected' : '') + '> Pending</option>' +
                 '<option value="completed" ' + (entryStatus === 'completed' ? 'selected' : '') + '> Completed</option>' +
                 '<option value="aborted" ' + (entryStatus === 'aborted' ? 'selected' : '') + '> Aborted</option>' +
@@ -6865,7 +8134,9 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         
         fetch(window.location.href, {
             method: 'POST',
-            body: formData
+            body: formData,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
+            credentials: 'same-origin'
         }).catch(function(error) {
             console.log('Error saving cleaned tabs:', error);
         });
@@ -6944,7 +8215,10 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                 display_tab: !!(item.querySelector('.display-tab-input') && item.querySelector('.display-tab-input').value === 'yes'),
                 additional_features: additionalFeatures
             };
+            var old = {};
             if (!isSub) {
+                var idx = parseInt(item.getAttribute('data-tab-index'), 10);
+                old = userDynamicTabs[idx] || {};
                 var mode = item.querySelector('.sub-tabs-mode');
                 result.sub_tabs_mode = mode ? mode.value : 'none';
                 result.sub_tabs = [];
@@ -6962,11 +8236,28 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                         var c = collectTab(child, true); if (c.tab_name) result.sub_tabs.push(c);
                     });
                 }
-                var idx = parseInt(item.getAttribute('data-tab-index'), 10);
-                var old = userDynamicTabs[idx] || {};
                 result.submit_tab = old.submit_tab !== undefined ? old.submit_tab : true;
                 result._expanded = old._expanded || false;
+            } else {
+                // The data-tab-index is the original child index, and survives DOM reordering.
+                // Use it to retain the relational row identity when the editor is saved.
+                var rootItem = item.closest('.root-tab-editor-item');
+                var rootIndex = rootItem ? parseInt(rootItem.getAttribute('data-tab-index'), 10) : -1;
+                var childIndex = parseInt(item.getAttribute('data-tab-index'), 10);
+                var oldRoot = (rootIndex >= 0 && userDynamicTabs[rootIndex]) ? userDynamicTabs[rootIndex] : {};
+                var oldChildren = Array.isArray(oldRoot.sub_tabs) ? oldRoot.sub_tabs : [];
+                old = (childIndex >= 0 && oldChildren[childIndex]) ? oldChildren[childIndex] : {};
             }
+            // Retain DB identity and any extension properties not currently represented
+            // by visible controls. This prevents every Save Tabs operation from creating
+            // replacement rows or silently dropping future tab metadata.
+            ['_table_id','_tab_key'].forEach(function(key) {
+                if (old[key] !== undefined) result[key] = old[key];
+            });
+            Object.keys(old).forEach(function(key) {
+                if (key.charAt(0) === '_' || ['tab_name','header','description','dynamic_fields_display','display_tab','additional_features','sub_tabs','sub_tabs_mode','submit_tab','_expanded'].indexOf(key) !== -1) return;
+                if (result[key] === undefined) result[key] = old[key];
+            });
             return result;
         }
         var tabs = [];
@@ -6977,7 +8268,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         userDynamicTabs = tabs;
         var input = document.getElementById('tabsDataInput');
         var form = document.getElementById('dynamicTabsForm');
-        if (input && form) { input.value = JSON.stringify(tabs); form.submit(); }
+        if (input && form) { input.value = JSON.stringify(tabs); if (form.requestSubmit) form.requestSubmit(); else form.submit(); }
     }
 
     // ============================================================
@@ -7369,7 +8660,12 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
             await postEntryUploadRequest(finishData);
 
             if (saveButton) saveButton.textContent = 'Saved';
-            window.location.reload();
+            await sceneIQRefreshAfterSave(null, 'Project saved successfully.', { refreshProjectMarkup: false });
+            activeForm.dataset.entryUploadRunning = '0';
+            if (saveButton) {
+                saveButton.disabled = false;
+                saveButton.textContent = originalButtonText;
+            }
         } catch (error) {
             if (uploadId && csrfToken) {
                 try {
@@ -8309,15 +9605,15 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         showDialog('Saving', 'Updating field...');
         fetch(window.location.href, {
             method: 'POST',
-            body: formData
+            body: formData,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
+            credentials: 'same-origin'
         })
         .then(function(response) { return response.json(); })
-        .then(function(data) {
+        .then(async function(data) {
             if (data.success) {
                 closeDialog();
-                showDialog('Success', data.message + ' Refreshing...', [
-                    { label: 'OK', class: 'btn-primary', callback: function(){ location.reload(); } }
-                ]);
+                await sceneIQRefreshAfterSave(data.state, data.message, { refreshProjectMarkup: true });
             } else {
                 closeDialog();
                 showDialog('Error', data.message);
@@ -8339,14 +9635,15 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
                 formData.append('field_key', key);
                 fetch(window.location.href, {
                     method: 'POST',
-                    body: formData
+                    body: formData,
+                    headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
+                    credentials: 'same-origin'
                 })
-                .then(function(response) {
-                    if (response.redirected || response.url) {
-                        window.location.reload();
-                    } else {
-                        window.location.reload();
-                    }
+                .then(function(response) { return response.json(); })
+                .then(async function(data) {
+                    if (!data.success) throw new Error(data.message || 'The field could not be deleted.');
+                    closeDialog();
+                    await sceneIQRefreshAfterSave(data.state, data.message, { refreshProjectMarkup: true });
                 })
                 .catch(function(error) {
                     showDialog('Error', 'Failed to delete field: ' + error.message);
@@ -8642,15 +9939,15 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
         showDialog('Saving', 'Saving field...');
         fetch(window.location.href, {
             method: 'POST',
-            body: formData
+            body: formData,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
+            credentials: 'same-origin'
         })
         .then(function(response) { return response.json(); })
-        .then(function(data) {
+        .then(async function(data) {
             if (data.success) {
                 closeDialog();
-                showDialog('Success', data.message + ' Refreshing...', [
-                    { label: 'OK', class: 'btn-primary', callback: function(){ location.reload(); } }
-                ]);
+                await sceneIQRefreshAfterSave(data.state, data.message, { refreshProjectMarkup: true });
             } else {
                 closeDialog();
                 showDialog('Error', data.message);
@@ -10854,95 +12151,7 @@ body.sceneiq-modal-open .scroll-body { overflow:hidden !important; }
 })();
 </script>
 
-<style id="sceneiq-folder-navigation-style">
-/* SceneIQ folder/file navigation */
-.main-header.folder-mode{justify-content:center;position:relative;min-height:64px;padding:12px 72px}
-.main-header.folder-mode .folder-header-left{position:absolute;left:16px;top:50%;transform:translateY(-50%)}
-.main-header.folder-mode .folder-header-title{font-size:17px;font-weight:750;text-align:center;max-width:100%;overflow-wrap:anywhere}
-.main-header.folder-mode .folder-header-right{position:absolute;right:16px;top:50%;transform:translateY(-50%)}
-.folder-back-btn{width:40px;height:40px;border:1px solid rgba(255,255,255,.35);border-radius:12px;background:rgba(255,255,255,.15);color:#fff;font-size:24px;line-height:1;cursor:pointer;display:grid;place-items:center}
-.folder-back-btn:hover{background:rgba(255,255,255,.27)}
-.folder-nav-root{width:100%;max-width:1100px;margin:0 auto;padding:clamp(14px,3vw,30px) 0 35px}
-.folder-nav-heading{margin:0 0 7px;color:#102a43;font-size:clamp(21px,3vw,28px);font-weight:800;letter-spacing:-.035em}
-.folder-nav-description{color:#718096;font-size:13px;margin:0 0 22px;line-height:1.6}
-.folder-card-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px}
-.folder-card{appearance:none;position:relative;min-width:0;min-height:142px;text-align:left;padding:20px 18px;border:1px solid #e2e8f0;border-radius:18px;background:linear-gradient(145deg,#fff 0%,#f8fbfc 100%);box-shadow:0 5px 18px rgba(15,35,55,.055);cursor:pointer;display:flex;flex-direction:column;align-items:flex-start;justify-content:space-between;gap:17px;color:#142b3c;transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;overflow:hidden}
-.folder-card:before{content:"";position:absolute;inset:0 auto 0 0;width:4px;background:var(--folder-accent,#0f8b80);opacity:.85}
-.folder-card:hover{transform:translateY(-3px);border-color:#9bd7ce;box-shadow:0 12px 28px rgba(15,75,80,.11)}
-.folder-card:focus-visible{outline:3px solid #79d3c6;outline-offset:3px}
-.folder-card-top{display:flex;width:100%;align-items:flex-start;justify-content:space-between;gap:12px}
-.folder-card-icon{width:43px;height:43px;flex:0 0 43px;border-radius:13px;background:var(--folder-tint,#e6f7f4);display:grid;place-items:center;font-size:22px}
-.folder-card-arrow{color:#91a2b2;font-size:20px}
-.folder-card-title{font-size:15px;font-weight:780;line-height:1.35;overflow-wrap:anywhere}
-.folder-card-subtitle{margin-top:5px;font-size:12px;line-height:1.45;color:#81909e;overflow-wrap:anywhere}
-.folder-card.wide{grid-column:1/-1;min-height:112px}
-.folder-card.wide .folder-card-top{align-items:center}
-.folder-card.wide .folder-card-copy{flex:1;min-width:0}
-.folder-card-count{font-size:11px;font-weight:750;color:#087f75;background:#e6f7f4;border-radius:99px;padding:5px 9px;white-space:nowrap}
-.folder-page-content{min-width:0;width:100%;animation:folderPageIn .18s ease both}
-.folder-page-content .user-config-content{display:block!important;padding-top:0}
-.folder-page-content .user-config-content.folder-active-content{display:block!important}
-.folder-page-content .dynamic-sub-tabs,.folder-page-content .nested-project-tabs>.dynamic-sub-tabs{display:none!important}
-.folder-page-content .dynamic-sub-tab-content{display:none!important}
-.folder-page-content .dynamic-sub-tab-content.folder-active-content{display:block!important}
-.folder-page-content .nested-child-content{display:none!important}
-.folder-page-content .nested-child-content.folder-active-content{display:block!important}
-.folder-breadcrumb{font-size:12px;color:#8a9aa9;margin-bottom:15px;overflow-wrap:anywhere}
-.folder-breadcrumb span{color:#087f75;font-weight:700}
-@keyframes folderPageIn{from{opacity:.4;transform:translateY(4px)}to{opacity:1;transform:translateY(0)}}
-@media(max-width:560px){.folder-card-grid{gap:10px}.folder-card{min-height:128px;padding:15px 13px;border-radius:15px}.folder-card-icon{width:37px;height:37px;flex-basis:37px;font-size:19px}.folder-card-title{font-size:13px}.folder-card-subtitle{font-size:11px}.main-header.folder-mode{padding-left:62px;padding-right:62px}.main-header.folder-mode .folder-header-left{left:10px}.main-header.folder-mode .folder-header-right{right:10px}.folder-back-btn{width:38px;height:38px}}
-@media(prefers-reduced-motion:reduce){.folder-card,.folder-page-content{animation:none!important;transition:none!important}}
 
-/* FINAL FOLDER-ONLY NAVIGATION OVERRIDES: no tab strips or tab-shaped navigation */
-body:has(#sceneiqFolderRoot) .dashboard-tabs,
-body:has(#sceneiqFolderRoot) .user-config-tabs,
-body:has(#sceneiqFolderRoot) #newProjectSubTabs,
-body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tabs,
-body:has(#sceneiqFolderRoot) .folder-page-content .nested-project-tabs > .dynamic-sub-tabs {
-    display:none !important;
-    visibility:hidden !important;
-    height:0 !important;
-    min-height:0 !important;
-    max-height:0 !important;
-    margin:0 !important;
-    padding:0 !important;
-    border:0 !important;
-    overflow:hidden !important;
-}
-body:has(#sceneiqFolderRoot) .folder-page-content .user-config-content {
-    display:block !important;
-    width:100%;
-    padding:0 !important;
-}
-body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tab-content {
-    display:none !important;
-    width:100%;
-    padding:0 !important;
-    border:0 !important;
-    background:transparent !important;
-}
-body:has(#sceneiqFolderRoot) .folder-page-content .dynamic-sub-tab-content.folder-active-content {
-    display:block !important;
-}
-body:has(#sceneiqFolderRoot) .folder-page-content .nested-child-content {
-    display:none !important;
-}
-body:has(#sceneiqFolderRoot) .folder-page-content .nested-child-content.folder-active-content {
-    display:block !important;
-}
-body:has(#sceneiqFolderRoot) .folder-page-content .folder-page-content {
-    width:100%;
-    max-width:100%;
-    padding:0;
-    margin:0;
-}
-body:has(#sceneiqFolderRoot) .folder-nav-root {
-    padding-top:20px;
-}
-@media(max-width:560px) {
-    body:has(#sceneiqFolderRoot) .folder-nav-root { padding-top:14px; }
-}
-</style>
 <script id="sceneiq-folder-navigation">
     (function(){
     'use strict';
@@ -10959,6 +12168,64 @@ body:has(#sceneiqFolderRoot) .folder-nav-root {
     const accents={add_entry:['#0f8b80','#e5f7f3'],pending:['#d99416','#fff5dd'],completed:['#169b72','#e4f8ef'],aborted:['#e05252','#fff0f0'],dynamic_tabs:['#6575db','#eef0ff'],submit_tabs:['#9a62c7','#f6edff'],dynamic_fields:['#2686c8','#e9f5ff']};
     const mainHeaderContent=header.innerHTML;
     const scrollBody=document.querySelector('.scroll-body');
+
+    function renderAccountSwitcher(){
+        if(!header.classList.contains('account-selected-header')) return;
+        let host=header.querySelector('.account-switcher-host');
+        if(!host){host=document.createElement('div');host.className='account-switcher-host';header.appendChild(host);}
+        host.innerHTML='';
+        const accounts=Array.isArray(window.sceneIQAccountSwitcherUsers)?window.sceneIQAccountSwitcherUsers:[];
+        const currentId=Number(window.sceneIQSelectedAccountId || header.dataset.accountId || 0);
+        const current=accounts.find(function(a){return Number(a.id)===currentId;});
+        const wrapper=document.createElement('div');wrapper.className='account-switcher';
+        const toggle=document.createElement('button');toggle.type='button';toggle.className='account-switcher-toggle';
+        toggle.setAttribute('aria-haspopup','true');toggle.setAttribute('aria-expanded','false');
+        const label=document.createElement('span');label.className='account-switcher-toggle-label';
+        label.textContent=(current&&current.username)||header.dataset.accountUsername||'Accounts';
+        const chevron=document.createElement('span');chevron.className='account-switcher-chevron';chevron.textContent='▾';
+        toggle.appendChild(label);toggle.appendChild(chevron);
+        const dropdown=document.createElement('div');dropdown.className='account-switcher-dropdown';dropdown.hidden=true;
+        const search=document.createElement('input');search.type='search';search.className='account-switcher-search';search.placeholder='Search accounts...';search.setAttribute('aria-label','Search accounts');
+        const list=document.createElement('div');list.className='account-switcher-list';
+        if(!accounts.length){const empty=document.createElement('div');empty.className='account-switcher-empty';empty.textContent='No other accounts found.';list.appendChild(empty);}
+        accounts.forEach(function(account){
+            const form=document.createElement('form');form.method='POST';form.className='account-switcher-user-form';
+            const selectInput=document.createElement('input');selectInput.type='hidden';selectInput.name='select_user';selectInput.value='1';
+            const idInput=document.createElement('input');idInput.type='hidden';idInput.name='user_id';idInput.value=String(account.id);
+            form.appendChild(selectInput);form.appendChild(idInput);
+            const button=document.createElement('button');button.type='submit';button.className='account-switcher-user'+(Number(account.id)===currentId?' is-current':'');
+            const name=document.createElement('span');name.className='account-switcher-user-name';name.textContent=account.username||('Account '+account.id);
+            const email=document.createElement('span');email.className='account-switcher-user-email';email.textContent=account.email||'';
+            button.appendChild(name);button.appendChild(email);form.appendChild(button);list.appendChild(form);
+        });
+        dropdown.appendChild(search);dropdown.appendChild(list);wrapper.appendChild(toggle);wrapper.appendChild(dropdown);host.appendChild(wrapper);
+        toggle.addEventListener('click',function(event){
+            event.preventDefault();event.stopPropagation();
+            const opening=dropdown.hidden;dropdown.hidden=!opening;toggle.setAttribute('aria-expanded',opening?'true':'false');
+            if(opening){search.value='';Array.from(list.children).forEach(function(row){row.style.display='';});search.focus();}
+        });
+        search.addEventListener('input',function(){
+            const term=search.value.trim().toLowerCase();let visible=0;
+            Array.from(list.querySelectorAll('.account-switcher-user-form')).forEach(function(form){
+                const match=form.textContent.toLowerCase().includes(term);form.style.display=match?'':'none';if(match)visible++;
+            });
+            let empty=list.querySelector('.account-switcher-filter-empty');
+            if(!empty){empty=document.createElement('div');empty.className='account-switcher-empty account-switcher-filter-empty';empty.textContent='No matching accounts.';list.appendChild(empty);}
+            empty.style.display=visible===0?'':'none';
+        });
+        if(!window.__sceneIQAccountSwitcherDocumentEvents){
+            document.addEventListener('click',function(event){
+                document.querySelectorAll('.account-switcher').forEach(function(node){
+                    if(!node.contains(event.target)){const menu=node.querySelector('.account-switcher-dropdown');const btn=node.querySelector('.account-switcher-toggle');if(menu)menu.hidden=true;if(btn)btn.setAttribute('aria-expanded','false');}
+                });
+            });
+            document.addEventListener('keydown',function(event){
+                if(event.key==='Escape')document.querySelectorAll('.account-switcher-dropdown').forEach(function(menu){menu.hidden=true;const btn=menu.parentElement&&menu.parentElement.querySelector('.account-switcher-toggle');if(btn)btn.setAttribute('aria-expanded','false');});
+            });
+            window.__sceneIQAccountSwitcherDocumentEvents=true;
+        }
+    }
+    renderAccountSwitcher();
     const root=document.createElement('div'); root.id='sceneiqFolderRoot';root.className='folder-nav-root';
     const page=document.createElement('div');page.id='sceneiqFolderPage';page.className='folder-page-content';
     root.appendChild(page);
@@ -10982,7 +12249,22 @@ body:has(#sceneiqFolderRoot) .folder-nav-root {
     let currentRender=null;
     function setHeader(title,rootMode){
     header.classList.toggle('folder-mode',!rootMode);
-    if(rootMode){header.innerHTML=mainHeaderContent;return;}
+    if(rootMode){header.innerHTML=mainHeaderContent;renderAccountSwitcher();return;}
+
+    // On every page inside the selected account, replace the hamburger menu
+    // with a Back arrow in exactly the same left-side position. Keep the account
+    // username and email centered, and do not render a second Back control at right.
+    if(header.classList.contains('account-selected-header')){
+        header.innerHTML='<div class="folder-header-left"><button type="button" class="folder-back-btn account-page-back-btn" aria-label="Go back" title="Go back">←</button></div>'+
+            '<div class="folder-header-title account-folder-identity"><div class="account-header-username"></div><div class="account-header-email"></div></div>'+
+            '<div class="account-switcher-host"></div>';
+        header.querySelector('.account-header-username').textContent=header.dataset.accountUsername||'';
+        header.querySelector('.account-header-email').textContent=header.dataset.accountEmail||'';
+        header.querySelector('.account-page-back-btn').addEventListener('click',goBack);
+        renderAccountSwitcher();
+        return;
+    }
+
     header.innerHTML='<div class="folder-header-left"><button type="button" class="folder-back-btn" aria-label="Go back" title="Go back">‹</button></div><div class="folder-header-title"></div>';
     header.querySelector('.folder-header-title').textContent=title;
     header.querySelector('.folder-back-btn').addEventListener('click',goBack);
@@ -11102,11 +12384,495 @@ body:has(#sceneiqFolderRoot) .folder-nav-root {
         });
     });
     }
+    // Re-render the currently open folder/child view after background saves while
+    // preserving the navigation stack and the user's current location.
+    window.sceneIQRefreshCurrentFolderView=function(){
+        if(typeof currentRender==='function') currentRender();
+    };
     rootPage();
     }
     if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initSceneIQFolderNavigation,{once:true});
     else initSceneIQFolderNavigation();
     })();
+</script>
+
+
+<script id="sceneiq-live-save-and-refresh">
+(function () {
+    'use strict';
+
+    function showLiveSaveToast(message, isError) {
+        var toast = document.getElementById('sceneiqLiveSaveToast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.id = 'sceneiqLiveSaveToast';
+            toast.setAttribute('role', 'status');
+            toast.setAttribute('aria-live', 'polite');
+            toast.style.cssText = 'position:fixed;right:18px;bottom:18px;z-index:2147483000;max-width:min(420px,calc(100vw - 36px));padding:12px 16px;border-radius:12px;font:600 13px/1.45 Segoe UI,Arial,sans-serif;box-shadow:0 12px 34px rgba(15,23,42,.22);opacity:0;transform:translateY(8px);pointer-events:none;transition:opacity .16s ease,transform .16s ease;';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = message || (isError ? 'Save failed.' : 'Saved successfully.');
+        toast.style.background = isError ? '#fff1f2' : '#ecfdf5';
+        toast.style.border = isError ? '1px solid #fecaca' : '1px solid #a7f3d0';
+        toast.style.color = isError ? '#991b1b' : '#065f46';
+        toast.style.opacity = '1';
+        toast.style.transform = 'translateY(0)';
+        if (toast._sceneIQHideTimer) clearTimeout(toast._sceneIQHideTimer);
+        toast._sceneIQHideTimer = setTimeout(function () {
+            toast.style.opacity = '0';
+            toast.style.transform = 'translateY(8px)';
+        }, 2600);
+    }
+
+    async function fetchLiveState() {
+        var formData = new FormData();
+        formData.append('sceneiq_live_state', '1');
+        var response = await fetch(window.location.href.split('#')[0], {
+            method: 'POST',
+            body: formData,
+            headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' },
+            credentials: 'same-origin',
+            cache: 'no-store'
+        });
+        var data = await response.json();
+        if (!response.ok || !data || data.success !== true) {
+            throw new Error((data && data.message) || 'Could not retrieve the latest saved account data.');
+        }
+        return data.state;
+    }
+
+    function applyLiveState(state) {
+        if (!state || Number(state.userId || 0) !== Number(window.sceneIQSelectedAccountId || window.selectedUserId || 0)) return;
+        if (typeof window.userSettings !== 'undefined') window.userSettings = Array.isArray(state.userSettings) ? state.userSettings : [];
+        if (typeof window.globalDynamicFields !== 'undefined') window.globalDynamicFields = state.dynamicFields || {};
+        if (typeof window.userDynamicTabs !== 'undefined') window.userDynamicTabs = Array.isArray(state.dynamicTabs) ? state.dynamicTabs : [];
+
+        // Top-level var declarations in the legacy app are window globals. Assign
+        // explicitly as well so every editor and renderer sees the same live state.
+        try { userSettings = Array.isArray(state.userSettings) ? state.userSettings : []; } catch (ignoreSettings) {}
+        try { globalDynamicFields = state.dynamicFields || {}; } catch (ignoreFields) {}
+        try { userDynamicTabs = Array.isArray(state.dynamicTabs) ? state.dynamicTabs : []; } catch (ignoreTabs) {}
+    }
+
+    async function refreshServerRenderedProjectForm() {
+        var liveProjectNode = document.getElementById('user_tab_add_entry');
+        if (!liveProjectNode) return;
+        // Do not replace an actively displayed New Project form: this preserves
+        // partially entered content and open nested-tab references.
+        if (liveProjectNode.closest('.folder-page-content')) return;
+
+        var response = await fetch(window.location.href.split('#')[0], {
+            method: 'GET',
+            credentials: 'same-origin',
+            cache: 'no-store',
+            headers: { 'X-SceneIQ-Partial': 'project-form' }
+        });
+        if (!response.ok) throw new Error('The saved project form could not be refreshed.');
+        var html = await response.text();
+        var parsed = new DOMParser().parseFromString(html, 'text/html');
+        var freshProjectNode = parsed.getElementById('user_tab_add_entry');
+        if (freshProjectNode) liveProjectNode.innerHTML = freshProjectNode.innerHTML;
+    }
+
+    function rerenderLiveSections() {
+        if (typeof renderUserGlobalDynamicFields === 'function') renderUserGlobalDynamicFields();
+        if (typeof renderDynamicTabsEditor === 'function') renderDynamicTabsEditor();
+        if (typeof renderSubmitTabsEditor === 'function') renderSubmitTabsEditor();
+        if (typeof renderStatusEntries === 'function') {
+            renderStatusEntries('pending', 'pendingEntriesList');
+            renderStatusEntries('completed', 'completedEntriesList');
+            renderStatusEntries('aborted', 'abortedEntriesList');
+        }
+        if (typeof updateSaveEntryButtonVisibility === 'function') updateSaveEntryButtonVisibility();
+    }
+
+    async function sceneIQRefreshAfterSave(state, message, options) {
+        options = options || {};
+        var scrollHost = document.querySelector('.scroll-body');
+        var oldScrollTop = scrollHost ? scrollHost.scrollTop : 0;
+        try {
+            if (!state) state = await fetchLiveState();
+            applyLiveState(state);
+            if (options.refreshProjectMarkup) await refreshServerRenderedProjectForm();
+            rerenderLiveSections();
+            if (typeof window.sceneIQRefreshCurrentFolderView === 'function') {
+                window.sceneIQRefreshCurrentFolderView();
+            }
+            // Folder rendering may reflow the workspace. Restore the user's exact
+            // scroll position instead of sending them back to the top of the page.
+            if (scrollHost) scrollHost.scrollTop = oldScrollTop;
+            showLiveSaveToast(message || 'Saved successfully.', false);
+            return true;
+        } catch (error) {
+            console.error('SceneIQ live refresh failed:', error);
+            showLiveSaveToast('Saved, but the view could not refresh: ' + error.message, true);
+            return false;
+        }
+    }
+    window.sceneIQRefreshAfterSave = sceneIQRefreshAfterSave;
+
+    function getSaveAction(form) {
+        if (!form || form.tagName !== 'FORM') return '';
+        if (form.id === 'copyAccountDataForm' || form.id === 'changePasswordForm') return form.id;
+        var names = [
+            'save_global_dynamic_fields','save_settings','add_entry','delete_entry','update_entry_status',
+            'update_entry_field','save_dynamic_tabs','save_submit_tabs','delete_dynamic_tab',
+            'delete_global_dynamic_field','delete_account_dynamic_data','copy_account_data'
+        ];
+        for (var i = 0; i < names.length; i++) {
+            if (form.querySelector('[name="' + names[i] + '"]')) return names[i];
+        }
+        return '';
+    }
+
+    async function submitSaveFormAjax(form, submitter) {
+        if (form.dataset.sceneiqAjaxBusy === '1') return;
+        form.dataset.sceneiqAjaxBusy = '1';
+        var buttons = Array.from(form.querySelectorAll('button[type="submit"],input[type="submit"]'));
+        var previous = buttons.map(function (button) { return { disabled: button.disabled, text: button.textContent }; });
+        buttons.forEach(function (button) { button.disabled = true; });
+        var action = getSaveAction(form);
+        var projectMarkupChanges = [
+            'save_global_dynamic_fields','save_dynamic_tabs','save_submit_tabs',
+            'delete_dynamic_tab','delete_global_dynamic_field','delete_account_dynamic_data'
+        ].indexOf(action) !== -1;
+        try {
+            var formData = new FormData(form);
+            if (submitter && submitter.name && !formData.has(submitter.name)) formData.append(submitter.name, submitter.value || '1');
+            var response = await fetch(form.action || window.location.href.split('#')[0], {
+                method: 'POST',
+                body: formData,
+                credentials: 'same-origin',
+                cache: 'no-store',
+                headers: { 'X-Requested-With': 'XMLHttpRequest', 'X-SceneIQ-Request': 'save' }
+            });
+            var data;
+            try { data = await response.json(); }
+            catch (parseError) { throw new Error('The server did not return a valid save response. Check the PHP error log.'); }
+            if (!response.ok || !data || data.success !== true) {
+                throw new Error((data && data.message) || 'The server rejected this save.');
+            }
+            await sceneIQRefreshAfterSave(data.state, data.message, { refreshProjectMarkup: projectMarkupChanges });
+        } catch (error) {
+            console.error('SceneIQ background save failed:', error);
+            showLiveSaveToast(error.message || 'The save failed.', true);
+        } finally {
+            delete form.dataset.sceneiqAjaxBusy;
+            buttons.forEach(function (button, index) {
+                button.disabled = previous[index] ? previous[index].disabled : false;
+                if (previous[index] && previous[index].text && button.tagName === 'BUTTON') button.textContent = previous[index].text;
+            });
+        }
+    }
+
+    // Central interception covers settings, Dynamic Content/Tabs, project edits,
+    // status changes, and deletions. Account switching and dashboard navigation are
+    // deliberately excluded so genuine navigation still behaves normally.
+    document.addEventListener('submit', function (event) {
+        if (event.defaultPrevented) return;
+        var form = event.target;
+        if (!getSaveAction(form)) return;
+        event.preventDefault();
+        submitSaveFormAjax(form, event.submitter || null);
+    });
+
+})();
+</script>
+
+
+<script id="sceneiq-account-copy-controller">
+(function () {
+    'use strict';
+
+    var accounts = <?php echo json_encode(array_map(function ($user) { return ['id' => (int)$user['id'], 'username' => (string)$user['username'], 'email' => (string)$user['email']]; }, $users), JSON_HEX_TAG | JSON_HEX_APOS | JSON_HEX_AMP | JSON_HEX_QUOT); ?>;
+    var csrfToken = <?php echo json_encode((string)$_SESSION['sceneiq_copy_csrf_token']); ?>;
+    var form = document.getElementById('copyAccountDataForm');
+    var sourceSelect = document.getElementById('copyDataFromAccount');
+
+    var scopeInput = document.getElementById('copyDataScope');
+    var modeButtons = Array.prototype.slice.call(document.querySelectorAll('[data-copy-scope]'));
+    var selectionModal = document.getElementById('copySelectionModal');
+    var destinationModal = document.getElementById('copyDestinationModal');
+    var configList = document.getElementById('copyConfigList');
+    var configTabs = document.getElementById('copyConfigTabs');
+    var currentConfigTab = 'dynamic_tabs';
+    var copyOptions = null;
+    var sourceOptionsAccountId = '';
+    var selectedTabKeys = {};
+    var selectedFieldKeys = {};
+    var bulkDestinationIds = [];
+    var destinationModalMode = 'bulk';
+    var currentFieldCopyKey = '';
+
+    function htmlEscape(value) {
+        return String(value == null ? '' : value).replace(/[&<>"']/g, function (ch) {
+            return {'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch];
+        });
+    }
+    function openModal(modal) { if (modal) { modal.classList.add('active'); modal.setAttribute('aria-hidden', 'false'); } }
+    function closeModal(modal) { if (modal) { modal.classList.remove('active'); modal.setAttribute('aria-hidden', 'true'); } }
+    function notify(title, message) {
+        if (typeof window.showDialog === 'function') window.showDialog(title, message);
+        else window.alert(message);
+    }
+    function accountLabel(account) { return (account.username || ('Account ' + account.id)) + ' — ' + (account.email || ''); }
+    function currentSourceId() { return sourceSelect ? String(sourceSelect.value || '') : ''; }
+    function ensureHiddenValues(name, values) {
+        if (!form) return;
+        Array.prototype.forEach.call(form.querySelectorAll('input[data-copy-generated="' + name + '"]'), function (node) { node.remove(); });
+        (values || []).forEach(function (value) {
+            var input = document.createElement('input');
+            input.type = 'hidden'; input.name = name + '[]'; input.value = String(value);
+            input.setAttribute('data-copy-generated', name);
+            form.appendChild(input);
+        });
+    }
+    function selectedKeys(map) { return Object.keys(map).filter(function (key) { return map[key] === true; }); }
+    function updateBulkSummary() {
+        if (!scopeInput) return;
+        var count = bulkDestinationIds.length;
+        var label = document.getElementById('copyDestinationLabel');
+        var countNode = document.getElementById('copyDestinationCount');
+        var button = document.getElementById('copyDataSubmit');
+        if (label) label.textContent = count ? (count + ' destination account' + (count === 1 ? '' : 's') + ' selected') : 'Choose destination accounts';
+        if (countNode) countNode.textContent = count + ' selected';
+        if (button) button.disabled = !(scopeInput.value && count && currentSourceId());
+        ensureHiddenValues('destination_user_ids', bulkDestinationIds);
+        ensureHiddenValues('selected_dynamic_tab_keys', selectedKeys(selectedTabKeys));
+        ensureHiddenValues('selected_dynamic_field_keys', selectedKeys(selectedFieldKeys));
+        var summary = document.getElementById('copySelectionSummary');
+        if (summary) {
+            if (!scopeInput.value) summary.textContent = 'No data category selected.';
+            else if (scopeInput.value === 'dynamic_tabs') summary.textContent = selectedKeys(selectedTabKeys).length + ' Dynamic tab(s) selected.';
+            else if (scopeInput.value === 'dynamic_fields') summary.textContent = selectedKeys(selectedFieldKeys).length + ' Dynamic field(s) selected.';
+            else summary.textContent = selectedKeys(selectedTabKeys).length + ' Dynamic tab(s) and ' + selectedKeys(selectedFieldKeys).length + ' Dynamic field(s) selected.';
+        }
+    }
+    function setScope(scope) {
+        scopeInput.value = scope;
+        modeButtons.forEach(function (button) { button.classList.toggle('active', button.getAttribute('data-copy-scope') === scope); });
+        ensureHiddenValues('selected_dynamic_tab_keys', []);
+        ensureHiddenValues('selected_dynamic_field_keys', []);
+        if (scope === 'dynamic_tabs') currentConfigTab = 'dynamic_tabs';
+        else if (scope === 'dynamic_fields') currentConfigTab = 'dynamic_fields';
+        else currentConfigTab = 'dynamic_tabs';
+        renderConfigList();
+        updateBulkSummary();
+    }
+    function initializeSelections() {
+        selectedTabKeys = {};
+        selectedFieldKeys = {};
+        (copyOptions && copyOptions.dynamicTabs || []).forEach(function (tab) { selectedTabKeys[String(tab.key)] = true; });
+        (copyOptions && copyOptions.dynamicFields || []).forEach(function (field) { selectedFieldKeys[String(field.key)] = true; });
+    }
+    async function loadOptions() {
+        var sourceId = currentSourceId();
+        if (!sourceId) throw new Error('Select a source account first.');
+        if (copyOptions && sourceOptionsAccountId === sourceId) return copyOptions;
+        var data = new FormData();
+        data.append('load_account_copy_options', '1');
+        data.append('source_user_id', sourceId);
+        data.append('sceneiq_copy_csrf_token', csrfToken);
+        var response = await fetch(window.location.href.split('#')[0], { method: 'POST', body: data, credentials: 'same-origin', cache: 'no-store', headers: {'X-Requested-With':'XMLHttpRequest'} });
+        var result = await response.json();
+        if (!response.ok || !result || result.success !== true) throw new Error((result && result.message) || 'Could not load source data.');
+        copyOptions = { dynamicTabs: result.dynamicTabs || [], dynamicFields: result.dynamicFields || [] };
+        sourceOptionsAccountId = sourceId;
+        initializeSelections();
+        return copyOptions;
+    }
+    function renderConfigList() {
+        if (!configList) return;
+        var scope = scopeInput.value;
+        var isBoth = scope === 'dynamic_tabs_and_fields';
+        configTabs.hidden = !isBoth;
+        var isTabs = currentConfigTab === 'dynamic_tabs';
+        var records = isTabs ? (copyOptions && copyOptions.dynamicTabs || []) : (copyOptions && copyOptions.dynamicFields || []);
+        var map = isTabs ? selectedTabKeys : selectedFieldKeys;
+        document.querySelectorAll('[data-copy-config-tab]').forEach(function (button) {
+            button.classList.toggle('active', button.getAttribute('data-copy-config-tab') === currentConfigTab);
+        });
+        if (!records.length) {
+            configList.innerHTML = '<div class="copy-config-empty">No ' + (isTabs ? 'Dynamic tabs' : 'Dynamic fields') + ' are configured on this source account.</div>';
+        } else {
+            configList.innerHTML = records.map(function (record) {
+                var key = String(record.key);
+                var title = isTabs ? record.label : record.title;
+                var meta = isTabs ? 'Dynamic tab' : (record.type + ' · Key: ' + key);
+                return '<label class="copy-config-option"><span class="copy-config-option-copy"><span class="copy-config-option-title">' + htmlEscape(title) + '</span><span class="copy-config-option-meta">' + htmlEscape(meta) + '</span></span><input type="checkbox" data-copy-item-type="' + (isTabs ? 'tab' : 'field') + '" data-copy-item-key="' + htmlEscape(key) + '" ' + (map[key] ? 'checked' : '') + '></label>';
+            }).join('');
+        }
+        var count = selectedKeys(map).length;
+        var countNode = document.getElementById('copyConfigCount');
+        if (countNode) countNode.textContent = count + ' selected of ' + records.length;
+    }
+    function updateConfigCount() {
+        renderConfigList();
+        updateBulkSummary();
+    }
+    async function chooseScope(scope) {
+        if (!currentSourceId()) { notify('Select source account', 'Choose the source account before choosing what to copy.'); return; }
+        try {
+            var modal = document.getElementById('copySelectionModal');
+            var title = document.getElementById('copySelectionModalTitle');
+            var description = document.getElementById('copySelectionModalDescription');
+            await loadOptions();
+            setScope(scope);
+            title.textContent = scope === 'dynamic_tabs' ? 'Choose Dynamic tabs' : (scope === 'dynamic_fields' ? 'Choose Dynamic field' : 'Choose Dynamic tabs and Dynamic field');
+            description.textContent = 'All source items are selected initially. Uncheck any tab or field you do not want copied.';
+            openModal(modal);
+        } catch (error) { notify('Could not load source data', error.message); }
+    }
+    function openDestinationPicker(mode, fieldKey) {
+        destinationModalMode = mode;
+        currentFieldCopyKey = fieldKey || '';
+        var sourceId = mode === 'bulk' ? currentSourceId() : String(window.sceneIQSelectedAccountId || window.selectedUserId || '');
+        var list = document.getElementById('copyDestinationList');
+        var title = document.getElementById('copyDestinationModalTitle');
+        var description = document.getElementById('copyDestinationModalDescription');
+        var selected = mode === 'bulk' ? bulkDestinationIds.map(String) : [];
+        title.textContent = mode === 'field' ? 'Copy field to accounts' : 'Choose destination accounts';
+        description.textContent = mode === 'field' ? 'Choose one or more accounts to receive this complete Dynamic Content field. The source account is excluded.' : 'Choose one or more accounts. The source account is excluded.';
+        var candidates = accounts.filter(function (account) { return String(account.id) !== String(sourceId); });
+        if (!candidates.length) list.innerHTML = '<div class="copy-config-empty">No other accounts are available.</div>';
+        else list.innerHTML = candidates.map(function (account) {
+            var checked = selected.indexOf(String(account.id)) !== -1;
+            return '<label class="copy-config-option"><span class="copy-config-option-copy"><span class="copy-config-option-title">' + htmlEscape(account.username || ('Account ' + account.id)) + '</span><span class="copy-config-option-meta">' + htmlEscape(account.email || '') + '</span></span><input type="checkbox" data-destination-account="' + String(account.id) + '" ' + (checked ? 'checked' : '') + '></label>';
+        }).join('');
+        updateDestinationCount();
+        openModal(destinationModal);
+    }
+    function getDestinationModalSelection() {
+        return Array.prototype.slice.call(destinationModal.querySelectorAll('[data-destination-account]:checked')).map(function (node) { return node.getAttribute('data-destination-account'); });
+    }
+    function updateDestinationCount() {
+        var count = getDestinationModalSelection().length;
+        var node = document.getElementById('copyDestinationModalCount');
+        if (node) node.textContent = count + ' selected';
+    }
+    function closeCopyModals() {
+        closeModal(selectionModal);
+        closeModal(destinationModal);
+    }
+    async function performSingleFieldCopy(fieldKey, destinationIds) {
+        if (!destinationIds.length) { notify('Choose destination accounts', 'Select at least one account to receive this field.'); return; }
+        var sourceId = String(window.sceneIQSelectedAccountId || window.selectedUserId || '');
+        if (!sourceId) { notify('Source account unavailable', 'Select an account before copying a Dynamic Content field.'); return; }
+        var data = new FormData();
+        data.append('copy_dynamic_field_to_accounts', '1');
+        data.append('source_user_id', sourceId);
+        data.append('field_key', fieldKey);
+        data.append('destination_user_ids_json', JSON.stringify(destinationIds));
+        data.append('sceneiq_copy_csrf_token', csrfToken);
+        var response;
+        var result;
+        try {
+            response = await fetch(window.location.href.split('#')[0], { method: 'POST', body: data, credentials: 'same-origin', cache: 'no-store', headers: {'X-Requested-With':'XMLHttpRequest','X-SceneIQ-Request':'save'} });
+            result = await response.json();
+            if (!response.ok || !result || result.success !== true) throw new Error((result && result.message) || 'The field could not be copied.');
+            if (typeof window.sceneIQRefreshAfterSave === 'function') await window.sceneIQRefreshAfterSave(result.state, result.message);
+            else notify('Field copied', result.message);
+        } catch (error) { notify('Copy failed', error.message || 'The field could not be copied.'); }
+    }
+
+    modeButtons.forEach(function (button) {
+        button.addEventListener('click', function () { chooseScope(button.getAttribute('data-copy-scope')); });
+    });
+    if (sourceSelect) sourceSelect.addEventListener('change', function () {
+        copyOptions = null;
+        sourceOptionsAccountId = '';
+        selectedTabKeys = {}; selectedFieldKeys = {};
+        bulkDestinationIds = [];
+        scopeInput.value = '';
+        modeButtons.forEach(function (button) { button.classList.remove('active'); });
+        modeButtons.forEach(function (button) { button.disabled = !currentSourceId(); });
+        var destinationTrigger = document.getElementById('copyDestinationTrigger');
+        if (destinationTrigger) destinationTrigger.disabled = !currentSourceId();
+        updateBulkSummary();
+    });
+    modeButtons.forEach(function (button) { button.disabled = !currentSourceId(); });
+    var destinationTrigger = document.getElementById('copyDestinationTrigger');
+    if (destinationTrigger) {
+        destinationTrigger.disabled = !currentSourceId();
+        destinationTrigger.addEventListener('click', function () {
+            if (!scopeInput.value) { notify('Choose data first', 'Choose Dynamic tabs, Dynamic field, or Both before selecting destinations.'); return; }
+            openDestinationPicker('bulk');
+        });
+    }
+
+    document.querySelectorAll('[data-copy-modal-close]').forEach(function (button) {
+        button.addEventListener('click', function () {
+            var which = button.getAttribute('data-copy-modal-close');
+            closeModal(which === 'selection' ? selectionModal : destinationModal);
+        });
+    });
+    document.querySelectorAll('[data-copy-config-tab]').forEach(function (button) {
+        button.addEventListener('click', function () { currentConfigTab = button.getAttribute('data-copy-config-tab'); renderConfigList(); });
+    });
+    configList.addEventListener('change', function (event) {
+        var control = event.target.closest('[data-copy-item-type]');
+        if (!control) return;
+        var map = control.getAttribute('data-copy-item-type') === 'tab' ? selectedTabKeys : selectedFieldKeys;
+        map[control.getAttribute('data-copy-item-key')] = !!control.checked;
+        updateConfigCount();
+    });
+    document.getElementById('copyConfigSelectAll').addEventListener('click', function () {
+        var map = currentConfigTab === 'dynamic_tabs' ? selectedTabKeys : selectedFieldKeys;
+        var records = currentConfigTab === 'dynamic_tabs' ? (copyOptions.dynamicTabs || []) : (copyOptions.dynamicFields || []);
+        records.forEach(function (record) { map[String(record.key)] = true; }); renderConfigList(); updateBulkSummary();
+    });
+    document.getElementById('copyConfigClearAll').addEventListener('click', function () {
+        var map = currentConfigTab === 'dynamic_tabs' ? selectedTabKeys : selectedFieldKeys;
+        Object.keys(map).forEach(function (key) { map[key] = false; }); renderConfigList(); updateBulkSummary();
+    });
+    document.getElementById('copyConfigApply').addEventListener('click', function () {
+        var scope = scopeInput.value;
+        var tabCount = selectedKeys(selectedTabKeys).length;
+        var fieldCount = selectedKeys(selectedFieldKeys).length;
+        if ((scope === 'dynamic_tabs' && !tabCount) || (scope === 'dynamic_fields' && !fieldCount) || (scope === 'dynamic_tabs_and_fields' && !tabCount && !fieldCount)) {
+            notify('Nothing selected', 'Select at least one item to copy.'); return;
+        }
+        ensureHiddenValues('selected_dynamic_tab_keys', selectedKeys(selectedTabKeys));
+        ensureHiddenValues('selected_dynamic_field_keys', selectedKeys(selectedFieldKeys));
+        updateBulkSummary();
+        closeModal(selectionModal);
+    });
+    destinationModal.addEventListener('change', function (event) { if (event.target.matches('[data-destination-account]')) updateDestinationCount(); });
+    document.getElementById('copyDestinationSelectAll').addEventListener('click', function () {
+        destinationModal.querySelectorAll('[data-destination-account]').forEach(function (node) { node.checked = true; }); updateDestinationCount();
+    });
+    document.getElementById('copyDestinationClearAll').addEventListener('click', function () {
+        destinationModal.querySelectorAll('[data-destination-account]').forEach(function (node) { node.checked = false; }); updateDestinationCount();
+    });
+    document.getElementById('copyDestinationApply').addEventListener('click', function () {
+        var ids = getDestinationModalSelection();
+        if (!ids.length) { notify('No accounts selected', 'Select at least one destination account.'); return; }
+        if (destinationModalMode === 'bulk') {
+            bulkDestinationIds = ids;
+            updateBulkSummary();
+            closeModal(destinationModal);
+        } else {
+            closeModal(destinationModal);
+            performSingleFieldCopy(currentFieldCopyKey, ids);
+        }
+    });
+    if (form) form.addEventListener('submit', function (event) {
+        if (!scopeInput.value) { event.preventDefault(); notify('Choose what to copy', 'The default is None. Select Dynamic tabs, Dynamic field, or Both first.'); return; }
+        if (!bulkDestinationIds.length) { event.preventDefault(); notify('Choose destination accounts', 'Select at least one destination account.'); return; }
+        if (!selectedKeys(selectedTabKeys).length && !selectedKeys(selectedFieldKeys).length) { event.preventDefault(); notify('Nothing selected', 'Select at least one tab or field to copy.'); return; }
+        var sourceName = sourceSelect.options[sourceSelect.selectedIndex] ? sourceSelect.options[sourceSelect.selectedIndex].text : 'source account';
+        var destinationNames = accounts.filter(function (account) { return bulkDestinationIds.indexOf(String(account.id)) !== -1; }).map(accountLabel);
+        if (!window.confirm('Copy the selected data from ' + sourceName + ' to ' + destinationNames.join(', ') + '?\n\nOnly selected items are copied. Matching keys are replaced in full; all unrelated destination data remains.')) event.preventDefault();
+    });
+
+    // Public function used by the Copy field to button on each Dynamic Content card.
+    window.openCopyFieldToUsers = function (fieldKey) {
+        if (!fieldKey) return;
+        currentFieldCopyKey = String(fieldKey);
+        openDestinationPicker('field', currentFieldCopyKey);
+    };
+    updateBulkSummary();
+})();
 </script>
 
 </body>
