@@ -1489,26 +1489,26 @@ $folders = array_merge($mainFolders, $uploadedFolders);
 <style>
   :root {
     --primary: #6366f1; --primary-dark: #4f46e5; --success: #10b981; --warning: #f59e0b; --danger: #ef4444;
-    --bg: #f8fafc; --card: #ffffff; --text: #1e293b; --text-light: #64748b; --border: #e2e8f0;
+    --bg: #f0f7f6; --card: #ffffff; --text: #1e293b; --text-light: #64748b; --border: #e2e8f0;
     --shadow: 0 10px 25px rgba(0,0,0,0.08); --radius: 16px; --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
   }
   *{margin:0;padding:0;box-sizing:border-box}
-  html, body {height:100%;margin:0;overflow:hidden;font-family:'Inter',sans-serif;background:var(--bg);color:var(--text)}
+  html, body {height:100%;margin:0;overflow:hidden;font-family:'Inter',sans-serif;background:none;color:var(--text)}
   .contentsdiv {height:100vh;overflow:hidden;display:flex;flex-direction:column}
   .contentsinnerdiv {flex:1;overflow-y:auto;padding-bottom:3rem}
-  header{text-align:center;padding:2.5rem 1rem 1.5rem;background:linear-gradient(135deg,var(--primary),#8b5cf6);color:#fff;border-bottom-left-radius:var(--radius);border-bottom-right-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:-1rem;position:relative;overflow:hidden;flex-shrink:0}
-  header::after{content:'';position:absolute;bottom:0;left:0;right:0;height:50px;background:linear-gradient(transparent,var(--bg))}
+  header{text-align:center;padding:2.5rem 1rem 1.5rem;background:linear-gradient(135deg, rgba(15, 59, 58, 0.95), rgba(43, 156, 138, 0.95));color:#fff;border-bottom-left-radius:var(--radius);border-bottom-right-radius:var(--radius);box-shadow:var(--shadow);margin-bottom:-1rem;position:relative;overflow:hidden;flex-shrink:0;backdrop-filter:blur(10px);border-bottom:1px solid rgba(255,255,255,0.1)}
+  header::after{content:'';position:absolute;bottom:0;left:0;right:0;height:50px;background:linear-gradient(transparent, rgba(15, 59, 58, 0.3))}
   header h1{font-size:2.8rem;font-weight:700;margin-bottom:.5rem;text-shadow:0 2px 10px rgba(0,0,0,.2)}
   header .subtitle{font-size:1rem;opacity:.9;font-weight:500}
-  .controls{background:var(--card);padding:1.5rem 1rem;border-radius:var(--radius);margin:1.5rem 1rem 0;max-width:1100px;box-shadow:var(--shadow);display:flex;flex-direction:column;align-items:center;gap:1.2rem;position:sticky;top:1rem;z-index:10;backdrop-filter:blur(10px);border:1px solid var(--border);flex-shrink:0}
+  .controls{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);padding:1.5rem 1rem;border-radius:var(--radius);margin:1.5rem 1rem 0;max-width:1100px;box-shadow:var(--shadow);display:flex;flex-direction:column;align-items:center;gap:1.2rem;position:sticky;top:1rem;z-index:10;border:1px solid rgba(255,255,255,0.2)}
   .top-controls{display:flex;align-items:center;gap:1rem;flex-wrap:wrap;justify-content:center;width:100%}
-  .active-folder-btn{padding:.75rem 1.8rem;font-size:1rem;font-weight:600;color:white;background:var(--primary);border:none;border-radius:50px;cursor:default;box-shadow:0 4px 15px rgba(99,102,241,.3);min-width:180px}
+  .active-folder-btn{padding:.75rem 1.8rem;font-size:1rem;font-weight:600;color:white;background:linear-gradient(135deg, #0f3b3a, #2b9c8a);border:none;border-radius:50px;cursor:default;box-shadow:0 4px 15px rgba(15, 59, 58, .3);min-width:180px}
   .folder-dropdown{position:relative;display:inline-block}
   .folder-toggle{padding:.75rem 1.5rem;font-size:.95rem;font-weight:600;color:var(--text-light);background:#f1f5f9;border:none;border-radius:50px;cursor:pointer;transition:var(--transition);box-shadow:0 2px 6px rgba(0,0,0,.05);min-width:140px}
   .folder-toggle:hover{background:#e2e8f0}
   .folder-menu{
     position:absolute;
-    top:100%;
+    top:-50%;
     left:50%;
     transform:translateX(-50%);
     margin-top:.5rem;
@@ -1575,8 +1575,8 @@ $folders = array_merge($mainFolders, $uploadedFolders);
   .move-selected-folder-btn{background:#8b5cf6;color:white;padding:.6rem 1.2rem;font-size:.9rem;border:none;border-radius:50px;cursor:pointer;font-weight:600;display:none;transition:var(--transition)}
   .move-selected-folder-btn:hover{background:#7c3aed;transform:translateY(-1px)}
   .gallery{padding:1rem 1.5rem;max-width:1400px;margin:auto;flex:1}
-  .gallery-title{text-align:center;margin-bottom:1rem;font-size:1.5rem;color:#444}
-  .images-container{background:#fff;border-radius:8px;padding:1rem;position:relative}
+  .gallery-title{text-align:center;margin-bottom:1rem;font-size:1.5rem;color:rgba(255,255,255,0.95);text-shadow:0 2px 10px rgba(0,0,0,0.2)}
+  .images-container{background:rgba(255,255,255,0.92);backdrop-filter:blur(10px);border-radius:8px;padding:1rem;position:relative;border:1px solid rgba(255,255,255,0.2)}
   
   .image-scroll{
     display:grid;
@@ -1690,19 +1690,19 @@ $folders = array_merge($mainFolders, $uploadedFolders);
   
   .empty-state,.loading,.no-results{text-align:center;padding:3rem;color:#888;font-style:italic}
   .add-btn-container{text-align:center;padding:2rem}
-  .add-btn-container button{padding:1rem 2rem;font-size:1.1rem;background:#007bff;color:white;border:none;border-radius:50px;cursor:pointer}
-  .add-btn-container button:hover{background:#0056b3}
+  .add-btn-container button{padding:1rem 2rem;font-size:1.1rem;background:linear-gradient(135deg, #0f3b3a, #2b9c8a);color:white;border:none;border-radius:50px;cursor:pointer;transition:var(--transition)}
+  .add-btn-container button:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(15, 59, 58, .3)}
   .move-to-uploaded-btn,.move-to-another-folder-btn,.move-all-jpgs-btn,.move-back-to-main-btn,.move-all-jpgs-back-btn{margin-top:1rem;padding:.8rem 1.8rem;color:white;border:none;border-radius:50px;font-weight:600;cursor:pointer;width:240px;font-size:.95rem}
-  .move-to-uploaded-btn{background:#10b981}
-  .move-to-uploaded-btn:hover{background:#0d8b5f}
-  .move-to-another-folder-btn{background:#8b5cf6}
-  .move-to-another-folder-btn:hover{background:#7c3aed}
-  .move-all-jpgs-btn{background:#f59e0b}
-  .move-all-jpgs-btn:hover{background:#e68a00}
-  .move-back-to-main-btn{background:#3b82f6}
-  .move-back-to-main-btn:hover{background:#2563eb}
-  .move-all-jpgs-back-btn{background:#8b5cf6}
-  .move-all-jpgs-back-btn:hover{background:#7c3aed}
+  .move-to-uploaded-btn{background:linear-gradient(135deg, #10b981, #0d8b5f)}
+  .move-to-uploaded-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(16, 185, 129, .3)}
+  .move-to-another-folder-btn{background:linear-gradient(135deg, #8b5cf6, #7c3aed)}
+  .move-to-another-folder-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(139, 92, 246, .3)}
+  .move-all-jpgs-btn{background:linear-gradient(135deg, #f59e0b, #d97706)}
+  .move-all-jpgs-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(245, 158, 11, .3)}
+  .move-back-to-main-btn{background:linear-gradient(135deg, #3b82f6, #2563eb)}
+  .move-back-to-main-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(59, 130, 246, .3)}
+  .move-all-jpgs-back-btn{background:linear-gradient(135deg, #8b5cf6, #7c3aed)}
+  .move-all-jpgs-back-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(139, 92, 246, .3)}
   
   .home-grid {
     display: grid;
@@ -1713,7 +1713,8 @@ $folders = array_merge($mainFolders, $uploadedFolders);
     margin: 0 auto;
   }
   .folder-card {
-    background: white;
+    background: rgba(255,255,255,0.95);
+    backdrop-filter: blur(10px);
     border-radius: 12px;
     overflow: hidden;
     box-shadow: 0 4px 12px rgba(0,0,0,0.1);
@@ -1721,6 +1722,7 @@ $folders = array_merge($mainFolders, $uploadedFolders);
     transition: transform 0.2s, box-shadow 0.2s;
     text-align: center;
     padding: 1rem;
+    border: 1px solid rgba(255,255,255,0.2);
   }
   .folder-card:hover {
     transform: translateY(-4px);
@@ -1730,7 +1732,7 @@ $folders = array_merge($mainFolders, $uploadedFolders);
     width: 120px;
     height: 120px;
     margin: 0 auto 1rem;
-    background: linear-gradient(135deg, var(--primary), #8b5cf6);
+    background: linear-gradient(135deg, #0f3b3a, #2b9c8a);
     border-radius: 50%;
     display: flex;
     align-items: center;
@@ -1739,7 +1741,7 @@ $folders = array_merge($mainFolders, $uploadedFolders);
     font-size: 3rem;
     font-weight: 600;
     text-transform: uppercase;
-    box-shadow: 0 4px 12px rgba(99,102,241,0.3);
+    box-shadow: 0 4px 12px rgba(15, 59, 58, 0.3);
   }
   .folder-info {
     text-align: center;
@@ -1770,22 +1772,23 @@ $folders = array_merge($mainFolders, $uploadedFolders);
   .logout-btn {
     margin-left: 1rem;
     padding: .6rem 1.2rem;
-    background: #dc3545;
+    background: linear-gradient(135deg, #dc3545, #c82333);
     color: white;
     border: none;
     border-radius: 50px;
     font-weight: 600;
     cursor: pointer;
-    transition: background 0.3s;
+    transition: var(--transition);
   }
   .logout-btn:hover {
-    background: #c82333;
+    transform: translateY(-2px);
+    box-shadow: 0 4px 15px rgba(220, 53, 69, .3);
   }
   
-  .fab{position:fixed;bottom:2rem;right:2rem;background:var(--primary);width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.3);z-index:50;transition:transform .2s}
+  .fab{position:fixed;bottom:2rem;right:2rem;background:linear-gradient(135deg, #0f3b3a, #2b9c8a);width:56px;height:56px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:1.8rem;cursor:pointer;box-shadow:0 4px 12px rgba(0,0,0,.3);z-index:50;transition:transform .2s;color:white}
   .fab:hover{transform:scale(1.1)}
-  .modal,.fullscreen-modal,.bulk-upload-overlay,.confirm-modal,.rename-modal,.delete-folder-modal,.move-modal,.move-all-modal,.move-back-modal,.move-all-back-modal,.move-to-folder-modal,.history-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);justify-content:center;align-items:center;z-index:100;padding:1rem}
-  .modal-content,.confirm-box,.bulk-upload-modal,.rename-box,.delete-folder-box,.move-box,.move-all-box,.move-back-box,.move-all-back-box,.move-to-folder-box,.history-modal .modal-content{background:#fff;padding:2rem;border-radius:12px;width:90%;max-width:420px;text-align:center;box-shadow:0 20px 50px rgba(0,0,0,.2);animation:modalPop .3s ease}
+  .modal,.fullscreen-modal,.bulk-upload-overlay,.confirm-modal,.rename-modal,.delete-folder-modal,.move-modal,.move-all-modal,.move-back-modal,.move-all-back-modal,.move-to-folder-modal,.history-modal{display:none;position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,.5);justify-content:center;align-items:center;z-index:100;padding:1rem;backdrop-filter:blur(5px)}
+  .modal-content,.confirm-box,.bulk-upload-modal,.rename-box,.delete-folder-box,.move-box,.move-all-box,.move-back-box,.move-all-back-box,.move-to-folder-box,.history-modal .modal-content{background:rgba(255,255,255,0.98);backdrop-filter:blur(20px);padding:2rem;border-radius:12px;width:90%;max-width:420px;text-align:center;box-shadow:0 20px 50px rgba(0,0,0,.2);animation:modalPop .3s ease;border:1px solid rgba(255,255,255,0.2)}
   
   .auto-move-modal .modal-content {
     max-width: 500px;
@@ -1941,7 +1944,8 @@ $folders = array_merge($mainFolders, $uploadedFolders);
   .bulk-progress-fill{height:100%;background:#28a745;width:0;transition:width .3s}
   .bulk-modal-actions{margin-top:1.5rem;display:flex;gap:1rem;justify-content:center}
   @keyframes fadeIn{from{opacity:0;transform:translateY(-8px)}to{opacity:1;transform:translateY(0)}}
-  .history-btn{margin-left:1rem;padding:.6rem 1.2rem;background:#8b5cf6;color:white;border:none;border-radius:50px;font-weight:600;cursor:pointer}
+  .history-btn{margin-left:1rem;padding:.6rem 1.2rem;background:linear-gradient(135deg, #8b5cf6, #7c3aed);color:white;border:none;border-radius:50px;font-weight:600;cursor:pointer;transition:var(--transition)}
+  .history-btn:hover{transform:translateY(-2px);box-shadow:0 4px 15px rgba(139, 92, 246, .3)}
   
   .auto-move-btn {
     background: var(--success);
@@ -2086,7 +2090,7 @@ $folders = array_merge($mainFolders, $uploadedFolders);
           <button class="folder-toggle" id="folder-toggle">FOLDERS ▼</button>
           <div class="folder-menu" id="folder-menu"></div>
         </div>
-        <button class="history-btn" id="history-btn">Copied History</button>
+        <button class="history-btn" id="history-btn" style="display: none;">Copied History</button>
         <button class="logout-btn" id="logout-btn">Logout</button>
         <div class="search-wrapper" id="search-wrapper" style="display:none">
           <svg class="search-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
@@ -3068,7 +3072,7 @@ $folders = array_merge($mainFolders, $uploadedFolders);
         } else if (isHomeView) {
         // In home view - show back button to go to serenum
         backBtn.style.display = 'flex';
-        backBtn.textContent = '← Home';
+        backBtn.textContent = '← Dashboard';
         } else {
         backBtn.style.display = 'none';
         }

@@ -307,16 +307,14 @@ if (!$isAuthenticated) {
                     <div class="app-icon">⚙️</div>
                     <div class="app-name">Serenum Configuration</div>
                     <div class="app-description">Master multitasking with advanced automation that executes multiple operations simultaneously.</div>
-                    <span class="app-status active">● Available</span>
                 </div>
                 
                 <!-- SceneIQ Card -->
-                <div class="app-card" onclick="location.href='sceneiq.php'">
+                <div class="app-card" onclick="location.href='sceneiq_server.php'">
                     <div class="app-badge">Beta</div>
                     <div class="app-icon">🧠</div>
                     <div class="app-name">SceneIQ</div>
                     <div class="app-description">Effortlessly build and manage complex scenes with powerful multitasking AI that handles everything simultaneously.</div>
-                    <span class="app-status coming">● Coming Soon</span>
                 </div>
             </div>
         </div>
